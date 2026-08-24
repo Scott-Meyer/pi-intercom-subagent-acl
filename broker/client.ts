@@ -35,6 +35,14 @@ export interface SendResult extends DeliveryDetails {
   reason?: string;
 }
 
+// ACL fork: result of a self-promotion "advertise" request/response exchange.
+export interface AdvertiseResult {
+  ok: boolean;
+  name?: string;
+  error?: string;
+  code?: string;
+}
+
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
@@ -69,6 +77,7 @@ export class IntercomClient extends EventEmitter {
   private _features = new Set<string>();
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
+  private pendingAdvertise = new Map<string, { resolve: (result: AdvertiseResult) => void; reject: (e: Error) => void }>();
   private nextSenderSequence = 1;
   private disconnecting = false;
   private disconnectError: Error | null = null;
@@ -80,6 +89,10 @@ export class IntercomClient extends EventEmitter {
       pending.reject(error);
     }
     this.pendingSends.clear();
+    for (const pending of this.pendingAdvertise.values()) {
+      pending.reject(error);
+    }
+    this.pendingAdvertise.clear();
     for (const pending of this.pendingLists.values()) {
       pending.reject(error);
     }
@@ -360,6 +373,25 @@ export class IntercomClient extends EventEmitter {
         break;
       }
 
+      case "advertise_result": {
+        const { requestId, ok, name, error, code } = brokerMessage;
+        if (typeof requestId !== "string" || typeof ok !== "boolean") {
+          throw new Error("Invalid advertise_result message");
+        }
+        const pending = this.pendingAdvertise.get(requestId);
+        if (!pending) {
+          return;
+        }
+        this.pendingAdvertise.delete(requestId);
+        pending.resolve({
+          ok,
+          ...(typeof name === "string" ? { name } : {}),
+          ...(typeof error === "string" ? { error } : {}),
+          ...(typeof code === "string" ? { code } : {}),
+        });
+        break;
+      }
+
       case "message": {
         const { from, message } = brokerMessage;
         if (!isSessionInfo(from) || !isMessage(message)) {
@@ -581,6 +613,46 @@ export class IntercomClient extends EventEmitter {
     if (!this.supportsFeature(EXTENSION_BUS_FEATURE)) return;
     const socket = this.requireActiveSocket();
     writeMessage(socket, { type: "extension_capabilities_update", extensions: extensions ?? [] });
+  }
+
+  // ACL fork: lets a subagent self-promote to full main-level visibility
+  // under a chosen name. Broker-authoritative: the broker validates
+  // eligibility (must currently be a restricted subagent) and name
+  // uniqueness (including against live session IDs) before applying it, so
+  // a client can never simply assert `advertised: true`.
+  advertise(name: string, options: { timeoutMs?: number } = {}): Promise<AdvertiseResult> {
+    let socket: net.Socket;
+    try {
+      socket = this.requireActiveSocket();
+    } catch (error) {
+      return Promise.reject(toError(error));
+    }
+
+    return new Promise((resolve, reject) => {
+      const requestId = randomUUID();
+      const wrappedResolve = (result: AdvertiseResult) => {
+        clearTimeout(timeout);
+        resolve(result);
+      };
+      const wrappedReject = (error: Error) => {
+        clearTimeout(timeout);
+        reject(error);
+      };
+      const timeout = setTimeout(() => {
+        if (this.pendingAdvertise.has(requestId)) {
+          this.pendingAdvertise.delete(requestId);
+          wrappedReject(new Error("Advertise timeout"));
+        }
+      }, options.timeoutMs ?? 5000);
+      this.pendingAdvertise.set(requestId, { resolve: wrappedResolve, reject: wrappedReject });
+      try {
+        writeMessage(socket, { type: "advertise", requestId, name });
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingAdvertise.delete(requestId);
+        reject(toError(error));
+      }
+    });
   }
 
   listSessions(options: { timeoutMs?: number } = {}): Promise<SessionInfo[]> {

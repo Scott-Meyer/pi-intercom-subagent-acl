@@ -163,6 +163,9 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   if (value.supervisorName !== undefined && typeof value.supervisorName !== "string") {
     return false;
   }
+  if (value.advertised !== undefined && typeof value.advertised !== "boolean") {
+    return false;
+  }
 
   return value.trustedLocal === undefined || typeof value.trustedLocal === "boolean";
 }
@@ -207,6 +210,9 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
   if (value.supervisorName !== undefined && typeof value.supervisorName !== "string") {
     return false;
   }
+  // advertised is intentionally NOT accepted on registration/presence -- it is
+  // broker-authoritative, set only via the dedicated "advertise" request/response
+  // exchange after uniqueness validation, never by a client asserting it directly.
 
   return value.status === undefined || typeof value.status === "string";
 }

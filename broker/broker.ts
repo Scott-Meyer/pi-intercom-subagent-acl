@@ -147,21 +147,31 @@ function matchesSupervisor(child: SessionInfo, candidateSupervisor: SessionInfo)
   return false;
 }
 
+// A subagent that has explicitly self-promoted via "advertise" is treated as
+// an ordinary main for visibility in both directions, while isSubagent /
+// supervisorSessionId / supervisorName remain in place as provenance --
+// advertising does not erase where it came from, it only lifts the ACL.
+function isRestrictedSubagent(info: SessionInfo): boolean {
+  return info.isSubagent === true && info.advertised !== true;
+}
+
 function canSeeSession(observer: SessionInfo, subject: SessionInfo): boolean {
   if (observer.id === subject.id) {
     return true;
   }
-  if (observer.isSubagent) {
+  if (isRestrictedSubagent(observer)) {
     // Subagents see only their own supervisor, never siblings or other mains.
     return matchesSupervisor(observer, subject);
   }
-  if (!subject.isSubagent) {
-    // Mains see every other main.
+  if (!isRestrictedSubagent(subject)) {
+    // Mains (and advertised subagents) see every other main / advertised subagent.
     return true;
   }
   // Mains see only the subagent children they personally supervise.
   return matchesSupervisor(subject, observer);
 }
+
+const MAX_ADVERTISE_NAME_LENGTH = 128;
 
 function isPendingAskRecord(value: unknown): value is PendingAskRecord {
   if (!isRecord(value) || !isRecord(value.asker) || !isRecord(value.target)) {
@@ -590,6 +600,93 @@ class IntercomBroker {
         break;
       }
 
+      case "advertise": {
+        if (!currentId) {
+          throw new Error("Received advertise before register");
+        }
+        const requestId = clientMessage.requestId;
+        if (typeof requestId !== "string") {
+          throw new Error("Invalid advertise message");
+        }
+        const respond = (ok: boolean, extra: { name?: string; error?: string; code?: string } = {}) => {
+          writeMessage(socket, { type: "advertise_result", requestId, ok, ...extra });
+        };
+
+        const self = this.sessions.get(currentId);
+        if (!self || self.socket !== socket) {
+          respond(false, { error: "Sender session not found", code: "E_SENDER_NOT_FOUND" });
+          break;
+        }
+
+        // Only a tagged subagent has anything to gain from advertising; a main
+        // is already fully visible both ways. Reject rather than silently no-op
+        // so the caller's model gets a clear, actionable result.
+        if (!isRestrictedSubagent(self.info)) {
+          respond(false, {
+            error: self.info.isSubagent
+              ? "This session has already advertised itself."
+              : "Only subagent sessions can advertise themselves; this session is already fully visible.",
+            code: "E_NOT_ELIGIBLE",
+          });
+          break;
+        }
+
+        const rawName = clientMessage.name;
+        if (typeof rawName !== "string") {
+          respond(false, { error: "advertise requires a string name", code: "E_INVALID_NAME" });
+          break;
+        }
+        const name = rawName.trim();
+        if (name.length === 0 || name.length > MAX_ADVERTISE_NAME_LENGTH) {
+          respond(false, { error: `name must be 1-${MAX_ADVERTISE_NAME_LENGTH} characters after trimming`, code: "E_INVALID_NAME" });
+          break;
+        }
+        // Single-line, printable only. This name is interpolated verbatim into
+        // roster rows, target strings, and error text on every client that can
+        // see it; control characters (newlines especially) let a chosen name
+        // forge extra fake roster lines or corrupt terminal rendering.
+        if (/[\p{Cc}\p{Cf}]/u.test(name)) {
+          respond(false, { error: "name must not contain control or formatting characters", code: "E_INVALID_NAME" });
+          break;
+        }
+
+        // Case-insensitive uniqueness against every other currently connected
+        // session -- advertising is a deliberate public-identity claim, stricter
+        // than the ordinary same-name tolerance regular sessions have (which is
+        // only resolved lazily at send time via E_AMBIGUOUS_TARGET).
+        const lowerName = name.toLowerCase();
+        const nameCollision = Array.from(this.sessions.values()).some(
+          (session) => session.info.id !== currentId && session.info.name?.toLowerCase() === lowerName,
+        );
+        if (nameCollision) {
+          respond(false, { error: `Name "${name}" is already in use by another connected session`, code: "E_NAME_TAKEN" });
+          break;
+        }
+        // findSessions() resolves an exact session ID before it ever checks
+        // names. If the requested name equalled another live session's real
+        // ID, that other session would silently win every lookup by this
+        // name and the advertised session would be unreachable by it.
+        const idCollision = Array.from(this.sessions.keys()).some((id) => id !== currentId && id === name);
+        if (idCollision) {
+          respond(false, { error: `Name "${name}" collides with another connected session's ID`, code: "E_NAME_TAKEN" });
+          break;
+        }
+
+        // Promote in place. isSubagent/supervisorSessionId/supervisorName are
+        // preserved as provenance -- advertising lifts the ACL, it does not
+        // erase where this session came from.
+        self.info.name = name;
+        self.info.runtimeFallbackAlias = false;
+        self.info.advertised = true;
+        respond(true, { name });
+
+        // The promoted info now reads as an ordinary main under canSeeSession,
+        // so this reaches every previously-blind session as well as everyone
+        // who could already see it -- exactly the newly-widened audience.
+        this.broadcastScoped({ type: "presence_update", session: self.info }, self.info, currentId);
+        break;
+      }
+
       case "send": {
         if (!currentId) {
           throw new Error("Received send before register");
@@ -866,11 +963,18 @@ class IntercomBroker {
         const session = this.sessions.get(currentId);
         if (session?.socket === socket) {
           let changed = false;
+          // ACL fork: once advertised, the public name/alias-ness is a
+          // deliberate, uniqueness-checked identity claim made through the
+          // dedicated "advertise" exchange. Routine presence syncs (which fire
+          // on every intercom tool call and normally just re-report the live
+          // runtime identity) must not silently revert it back to the
+          // pre-advertise fallback name behind the caller's back.
+          const identityLocked = session.info.advertised === true;
           if (clientMessage.name !== undefined) {
             if (typeof clientMessage.name !== "string") {
               throw new Error("Invalid presence name");
             }
-            if (session.info.name !== clientMessage.name) {
+            if (!identityLocked && session.info.name !== clientMessage.name) {
               session.info.name = clientMessage.name;
               changed = true;
             }
@@ -879,7 +983,7 @@ class IntercomBroker {
             if (typeof clientMessage.runtimeFallbackAlias !== "boolean") {
               throw new Error("Invalid presence runtimeFallbackAlias");
             }
-            if (session.info.runtimeFallbackAlias !== clientMessage.runtimeFallbackAlias) {
+            if (!identityLocked && session.info.runtimeFallbackAlias !== clientMessage.runtimeFallbackAlias) {
               session.info.runtimeFallbackAlias = clientMessage.runtimeFallbackAlias;
               changed = true;
             }
@@ -961,7 +1065,15 @@ class IntercomBroker {
   }
 
   private rememberDisconnectedSession(info: SessionInfo, now = Date.now()): void {
-    this.disconnectedSessions.set(info.id, { info: { ...info }, disconnectedAt: now });
+    // ACL fork: "advertised" is a live-connection promotion, not a durable
+    // identity. Carrying it into the disconnected-mailbox snapshot would let
+    // any unrelated main keep finding and queueing mail to a former child's
+    // public name/ID indefinitely (up to the 24h mailbox retention window)
+    // after the session that earned it is long gone. Strip it so a
+    // disconnected former child reverts to supervisor-only mailbox
+    // visibility, matching "advertised only while live".
+    const { advertised, ...rest } = info;
+    this.disconnectedSessions.set(info.id, { info: { ...rest }, disconnectedAt: now });
     this.pruneDisconnectedSessions(now);
   }
 

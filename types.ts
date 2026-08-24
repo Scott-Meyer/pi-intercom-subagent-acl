@@ -40,6 +40,18 @@ export interface SessionInfo {
    *  name, which is mutable — so a peer can live-resolve the current window
    *  from it via tmux when it needs to introspect or drive that pane. */
   tmuxPane?: string;
+  /** ACL fork: true when this session is a pi-subagents delegated child.
+   *  Set from local PI_SUBAGENT_* env vars at registration; the broker never
+   *  infers this from name/shape heuristics. */
+  isSubagent?: boolean;
+  /** ACL fork: the supervisor session's broker session ID, when the child
+   *  process knows it (PI_SUBAGENT_ORCHESTRATOR_SESSION_ID). Preferred over
+   *  supervisorName for matching because IDs are stable and unambiguous. */
+  supervisorSessionId?: string;
+  /** ACL fork: the supervisor session's intercom name/target
+   *  (PI_SUBAGENT_ORCHESTRATOR_TARGET), used to match a supervisor when the
+   *  child does not have the supervisor's session ID yet. */
+  supervisorName?: string;
 }
 
 export interface Message {

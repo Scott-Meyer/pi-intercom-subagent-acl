@@ -903,6 +903,24 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             extensions: currentExtensionCapabilities(),
           }
         : {}),
+      ...subagentAclFields(),
+    };
+  }
+
+  // ACL fork: label this session as a subagent child and record its
+  // supervisor identity so the broker can scope visibility. Uses the same
+  // gating (orchestratorTarget + runId + agent + index) as the
+  // contact_supervisor bridge, so a session is only ever tagged as a
+  // subagent when pi-subagents actually supplied bridge metadata.
+  function subagentAclFields(): { isSubagent?: boolean; supervisorSessionId?: string; supervisorName?: string } {
+    const metadata = readChildOrchestratorMetadata();
+    if (!metadata) {
+      return {};
+    }
+    return {
+      isSubagent: true,
+      supervisorName: metadata.orchestratorTarget,
+      ...(metadata.orchestratorSessionId ? { supervisorSessionId: metadata.orchestratorSessionId } : {}),
     };
   }
   // Snapshot the live session's context-window usage for presence. getContextUsage()

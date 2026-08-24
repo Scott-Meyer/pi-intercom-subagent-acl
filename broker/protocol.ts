@@ -169,6 +169,16 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
     return false;
   }
 
+  if (value.isSubagent !== undefined && typeof value.isSubagent !== "boolean") {
+    return false;
+  }
+  if (value.supervisorSessionId !== undefined && typeof value.supervisorSessionId !== "string") {
+    return false;
+  }
+  if (value.supervisorName !== undefined && typeof value.supervisorName !== "string") {
+    return false;
+  }
+
   return value.trustedLocal === undefined || typeof value.trustedLocal === "boolean";
 }
 
@@ -201,6 +211,15 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     return false;
   }
   if (value.tmuxPane !== undefined && typeof value.tmuxPane !== "string") {
+    return false;
+  }
+  if (value.isSubagent !== undefined && typeof value.isSubagent !== "boolean") {
+    return false;
+  }
+  if (value.supervisorSessionId !== undefined && typeof value.supervisorSessionId !== "string") {
+    return false;
+  }
+  if (value.supervisorName !== undefined && typeof value.supervisorName !== "string") {
     return false;
   }
 

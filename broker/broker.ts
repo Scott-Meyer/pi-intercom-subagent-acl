@@ -172,6 +172,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// ACL fork: subagent visibility scoping.
+//
+// A session tagged isSubagent may only see/reach the supervisor it was
+// delegated by. A main (non-subagent) session sees every other main session
+// plus only the subagent children it personally supervises — never another
+// main's children, and never a sibling child of its own children.
+//
+// Matching is (supervisorSessionId matches) OR (supervisorName matches),
+// never strict ID-then-name precedence. pi-subagents passes the parent's raw
+// pi session ID as PI_SUBAGENT_ORCHESTRATOR_SESSION_ID, but the parent may be
+// registered with pi-intercom under a different id (PI_INTERCOM_STABLE_ID /
+// config.stableId). In that case the ID never matches even though this is
+// genuinely the child's supervisor, and only the name fallback saves it —
+// mirroring resolveSupervisorTarget's own id-then-name resolution intent, but
+// evaluated as an OR so a stale/mismatched id can't shadow a correct name.
+function matchesSupervisor(child: SessionInfo, candidateSupervisor: SessionInfo): boolean {
+  if (child.supervisorSessionId && child.supervisorSessionId === candidateSupervisor.id) {
+    return true;
+  }
+  if (child.supervisorName && candidateSupervisor.name && candidateSupervisor.name.toLowerCase() === child.supervisorName.toLowerCase()) {
+    return true;
+  }
+  return false;
+}
+
+function canSeeSession(observer: SessionInfo, subject: SessionInfo): boolean {
+  if (observer.id === subject.id) {
+    return true;
+  }
+  if (observer.isSubagent) {
+    // Subagents see only their own supervisor, never siblings or other mains.
+    return matchesSupervisor(observer, subject);
+  }
+  if (!subject.isSubagent) {
+    // Mains see every other main.
+    return true;
+  }
+  // Mains see only the subagent children they personally supervise.
+  return matchesSupervisor(subject, observer);
+}
+
 function isPendingAskRecord(value: unknown): value is PendingAskRecord {
   if (!isRecord(value) || !isRecord(value.asker) || !isRecord(value.target)) {
     return false;
@@ -324,7 +365,7 @@ class IntercomBroker {
           this.rememberDisconnectedSession(existing);
           this.sessions.delete(sessionKey);
           this.clearMessageReceiptRoutesForSession(sessionKey);
-          this.broadcast({ type: "session_left", sessionId: existing.info.id }, sessionKey, existing.scopeId);
+          this.broadcastScoped({ type: "session_left", sessionId: existing.info.id }, existing.info, sessionKey, existing.scopeId);
           this.recomputeNamespaceOwners();
           this.scheduleShutdownCheck();
         }
@@ -473,6 +514,9 @@ class IntercomBroker {
           lastActivity: session.lastActivity,
           ...(session.status !== undefined ? { status: session.status } : {}),
           ...(session.tmuxPane !== undefined ? { tmuxPane: session.tmuxPane } : {}),
+          ...(session.isSubagent !== undefined ? { isSubagent: session.isSubagent } : {}),
+          ...(session.supervisorSessionId !== undefined ? { supervisorSessionId: session.supervisorSessionId } : {}),
+          ...(session.supervisorName !== undefined ? { supervisorName: session.supervisorName } : {}),
           trustedLocal: typeof LISTEN_TARGET === "string" && process.platform !== "win32",
         };
 
@@ -501,7 +545,7 @@ class IntercomBroker {
           sessionId: id,
           features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE],
         });
-        this.broadcast({ type: "session_joined", session: info }, key, scopeId);
+        this.broadcastScoped({ type: "session_joined", session: info }, info, key, scopeId);
 
         this.recomputeNamespaceOwners();
         this.flushMailboxForSession(connectedSession);
@@ -537,7 +581,7 @@ class IntercomBroker {
           this.rememberDisconnectedSession(existing);
           this.sessions.delete(currentKey);
           this.clearMessageReceiptRoutesForSession(currentKey);
-          this.broadcast({ type: "session_left", sessionId: existing.info.id }, currentKey, existing.scopeId);
+          this.broadcastScoped({ type: "session_left", sessionId: existing.info.id }, existing.info, currentKey, existing.scopeId);
           this.recomputeNamespaceOwners();
           this.scheduleShutdownCheck();
         }
@@ -588,13 +632,12 @@ class IntercomBroker {
         if (typeof clientMessage.requestId !== "string") {
           throw new Error("Invalid list message");
         }
-
         const requester = currentKey ? this.sessions.get(currentKey) : undefined;
         if (!requester || requester.socket !== socket) {
           throw new Error("List session not found");
         }
         const sessions = Array.from(this.sessions.values())
-          .filter(session => sameScope(session.scopeId, requester.scopeId))
+          .filter(session => sameScope(session.scopeId, requester.scopeId) && canSeeSession(requester.info, session.info))
           .map(s => s.info);
         writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
         break;
@@ -640,7 +683,8 @@ class IntercomBroker {
             break;
           }
           const exactTarget = this.sessions.get(scopedSessionKey(fromSession.scopeId, targetId));
-          if (!exactTarget) {
+          const exactTargetVisible = exactTarget ? this.isVisibleTo(currentKey, exactTarget.info) : false;
+          if (!exactTarget || !exactTargetVisible) {
             this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Session not found", "E_TARGET_NOT_FOUND");
             this.writeDeliveryFailure(socket, message.id, "Session not found", "E_TARGET_NOT_FOUND");
             break;
@@ -653,7 +697,7 @@ class IntercomBroker {
           clientMessage.to = targetId;
         }
 
-        const targets = this.findSessions(clientMessage.to, fromSession.scopeId);
+        const targets = this.findSessions(clientMessage.to, fromSession.scopeId, currentKey);
         if (targets.length === 1) {
           if (message.replyTo && !replyEdge) {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
@@ -728,7 +772,7 @@ class IntercomBroker {
           break;
         }
 
-        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to, fromSession.scopeId);
+        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to, fromSession.scopeId, currentKey);
         if (disconnectedTargets.length === 1) {
           if (message.replyTo && !replyEdge) {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
@@ -954,7 +998,7 @@ class IntercomBroker {
           session.info.lastActivity = now;
           if (changed || now - session.lastPresenceBroadcastAt >= PRESENCE_HEARTBEAT_MS) {
             session.lastPresenceBroadcastAt = now;
-            this.broadcast({ type: "presence_update", session: session.info }, currentKey, session.scopeId);
+            this.broadcastScoped({ type: "presence_update", session: session.info }, session.info, currentKey, session.scopeId);
           }
         }
         break;
@@ -1244,38 +1288,55 @@ class IntercomBroker {
     }
   }
 
-  private findSessions(nameOrId: string, scopeId: string | undefined): ConnectedSession[] {
+  // ACL fork: every lookup path is scoped through the requester's own
+  // visibility. A hidden session behaves exactly like a nonexistent one —
+  // callers get "Session not found", never a distinguishable ACL error, so
+  // existence of an out-of-scope session is never leaked.
+  private isVisibleTo(observerKey: string, subject: SessionInfo): boolean {
+    const observer = this.sessions.get(observerKey);
+    if (!observer) {
+      return false;
+    }
+    return canSeeSession(observer.info, subject);
+  }
+
+  private findSessions(nameOrId: string, scopeId: string | undefined, requesterKey: string): ConnectedSession[] {
+    const visible = (session: ConnectedSession) => this.isVisibleTo(requesterKey, session.info);
+
     const byId = this.sessions.get(scopedSessionKey(scopeId, nameOrId));
     if (byId) {
-      return [byId];
+      return visible(byId) ? [byId] : [];
     }
 
     const lowerName = nameOrId.toLowerCase();
-    const byName = Array.from(this.sessions.values()).filter(session => sameScope(session.scopeId, scopeId) && session.info.name?.toLowerCase() === lowerName);
+    const byName = Array.from(this.sessions.values()).filter(session => sameScope(session.scopeId, scopeId) && session.info.name?.toLowerCase() === lowerName && visible(session));
     if (byName.length > 0) {
       return byName;
     }
 
     return Array.from(this.sessions.entries())
-      .filter(([, session]) => sameScope(session.scopeId, scopeId) && session.info.id.startsWith(nameOrId))
+      .filter(([, session]) => sameScope(session.scopeId, scopeId) && session.info.id.startsWith(nameOrId) && visible(session))
       .map(([, session]) => session);
   }
 
-  private findDisconnectedSessions(nameOrId: string, scopeId: string | undefined): DisconnectedSession[] {
+  private findDisconnectedSessions(nameOrId: string, scopeId: string | undefined, requesterKey: string): DisconnectedSession[] {
     this.pruneDisconnectedSessions();
+    const observer = this.sessions.get(requesterKey);
+    const visible = (session: DisconnectedSession) => Boolean(observer) && canSeeSession(observer!.info, session.info);
+
     const byId = this.disconnectedSessions.get(scopedSessionKey(scopeId, nameOrId));
     if (byId) {
-      return [byId];
+      return visible(byId) ? [byId] : [];
     }
 
     const lowerName = nameOrId.toLowerCase();
-    const byName = Array.from(this.disconnectedSessions.values()).filter(session => sameScope(session.scopeId, scopeId) && session.info.name?.toLowerCase() === lowerName);
+    const byName = Array.from(this.disconnectedSessions.values()).filter(session => sameScope(session.scopeId, scopeId) && session.info.name?.toLowerCase() === lowerName && visible(session));
     if (byName.length > 0) {
       return byName;
     }
 
     return Array.from(this.disconnectedSessions.entries())
-      .filter(([, session]) => sameScope(session.scopeId, scopeId) && session.info.id.startsWith(nameOrId))
+      .filter(([, session]) => sameScope(session.scopeId, scopeId) && session.info.id.startsWith(nameOrId) && visible(session))
       .map(([, session]) => session);
   }
 
@@ -1314,6 +1375,27 @@ class IntercomBroker {
       if (id !== exclude && sameScope(session.scopeId, scopeId)) {
         writeMessage(session.socket, msg);
       }
+    }
+  }
+
+  // ACL fork: like broadcast(), but only reaches sessions that are allowed to
+  // see `subject` (the session that joined/left/changed presence) within the
+  // same scope. Used for session_joined, session_left, and presence_update so
+  // hidden peers never leak into a client's live session cache via these push
+  // events, even though the pull-based "list" response is separately filtered
+  // too.
+  private broadcastScoped(msg: BrokerMessage, subject: SessionInfo, exclude?: string, scopeId?: string): void {
+    for (const [id, session] of this.sessions) {
+      if (id === exclude) {
+        continue;
+      }
+      if (!sameScope(session.scopeId, scopeId)) {
+        continue;
+      }
+      if (!canSeeSession(session.info, subject)) {
+        continue;
+      }
+      writeMessage(session.socket, msg);
     }
   }
 

@@ -605,6 +605,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let runtimeContext: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
   let currentIntercomSessionId: string | null = null;
+  // ACL fork: fires the quiet, one-time supervisor notice the first time this
+  // subagent successfully advertises itself. Re-advertising under a new name
+  // later in the same session does not repeat the notice.
+  let hasNotifiedSupervisorOfAdvertise = false;
   let currentModel = "unknown";
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
@@ -2155,13 +2159,14 @@ Usage:
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
   intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
   intercom({ action: "pending" })                                      → List unresolved inbound asks
-  intercom({ action: "status" })                  → Show connection status`,
+  intercom({ action: "status" })                  → Show connection status
+  intercom({ action: "advertise", name: "my-nickname" })  → Subagent-only: self-promote to full main-level visibility under a chosen name`,
     promptSnippet:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'",
+      action: StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel", "advertise"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', 'cancel', or 'advertise'",
       }),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
@@ -2196,6 +2201,9 @@ Usage:
       focus: Type.Optional(Type.Boolean({
         description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
       })),
+      name: Type.Optional(Type.String({
+        description: "For 'advertise': the public name this subagent wants to claim. Must be unique among currently connected sessions.",
+      })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2212,9 +2220,65 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
+      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, name } = params;
 
       switch (action) {
+        case "advertise": {
+          const requestedName = name?.trim();
+          if (!requestedName) {
+            return {
+              content: [{ type: "text", text: "advertise requires a non-empty 'name'." }],
+              details: { error: true },
+            };
+          }
+
+          const metadata = readChildOrchestratorMetadata();
+          let result;
+          try {
+            result = await connectedClient.advertise(requestedName);
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: `Advertise failed: ${getErrorMessage(error)}` }],
+              details: { error: true },
+            };
+          }
+
+          if (!result.ok) {
+            return {
+              content: [{ type: "text", text: `Advertise failed: ${result.error ?? "unknown error"}` }],
+              details: { error: true },
+            };
+          }
+
+          // Best-effort, non-blocking notice to the supervisor -- same ordinary
+          // message pipeline as any other intercom send, delivered exactly once
+          // per session regardless of how many times this child re-advertises
+          // under a different name afterward.
+          if (metadata && !hasNotifiedSupervisorOfAdvertise) {
+            hasNotifiedSupervisorOfAdvertise = true;
+            try {
+              const resolvedSupervisor = await resolveSupervisorTarget(connectedClient, metadata);
+              const sendTarget = resolvedSupervisor ?? metadata.orchestratorTarget;
+              await connectedClient.send(sendTarget, {
+                text: formatChildOrchestratorMessage(
+                  "update",
+                  metadata,
+                  `This subagent has advertised itself as "${result.name}" and is now fully visible to and reachable by every session on the intercom mesh, not just you.`,
+                ),
+                expectsReply: false,
+              });
+            } catch {
+              // Best-effort only -- a failed notice must never fail the advertise
+              // call itself; the promotion already succeeded on the broker.
+            }
+          }
+
+          return {
+            content: [{ type: "text", text: `Advertised as "${result.name}". You are now fully visible to and reachable by every session on the intercom mesh, not just your supervisor.` }],
+            details: {},
+          };
+        }
+
         case "list": {
           try {
             const mySessionId = connectedClient.sessionId;

@@ -52,6 +52,13 @@ export interface SessionInfo {
    *  (PI_SUBAGENT_ORCHESTRATOR_TARGET), used to match a supervisor when the
    *  child does not have the supervisor's session ID yet. */
   supervisorName?: string;
+  /** ACL fork: true once a subagent has explicitly self-promoted via the
+   *  `advertise` action. An advertised child is treated as an ordinary main
+   *  for visibility in both directions (everyone sees it, it sees everyone),
+   *  while isSubagent/supervisorSessionId/supervisorName are preserved as
+   *  provenance rather than erased. Broker-authoritative; never set directly
+   *  by a presence update. */
+  advertised?: boolean;
 }
 
 export interface Message {
@@ -120,6 +127,7 @@ export type ClientMessage =
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }
+  | { type: "advertise"; requestId: string; name: string }
   | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
@@ -144,6 +152,7 @@ export type ClientMessage =
 export type BrokerMessage =
   | { type: "registered"; sessionId: string; features?: string[] }
   | { type: "sessions"; requestId: string; sessions: SessionInfo[] }
+  | { type: "advertise_result"; requestId: string; ok: boolean; name?: string; error?: string; code?: string }
   | { type: "message"; from: SessionInfo; message: Message }
   | { type: "presence_update"; session: SessionInfo }
   | { type: "session_joined"; session: SessionInfo }

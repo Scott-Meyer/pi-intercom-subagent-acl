@@ -10,7 +10,7 @@ import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
-import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
+import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceipt, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
   INTERCOM_EXTENSION_REGISTRY_READY_EVENT,
@@ -111,6 +111,13 @@ interface SupervisorInterviewReply {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+// Fork: a queued send to a disconnected session used to report plain
+// "Message sent", which reads as live delivery. Make the mailbox state explicit
+// so senders immediately know the target is offline and may never return.
+function queuedDeliveryNote(targetDisplay: string): string {
+  return `Queued for offline session "${targetDisplay}": it is not currently connected, so this message will be delivered only if it reconnects within 24h. If the session has ended, check intercom({ action: "list" }) and resend to its new address.`;
 }
 
 function deliveryDetails(result: SendResult): Record<string, unknown> {
@@ -1196,6 +1203,32 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return false;
   }
+  // Fork: when the broker expires (or evicts) a queued mailbox message we sent,
+  // surface it to the session instead of silently updating the delivery record.
+  // Without this, a "Message sent" from up to a day ago can quietly die with
+  // the sender none the wiser.
+  function handleExpiredOutboundReceipt(from: SessionInfo, receipt: MessageReceipt): void {
+    if (!runtimeStarted || !getLiveContext()) {
+      return;
+    }
+    const targetDisplay = from.name || from.id.slice(0, 8);
+    pi.appendEntry("intercom_delivery_failed", {
+      to: targetDisplay,
+      messageId: receipt.messageId,
+      detail: receipt.detail ?? "Mailbox delivery expired",
+      timestamp: receipt.timestamp,
+    });
+    pi.sendMessage(
+      {
+        customType: "intercom_delivery_notice",
+        content: `**Intercom delivery failed:** message ${receipt.messageId} to "${targetDisplay}" (${from.cwd}) was never delivered — ${receipt.detail ?? "the mailbox entry expired"}. If this still matters, run intercom({ action: "list" }) and resend to the session's current address.`,
+        display: true,
+        details: { to: targetDisplay, messageId: receipt.messageId, expired: true, ...(receipt.detail ? { detail: receipt.detail } : {}) },
+      },
+      { triggerTurn: true },
+    );
+  }
+
   function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       return;
@@ -1347,6 +1380,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             timestamp: message.receipt.timestamp,
             ...(message.receipt.detail ? { detail: message.receipt.detail } : {}),
           });
+          if (message.receipt.status === "expired") {
+            handleExpiredOutboundReceipt(message.from, message.receipt);
+          }
           break;
         case "message_control":
           handleMessageControl(message.control);
@@ -2444,12 +2480,13 @@ Usage:
             if (effectiveReplyTo) {
               dismissIncomingAsk(effectiveReplyTo);
             }
+            const sentText = target.projectPane
+              ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
+              : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${targetDisplay}`;
             return {
               content: [{
                 type: "text",
-                text: target.projectPane
-                  ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
-                  : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${targetDisplay}`,
+                text: result.delivery === "queued" ? `${sentText}\n\n${queuedDeliveryNote(targetDisplay)}` : sentText,
               }],
               details: {
                 ...deliveryDetails(result),
@@ -2634,8 +2671,12 @@ Usage:
               messageId: result.id,
               timestamp: Date.now(),
             });
+            const replyText = `Reply sent to ${target.from.name || target.from.id}`;
             return {
-              content: [{ type: "text", text: `Reply sent to ${target.from.name || target.from.id}` }],
+              content: [{
+                type: "text",
+                text: result.delivery === "queued" ? `${replyText}\n\n${queuedDeliveryNote(target.from.name || target.from.id)}` : replyText,
+              }],
               details: { ...deliveryDetails(result), replyTo: target.message.id },
             };
           } catch (error) {
@@ -2877,7 +2918,14 @@ Usage:
         messageId: result.messageId,
         timestamp: Date.now(),
       });
-      notifyIfLive(ctx, `Message sent to ${targetLabel}`, "info", overlayGeneration);
+      notifyIfLive(
+        ctx,
+        result.delivery === "queued"
+          ? `Message queued for offline session ${targetLabel} — delivered only if it reconnects within 24h`
+          : `Message sent to ${targetLabel}`,
+        "info",
+        overlayGeneration,
+      );
     }
   }
 

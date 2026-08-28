@@ -7,6 +7,7 @@ import type { SessionInfo } from "../types.ts";
 export interface ComposeResult {
   sent: boolean;
   messageId?: string;
+  delivery?: string;
   text?: string;
 }
 
@@ -94,6 +95,7 @@ export class ComposeOverlay implements Component {
         sent: true,
         messageId: result.id,
         text: this.inputBuffer.trim(),
+        delivery: result.delivery,
       });
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);

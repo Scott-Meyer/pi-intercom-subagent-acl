@@ -2,6 +2,13 @@
 
 All notable changes to the `pi-intercom` extension will be documented in this file.
 
+## [0.13.0-acl.2] - Delivery feedback
+
+### Fork highlights (on top of 0.13.0-acl.1)
+- **Honest send results:** a send that lands in a disconnected session's mailbox now says so explicitly ("Queued for offline session ... delivered only if it reconnects within 24h") instead of the misleading "Message sent". Applies to the send tool, reply tool, and compose overlay.
+- **Undelivered-message receipts:** when a queued mailbox message expires (24h retention) or is evicted (mailbox capacity), the broker now pushes an `expired` receipt to the sender, and the sender session surfaces it as a visible, agent-visible delivery-failure notice instead of silently dying. Expiry also runs on a periodic 60s sweep instead of lazily on the next unrelated mailbox queue operation.
+- **Name dedup at registration:** registering or renaming onto a name already held by another live session in the same scope auto-suffixes (`name-2`, `name-3`, ...) instead of accepting an ambiguous name that only fails at send time with `E_AMBIGUOUS_TARGET`. Deliberate `advertise` claims keep the stricter reject (`E_NAME_TAKEN`). Suffixes self-heal: when the colliding session leaves, the next presence sync reclaims the original name.
+
 ## [0.13.0-acl.1] - ACL fork, rebased onto upstream 0.12.0
 
 ### Fork highlights (on top of upstream 0.12.0)

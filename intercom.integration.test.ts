@@ -1338,7 +1338,7 @@ test("intercom-id inserts a stable handoff snippet into the editor", { concurren
   }
 });
 
-test("intercom tool shows unique ID prefixes when names collide", { concurrency: false }, async () => {
+test("intercom tool auto-suffixes colliding names so by-name targets stay unambiguous", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const twinA = new IntercomClient();
@@ -1354,21 +1354,25 @@ test("intercom tool shows unique ID prefixes when names collide", { concurrency:
     const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
     const listed = await intercomTool.execute("list-twin", { action: "list" }, new AbortController().signal, undefined, harness.ctx);
     const listText = listed.content.map((part) => (part as { text?: string }).text ?? "").join("");
+    // Fork: a colliding registration name is auto-suffixed instead of left
+    // ambiguous until send time. Roster rows still carry ID prefixes.
     assert.match(listText, /019fc92c-066f/);
     assert.match(listText, /019fc92c-b5f7/);
+    assert.match(listText, /twin-2/);
 
     const listedCwd = await intercomTool.execute("list-cwd-twin", { action: "list-cwd" }, new AbortController().signal, undefined, harness.ctx);
     const listCwdText = listedCwd.content.map((part) => (part as { text?: string }).text ?? "").join("");
     assert.match(listCwdText, /019fc92c-066f/);
     assert.doesNotMatch(listCwdText, /019fc92c-b5f7/);
 
-    const result = await intercomTool.execute("send-twin", { action: "send", to: "twin", message: "which one?" }, new AbortController().signal, undefined, harness.ctx);
+    // By-name sends resolve unambiguously to each twin.
+    const toFirst = await intercomTool.execute("send-twin", { action: "send", to: "twin", message: "the original" }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(toFirst.details?.error, true);
+    assert.equal(toFirst.details?.delivery, "socket_delivered");
 
-    assert.equal(result.details?.error, true);
-    const text = result.content.map((part) => (part as { text?: string }).text ?? "").join("");
-    assert.match(text, /parentheses/);
-    assert.match(text, /019fc92c-066f/);
-    assert.match(text, /019fc92c-b5f7/);
+    const toSecond = await intercomTool.execute("send-twin-2", { action: "send", to: "twin-2", message: "the suffixed twin" }, new AbortController().signal, undefined, harness.ctx);
+    assert.notEqual(toSecond.details?.error, true);
+    assert.equal(toSecond.details?.delivery, "socket_delivered");
     await harness.emitLifecycle("session_shutdown");
   } finally {
     await twinA.disconnect().catch(() => undefined);

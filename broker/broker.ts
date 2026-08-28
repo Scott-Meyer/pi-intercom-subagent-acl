@@ -42,6 +42,10 @@ const MESSAGE_RECEIPT_ROUTE_RETENTION_MS = 60 * 60 * 1000;
 const DISCONNECTED_SESSION_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
+// Periodic sweep so mailbox expiries (and their undelivered-receipt
+// notifications to senders) fire on schedule instead of lazily on the
+// next unrelated mailbox queue operation.
+const MAILBOX_SWEEP_INTERVAL_MS = 60 * 1000;
 const DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 4096;
 
@@ -261,6 +265,7 @@ class IntercomBroker {
   private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
   private shutdownTimer: NodeJS.Timeout | null = null;
+  private maintenanceTimer: NodeJS.Timeout | null = null;
   private readonly askTimeoutMs = getAskTimeoutMs();
   private namespaceOwners = new Map<string, NamespaceOwner>();
   private nextOwnerOrder = 1;
@@ -312,6 +317,11 @@ class IntercomBroker {
     }
     process.on("SIGTERM", () => this.shutdown());
     process.on("SIGINT", () => this.shutdown());
+    this.maintenanceTimer = setInterval(() => {
+      this.pruneMailboxMessages();
+      this.pruneDisconnectedSessions();
+    }, MAILBOX_SWEEP_INTERVAL_MS);
+    this.maintenanceTimer.unref?.();
   }
 
   private handleConnection(socket: net.Socket): void {
@@ -512,10 +522,11 @@ class IntercomBroker {
           previous.socket.end();
         }
         setKey(key);
+        const effectiveName = this.dedupeSessionName(session.name, scopeId, key);
         const info: SessionInfo = {
           id,
           endpointEpoch: randomUUID(),
-          ...(session.name !== undefined ? { name: session.name } : {}),
+          ...(effectiveName !== undefined ? { name: effectiveName } : {}),
           ...(session.runtimeFallbackAlias !== undefined ? { runtimeFallbackAlias: session.runtimeFallbackAlias } : {}),
           cwd: session.cwd,
           model: session.model,
@@ -1036,9 +1047,12 @@ class IntercomBroker {
             if (typeof clientMessage.name !== "string") {
               throw new Error("Invalid presence name");
             }
-            if (!identityLocked && session.info.name !== clientMessage.name) {
-              session.info.name = clientMessage.name;
-              changed = true;
+            if (!identityLocked) {
+              const effectiveName = this.dedupeSessionName(clientMessage.name, session.scopeId, currentKey);
+              if (effectiveName !== undefined && session.info.name !== effectiveName) {
+                session.info.name = effectiveName;
+                changed = true;
+              }
             }
           }
           if (clientMessage.runtimeFallbackAlias !== undefined) {
@@ -1152,6 +1166,27 @@ class IntercomBroker {
     }
   }
 
+  // Fork: when a queued mailbox message can no longer be delivered, the
+  // sender gets an explicit receipt instead of silence. Without this a send
+  // to a dead session reports "delivered (queued)" and then quietly expires
+  // up to a day later with no feedback at all.
+  private notifyMailboxUndelivered(entry: MailboxMessage, detail: string): void {
+    const sender = this.sessions.get(entry.fromKey);
+    if (!sender) {
+      return;
+    }
+    writeMessage(sender.socket, {
+      type: "message_receipt",
+      from: entry.target,
+      receipt: {
+        messageId: entry.message.id,
+        status: "expired",
+        timestamp: Date.now(),
+        detail,
+      },
+    });
+  }
+
   private pruneMailboxMessages(now = Date.now()): void {
     for (let index = this.mailboxMessages.length - 1; index >= 0; index -= 1) {
       const entry = this.mailboxMessages[index]!;
@@ -1160,6 +1195,7 @@ class IntercomBroker {
           this.askEdges.delete(entry.message.id);
           this.removePendingAskRecord(entry.message.id, entry.fromScopeId);
         }
+        this.notifyMailboxUndelivered(entry, "Mailbox delivery expired: the target session never reconnected");
         this.messageReceiptRoutes.delete(entry.message.id);
         this.updateDeliveryRecord(entry.fromKey, entry.message.id, "failed", "Mailbox delivery expired", "E_DELIVERY_EXPIRED");
         this.mailboxMessages.splice(index, 1);
@@ -1176,6 +1212,7 @@ class IntercomBroker {
         this.askEdges.delete(evicted.message.id);
         this.removePendingAskRecord(evicted.message.id, evicted.fromScopeId);
       }
+      this.notifyMailboxUndelivered(evicted, "Mailbox capacity evicted the delivery before the target session reconnected");
       this.messageReceiptRoutes.delete(evicted.message.id);
       this.updateDeliveryRecord(evicted.fromKey, evicted.message.id, "failed", "Mailbox capacity evicted the delivery", "E_DELIVERY_EVICTED");
     }
@@ -1407,6 +1444,38 @@ class IntercomBroker {
   // visibility. A hidden session behaves exactly like a nonexistent one —
   // callers get "Session not found", never a distinguishable ACL error, so
   // existence of an out-of-scope session is never leaked.
+  // Fork: registration/presence names are de-duplicated against every other
+  // live session in the same scope (independent of ACL visibility, so no
+  // observer can ever face a by-name ambiguity) so roster names are always
+  // uniquely addressable. A colliding name is auto-suffixed ("name-2",
+  // "name-3", ...) instead of failing at send time with E_AMBIGUOUS_TARGET.
+  // Deliberate advertise claims keep the stricter reject (E_NAME_TAKEN).
+  private dedupeSessionName(name: string | undefined, scopeId: string | undefined, selfKey: string): string | undefined {
+    const trimmed = name?.trim();
+    if (!trimmed) {
+      return name;
+    }
+    const taken = (candidate: string): boolean => {
+      const lower = candidate.toLowerCase();
+      return Array.from(this.sessions.values()).some(
+        (session) =>
+          session.key !== selfKey
+          && sameScope(session.scopeId, scopeId)
+          && (session.info.name?.toLowerCase() === lower || session.info.id === candidate),
+      );
+    };
+    if (!taken(trimmed)) {
+      return name;
+    }
+    for (let attempt = 2; attempt < 1000; attempt += 1) {
+      const candidate = `${trimmed}-${attempt}`;
+      if (!taken(candidate)) {
+        return candidate;
+      }
+    }
+    return `${trimmed}-${randomUUID().slice(0, 8)}`;
+  }
+
   private isVisibleTo(observerKey: string, subject: SessionInfo): boolean {
     const observer = this.sessions.get(observerKey);
     if (!observer) {
@@ -1884,7 +1953,11 @@ class IntercomBroker {
 
   private shutdown(): void {
     console.log("Broker shutting down");
-    
+
+    if (this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
     for (const session of this.sessions.values()) {
       session.socket.end();
     }

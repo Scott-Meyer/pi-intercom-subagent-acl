@@ -2,6 +2,13 @@
 
 All notable changes to the `pi-intercom` extension will be documented in this file.
 
+## [0.13.0-acl.1] - ACL fork, rebased onto upstream 0.12.0
+
+### Fork highlights (on top of upstream 0.12.0)
+- Subagent visibility ACL: a main sees every other main plus only the subagent children it personally supervises; a subagent sees only its own supervisor. All broker lookup paths (list, send, exact-target, disconnected-mailbox) are scoped through the requester's visibility, and a hidden session behaves exactly like a nonexistent one.
+- `advertise`: opt-in self-promotion for a tagged subagent to full main-level visibility both ways, with name/ID collision and control-character guards. Advertised status is stripped from disconnected-session snapshots (live-connection promotion only).
+- Upstream 0.12.0 features included: scoped intercom routing (scope-aware session keys and broadcast scoping compose with the ACL), lazy intercom tool visibility, and all earlier upstream fixes.
+
 ## [Unreleased]
 
 ## [0.13.0] - 2026-09-02

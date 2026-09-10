@@ -26,7 +26,7 @@ const keybindings = {
 
 const session: SessionInfo = {
   id: "session-12345678",
-  name: "subagent-chat-019ecaf6",
+  name: "session-019ecaf6",
   cwd: "/Users/envvar/.config/ghostty",
   model: "bsy-deepseek-v4-pro",
   pid: 1,
@@ -47,7 +47,7 @@ test("compose overlay renders lines at the declared overlay width", () => {
     theme as any,
     keybindings as any,
     session,
-    "subagent-chat-019ecaf6",
+    "session-019ecaf6",
     { send: async () => ({ delivered: true, id: "message-1" }) } as any,
     () => {},
   );

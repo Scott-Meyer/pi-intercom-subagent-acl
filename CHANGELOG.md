@@ -2,6 +2,11 @@
 
 All notable changes to the `pi-intercom` extension will be documented in this file.
 
+## [0.13.0-acl.3] - Neutral unnamed session aliases
+
+### Fixed
+- Unnamed ordinary sessions now use neutral `session-<id>` runtime aliases instead of looking like delegated subagents.
+
 ## [0.13.0-acl.2] - Delivery feedback
 
 ### Fork highlights (on top of 0.13.0-acl.1)

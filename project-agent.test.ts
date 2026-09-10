@@ -98,7 +98,7 @@ test("openProjectPane opens a Herdr pane and runs pi in the project", async () =
 
 test("waitForProjectSession returns the new project-pane session when no target is named", async () => {
   const before = [session("self", "self", "/repo-a")];
-  const after = [...before, session("pane-peer", "subagent-chat-pane", "/repo-b")];
+  const after = [...before, session("pane-peer", "session-pane", "/repo-b")];
   let calls = 0;
   const client = {
     async listSessions() {
@@ -120,7 +120,7 @@ test("waitForProjectSession returns the new project-pane session when no target 
 
 test("waitForProjectSession honors the target guard after opening a project pane", async () => {
   const before = [session("self", "self", "/repo-a")];
-  const afterUnnamed = [...before, session("pane-peer", "subagent-chat-pane", "/repo-b")];
+  const afterUnnamed = [...before, session("pane-peer", "session-pane", "/repo-b")];
   const afterNamed = [...afterUnnamed, session("worker-id", "worker", "/repo-b")];
   let calls = 0;
   const client = {

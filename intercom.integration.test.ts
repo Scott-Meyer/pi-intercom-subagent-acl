@@ -1068,7 +1068,7 @@ test("broker times out sockets that unregister and go idle", { concurrency: fals
   }
 });
 
-test("unnamed sessions use a collision-resistant runtime alias", { concurrency: false }, async () => {
+test("unnamed sessions use a neutral collision-resistant runtime alias", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const firstSessionId = "019fe418-248e-7447-9379-fdce6e91dcba";
@@ -1083,10 +1083,12 @@ test("unnamed sessions use a collision-resistant runtime alias", { concurrency: 
     await secondHarness.emitLifecycle("session_start");
     const first = await waitForSessionId(planner, firstSessionId);
     const second = await waitForSessionId(planner, secondSessionId);
-    assert.equal(first.name, "subagent-chat-019fe418-248e-7447");
-    assert.equal(second.name, "subagent-chat-019fe418-248e-7abc");
+    assert.equal(first.name, "session-019fe418-248e-7447");
+    assert.equal(second.name, "session-019fe418-248e-7abc");
     assert.equal(first.runtimeFallbackAlias, true);
     assert.equal(second.runtimeFallbackAlias, true);
+    assert.notEqual(first.isSubagent, true);
+    assert.notEqual(second.isSubagent, true);
     assert.notEqual(first.name, second.name);
   } finally {
     await firstHarness.emitLifecycle("session_shutdown");
@@ -3356,7 +3358,7 @@ test("broker does not treat runtime fallback aliases as reconnect identities", {
   const original = new IntercomClient();
   const unrelated = new IntercomClient();
   const replacement = new IntercomClient();
-  const fallbackAlias = "subagent-chat-019fe418-248e-7447";
+  const fallbackAlias = "session-019fe418-248e-7447";
   const originalId = "runtime-fallback-original";
 
   try {
@@ -3415,7 +3417,7 @@ test("broker does not deliver explicit mailbox mail to a matching fallback alias
   const original = new IntercomClient();
   const fallback = new IntercomClient();
   const replacement = new IntercomClient();
-  const sharedName = "subagent-chat-shared-worker";
+  const sharedName = "session-shared-worker";
   const originalId = "explicit-mailbox-original";
 
   try {

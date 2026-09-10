@@ -2,6 +2,12 @@
 
 All notable changes to the `pi-intercom` extension will be documented in this file.
 
+## [0.13.0-acl.4] - Upstream 0.13.0 rebase
+
+### Changed
+- Rebased the ACL fork onto upstream 0.13.0, including `/alias`, safer active-reply routing, stable intercom tool visibility, and hardened Windows broker startup.
+- Preserved the fork's subagent visibility ACL, explicit self-promotion, delivery feedback, live-name deduplication, and neutral unnamed-session aliases.
+
 ## [0.13.0-acl.3] - Neutral unnamed session aliases
 
 ### Fixed

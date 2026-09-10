@@ -1,6 +1,6 @@
 {
   "name": "pi-intercom",
-  "version": "0.13.0-acl.3",
+  "version": "0.13.0-acl.4",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",

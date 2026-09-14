@@ -43,7 +43,6 @@ const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
 const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
 const INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_SESSION_ID";
 const STABLE_INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_STABLE_ID";
-const NAME_POLL_MS_ENV = "PI_INTERCOM_NAME_POLL_MS";
 const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
@@ -574,16 +573,6 @@ function formatInboundDeliveryMetadata(message: Message): string {
   if (injectedAt) parts.push(`injected ${injectedAt}`);
   return parts.join(" · ");
 }
-function getNamePollMs(): number {
-  const configured = process.env[NAME_POLL_MS_ENV];
-  if (configured !== undefined) {
-    const value = Number(configured);
-    if (Number.isFinite(value) && value > 0) {
-      return value;
-    }
-  }
-  return 1000;
-}
 export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: IntercomClient | null = null;
   const config: IntercomConfig = loadConfig();
@@ -604,9 +593,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let currentModel = "unknown";
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
-  let namePollTimer: NodeJS.Timeout | null = null;
-  let lastPresenceName: string | null = null;
-  let lastPresenceRuntimeFallbackAlias: boolean | null = null;
   const previousIntercomSessionId = process.env[INTERCOM_SESSION_ID_ENV];
   let reconnectPromise: Promise<IntercomClient> | null = null;
   let reconnectPromiseGeneration: number | null = null;
@@ -733,13 +719,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     clearTimeout(startupConnectTimer);
     startupConnectTimer = null;
-  }
-  function clearNamePollTimer(): void {
-    if (!namePollTimer) {
-      return;
-    }
-    clearInterval(namePollTimer);
-    namePollTimer = null;
   }
   function getLiveContext(ctx: ExtensionContext | null = runtimeContext, generation = runtimeGeneration): ExtensionContext | null {
     if (disposed || shuttingDown || generation !== runtimeGeneration || !ctx) {
@@ -939,25 +918,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? sessionId);
-    lastPresenceName = identity.name;
-    lastPresenceRuntimeFallbackAlias = identity.runtimeFallbackAlias;
     client.updatePresence({ ...identity, status: currentStatus(), ...currentContextUsage() });
-  }
-  function startNamePoll(): void {
-    clearNamePollTimer();
-    const initialIdentity = currentSessionId ? buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId) : null;
-    lastPresenceName = initialIdentity?.name ?? null;
-    lastPresenceRuntimeFallbackAlias = initialIdentity?.runtimeFallbackAlias ?? null;
-    namePollTimer = setInterval(() => {
-      if (!currentSessionId || !getLiveContext()) {
-        return;
-      }
-      const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId);
-      if (identity.name !== lastPresenceName || identity.runtimeFallbackAlias !== lastPresenceRuntimeFallbackAlias) {
-        syncPresenceIdentity(currentSessionId);
-      }
-    }, getNamePollMs());
-    namePollTimer.unref?.();
   }
   function publishIntercomSessionId(sessionId: string): void {
     process.env[INTERCOM_SESSION_ID_ENV] = sessionId;
@@ -1619,7 +1580,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     reconnectAttempt = 0;
     clearReconnectTimer();
     clearStartupConnectTimer();
-    clearNamePollTimer();
     rejectReplyWaiter(new Error("Session replaced"));
     replyTracker.reset();
     if (previousClient) {
@@ -1632,12 +1592,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     publishIntercomSessionId(currentIntercomSessionId);
     currentModel = ctx.model?.id ?? "unknown";
     sessionStartedAt = Date.now();
-    const initialPresenceIdentity = buildPresenceIdentity(pi, currentIntercomSessionId);
-    lastPresenceName = initialPresenceIdentity.name;
-    lastPresenceRuntimeFallbackAlias = initialPresenceIdentity.runtimeFallbackAlias;
     agentRunning = false;
     activeTools.clear();
-    startNamePoll();
     const startupGeneration = runtimeGeneration;
     startupConnectTimer = setTimeout(() => {
       startupConnectTimer = null;
@@ -1768,7 +1724,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     runtimeGeneration += 1;
     clearStartupConnectTimer();
     clearReconnectTimer();
-    clearNamePollTimer();
     restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
@@ -1782,6 +1737,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     currentSessionId = null;
     currentIntercomSessionId = null;
     sessionStartedAt = null;
+  });
+  pi.on("session_info_changed", (_event, ctx) => {
+    if (!currentSessionId || !getLiveContext(ctx)) {
+      return;
+    }
+    syncPresenceIdentity(currentSessionId);
   });
   pi.on("turn_end", () => {
     if (!getLiveContext()) {
@@ -2846,9 +2807,9 @@ Usage:
       return;
     }
 
-    // Pi's session_info_changed event updates the built-in UI, but it is not
-    // an ExtensionAPI event. Push the new identity directly so broker peers
-    // see the alias without waiting for the idle name poll.
+    // session_info_changed is the shared identity contract. Keep this direct
+    // push as an idempotent fast path so /alias has completed broker presence
+    // synchronization before the command reports success.
     syncPresenceIdentity(liveContext.sessionManager.getSessionId());
     notifyAliasCommand(liveContext, `Session alias set: ${alias}`, "info", commandGeneration);
   }

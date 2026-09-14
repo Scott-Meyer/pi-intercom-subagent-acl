@@ -29,6 +29,9 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Changed
+- Session-name presence now follows Pi's `session_info_changed` event immediately instead of polling while idle. This raises the minimum supported Pi version to 0.80.3.
+
 ## [0.13.0] - 2026-09-02
 
 ### Highlights

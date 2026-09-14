@@ -20,7 +20,6 @@ const childEnvKeys = [
   "PI_SUBAGENT_ORCHESTRATOR_TARGET",
   "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID",
   "PI_INTERCOM_SESSION_ID",
-  "PI_INTERCOM_NAME_POLL_MS",
   "PI_SUBAGENT_RUN_ID",
   "PI_SUBAGENT_CHILD_AGENT",
   "PI_SUBAGENT_CHILD_INDEX",
@@ -102,7 +101,6 @@ async function withChildOrchestratorEnv<T>(metadata: {
   orchestratorTarget?: string;
   orchestratorSessionId?: string;
   inheritedIntercomSessionId?: string;
-  namePollMs?: string;
   runId?: string;
   agent?: string;
   index?: string;
@@ -117,7 +115,6 @@ async function withChildOrchestratorEnv<T>(metadata: {
   if (metadata.orchestratorTarget !== undefined) process.env.PI_SUBAGENT_ORCHESTRATOR_TARGET = metadata.orchestratorTarget;
   if (metadata.orchestratorSessionId !== undefined) process.env.PI_SUBAGENT_ORCHESTRATOR_SESSION_ID = metadata.orchestratorSessionId;
   if (metadata.inheritedIntercomSessionId !== undefined) process.env.PI_INTERCOM_SESSION_ID = metadata.inheritedIntercomSessionId;
-  if (metadata.namePollMs !== undefined) process.env.PI_INTERCOM_NAME_POLL_MS = metadata.namePollMs;
   if (metadata.runId !== undefined) process.env.PI_SUBAGENT_RUN_ID = metadata.runId;
   if (metadata.agent !== undefined) process.env.PI_SUBAGENT_CHILD_AGENT = metadata.agent;
   if (metadata.index !== undefined) process.env.PI_SUBAGENT_CHILD_INDEX = metadata.index;
@@ -1359,9 +1356,7 @@ test("alias names the current session, opens the local input menu, and appears i
   });
 
   try {
-    // Disable the background name poll for this test so the broker update
-    // proves that /alias synchronizes presence directly.
-    await withChildOrchestratorEnv({ namePollMs: "60000" }, async () => {
+    await withChildOrchestratorEnv({}, async () => {
       piIntercomExtension(harness.pi as never);
       await harness.emitLifecycle("session_start");
       const initial = await waitForSessionByName(planner, "alias-worker");
@@ -1431,7 +1426,7 @@ test("alias reports no-UI usage and current alias without hanging", { concurrenc
   const harness = createExtensionHarness("no-ui-worker");
 
   try {
-    await withChildOrchestratorEnv({ namePollMs: "60000" }, async () => {
+    await withChildOrchestratorEnv({}, async () => {
       piIntercomExtension(harness.pi as never);
       await harness.emitLifecycle("session_start");
       const initial = await waitForSessionByName(planner, "no-ui-worker");
@@ -1937,20 +1932,22 @@ test("sessions publish automatic lifecycle status", { concurrency: false }, asyn
   }
 });
 
-test("idle name poll propagates /name changes without other activity", { concurrency: false }, async () => {
+test("session_info_changed propagates /name changes without other activity", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   let sessionName = "idle-name-before";
   const harness = createExtensionHarness(() => sessionName, { hasUI: true });
 
   try {
-    await withChildOrchestratorEnv({ namePollMs: "25" }, async () => {
-      const { default: piIntercomExtension } = await import("./index.ts");
-      piIntercomExtension(harness.pi as never);
-      await harness.emitLifecycle("session_start");
-      await waitForSessionByName(planner, "idle-name-before");
-      sessionName = "idle-name-after";
-      await waitForSessionByName(planner, "idle-name-after");
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "idle-name-before");
+    sessionName = "idle-name-after";
+    await harness.emitLifecycle("session_info_changed", {
+      type: "session_info_changed",
+      name: sessionName,
     });
+    await waitForSessionByName(planner, "idle-name-after");
   } finally {
     await harness.emitLifecycle("session_shutdown");
     await cleanup();

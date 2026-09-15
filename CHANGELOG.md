@@ -2,6 +2,18 @@
 
 All notable changes to the `pi-intercom` extension will be documented in this file.
 
+## [Unreleased]
+
+## [0.13.0-acl.5] - 2026-09-15
+
+### Changed
+- Session-name presence follows Pi's `session_info_changed` extension event immediately where available. Upstream Pi 0.73.1 exposes the core event without forwarding it to extensions, so it uses a one-second compatibility fallback.
+- Pi, TUI, and TypeBox host modules are optional peers, so packaging installs neither coding-agent distribution nor duplicate host libraries. The extension supports upstream Pi 0.73.1 and fork 0.80.3+ with a compatible sibling-package set; tests cover a fully pinned 0.80.3 family and the default 0.85.1 resolution.
+
+### Fixed
+- A name change that lands while the broker registration acknowledgment is pending is replayed after connection instead of remaining stale.
+- Name events received outside a live session no longer poison compatibility-fallback deduplication.
+
 ## [0.13.0-acl.4] - Upstream 0.13.0 rebase
 
 ### Changed
@@ -26,11 +38,6 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 - Subagent visibility ACL: a main sees every other main plus only the subagent children it personally supervises; a subagent sees only its own supervisor. All broker lookup paths (list, send, exact-target, disconnected-mailbox) are scoped through the requester's visibility, and a hidden session behaves exactly like a nonexistent one.
 - `advertise`: opt-in self-promotion for a tagged subagent to full main-level visibility both ways, with name/ID collision and control-character guards. Advertised status is stripped from disconnected-session snapshots (live-connection promotion only).
 - Upstream 0.12.0 features included: scoped intercom routing (scope-aware session keys and broadcast scoping compose with the ACL), lazy intercom tool visibility, and all earlier upstream fixes.
-
-## [Unreleased]
-
-### Changed
-- Session-name presence now follows Pi's `session_info_changed` event immediately instead of polling while idle. This raises the minimum supported Pi version to 0.80.3.
 
 ## [0.13.0] - 2026-09-02
 

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import { ComposeOverlay } from "../ui/compose.ts";
 import { SessionListOverlay } from "../ui/session-list.ts";
 import type { SessionInfo } from "../types.ts";

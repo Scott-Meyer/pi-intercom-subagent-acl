@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { stripVTControlCharacters } from "node:util";
 
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import { InlineMessageComponent } from "../ui/inline-message.ts";
 import type { Message, SessionInfo } from "../types.ts";
 

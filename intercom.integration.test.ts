@@ -1954,6 +1954,96 @@ test("session_info_changed propagates /name changes without other activity", { c
   }
 });
 
+test("hosts without extension name events reconcile names through the compatibility fallback", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  let sessionName = "compat-name-before";
+  const harness = createExtensionHarness(() => sessionName, { hasUI: true });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "compat-name-before");
+
+    // Upstream Pi 0.73.1 emits session_info_changed to RPC/TUI consumers but
+    // does not forward it through ExtensionAPI.on(), so no lifecycle event is
+    // delivered to this harness after the underlying name changes.
+    sessionName = "compat-name-after";
+    await waitForSessionByName(planner, "compat-name-after");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("non-live name events do not suppress compatibility reconciliation", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  let sessionName = "stale-event-name-before";
+  const harness = createExtensionHarness(() => sessionName, { hasUI: true });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "stale-event-name-before");
+
+    sessionName = "stale-event-name-after";
+    const staleContext = {
+      ...harness.ctx,
+      sessionManager: { getSessionId: () => "different-session" },
+    };
+    await harness.emitLifecycle("session_info_changed", {
+      type: "session_info_changed",
+      name: sessionName,
+    }, staleContext);
+
+    await waitForSessionByName(planner, "stale-event-name-after");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("name changes during registration are replayed after the broker ACK", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  let sessionName = "handshake-name-before";
+  const harness = createExtensionHarness(() => sessionName, { hasUI: true });
+  const originalConnect = IntercomClient.prototype.connect;
+  let connectEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { connectEntered = resolve; });
+  let releaseConnect!: () => void;
+  const mayConnect = new Promise<void>((resolve) => { releaseConnect = resolve; });
+
+  IntercomClient.prototype.connect = function (session, sessionId) {
+    connectEntered();
+    return mayConnect.then(() => originalConnect.call(this, session, sessionId));
+  };
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    const starting = harness.emitLifecycle("session_start");
+    await entered;
+
+    // Registration already captured the old name, but the client has no broker
+    // session id yet, so this event's immediate updatePresence is a no-op.
+    sessionName = "handshake-name-after";
+    await harness.emitLifecycle("session_info_changed", {
+      type: "session_info_changed",
+      name: sessionName,
+    });
+    releaseConnect();
+    await starting;
+
+    await waitForSessionByName(planner, "handshake-name-after");
+  } finally {
+    IntercomClient.prototype.connect = originalConnect;
+    releaseConnect();
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("turn_start re-registers when Pi replaces the session context", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   let sessionName = "fork-before";

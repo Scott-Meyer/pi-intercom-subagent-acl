@@ -1,8 +1,8 @@
-import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
+import type { AgentSessionEvent, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
-import { Text } from "@earendil-works/pi-tui";
+import { Text } from "@mariozechner/pi-tui";
+import { defineTool, sessionInfoChangesReachExtensions, StringEnum } from "./pi-compat.ts";
 import { IntercomClient, type SendResult } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
@@ -31,6 +31,8 @@ import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
+
+type SessionInfoChangedEvent = Extract<AgentSessionEvent, { type: "session_info_changed" }>;
 
 const INTERCOM_TOOL_NAME = "intercom";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
@@ -597,6 +599,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let reconnectPromise: Promise<IntercomClient> | null = null;
   let reconnectPromiseGeneration: number | null = null;
   let startupConnectTimer: NodeJS.Timeout | null = null;
+  let sessionNameCompatibilityTimer: NodeJS.Timeout | null = null;
+  let observedSessionName: string | undefined;
   let reconnectAttempt = 0;
   let shuttingDown = false;
   let disposed = true;
@@ -719,6 +723,24 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     clearTimeout(startupConnectTimer);
     startupConnectTimer = null;
+  }
+  function clearSessionNameCompatibilityTimer(): void {
+    if (!sessionNameCompatibilityTimer) return;
+    clearInterval(sessionNameCompatibilityTimer);
+    sessionNameCompatibilityTimer = null;
+  }
+  function startSessionNameCompatibilityTimer(): void {
+    clearSessionNameCompatibilityTimer();
+    observedSessionName = pi.getSessionName()?.trim() || undefined;
+    if (sessionInfoChangesReachExtensions()) return;
+    sessionNameCompatibilityTimer = setInterval(() => {
+      if (!currentSessionId || !getLiveContext()) return;
+      const currentName = pi.getSessionName()?.trim() || undefined;
+      if (currentName === observedSessionName) return;
+      observedSessionName = currentName;
+      syncPresenceIdentity(currentSessionId);
+    }, 1_000);
+    sessionNameCompatibilityTimer.unref?.();
   }
   function getLiveContext(ctx: ExtensionContext | null = runtimeContext, generation = runtimeGeneration): ExtensionContext | null {
     if (disposed || shuttingDown || generation !== runtimeGeneration || !ctx) {
@@ -1427,7 +1449,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (reconnectPromise && reconnectPromiseGeneration === generationAtStart) {
       return reconnectPromise;
     }
-    const nextReconnectPromise = (async () => {
+    let nextReconnectPromise!: Promise<IntercomClient>;
+    nextReconnectPromise = (async () => {
       const nextClient = new IntercomClient();
       client = nextClient;
       attachClientHandlers(nextClient);
@@ -1440,6 +1463,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         client = nextClient;
         reconnectAttempt = 0;
+        // Registration snapshots identity before awaiting the broker ACK. A Pi
+        // name event can land in that window while updatePresence is not yet
+        // writable; replay the live identity once the session id is assigned.
+        syncPresenceIdentity(currentSessionId);
         return nextClient;
       } catch (error) {
         if (client === nextClient) {
@@ -1594,6 +1621,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     sessionStartedAt = Date.now();
     agentRunning = false;
     activeTools.clear();
+    startSessionNameCompatibilityTimer();
     const startupGeneration = runtimeGeneration;
     startupConnectTimer = setTimeout(() => {
       startupConnectTimer = null;
@@ -1724,6 +1752,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     runtimeGeneration += 1;
     clearStartupConnectTimer();
     clearReconnectTimer();
+    clearSessionNameCompatibilityTimer();
     restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
@@ -1738,10 +1767,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     currentIntercomSessionId = null;
     sessionStartedAt = null;
   });
-  pi.on("session_info_changed", (_event, ctx) => {
+  // Upstream 0.73.1 emits this event but omitted it from ExtensionAPI's event
+  // overloads. Compile against the common runtime contract shared by both Pi
+  // distributions instead of requiring the fork's broader declaration file.
+  const onSessionInfoChanged = pi.on as unknown as (
+    event: "session_info_changed",
+    handler: (event: SessionInfoChangedEvent, ctx: ExtensionContext) => void,
+  ) => void;
+  onSessionInfoChanged("session_info_changed", (event, ctx) => {
     if (!currentSessionId || !getLiveContext(ctx)) {
       return;
     }
+    observedSessionName = event.name?.trim() || undefined;
     syncPresenceIdentity(currentSessionId);
   });
   pi.on("turn_end", () => {
@@ -2387,7 +2424,7 @@ Usage:
             }
             const target: DeliveryTarget = cwd
               ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal })
-              : { id: await resolveSessionTarget(connectedClient, to) ?? to, label: to };
+              : { id: await resolveSessionTarget(connectedClient, to!) ?? to!, label: to! };
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
             if (sendTo === connectedClient.sessionId) {
@@ -2499,14 +2536,14 @@ Usage:
             if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
             } else {
-              const resolved = await resolveSessionTarget(connectedClient, to);
+              const resolved = await resolveSessionTarget(connectedClient, to!);
               if (!resolved) {
                 return {
                   content: [{ type: "text", text: `Session "${to}" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects.` }],
                   details: { error: true },
                 };
               }
-              target = { id: resolved, label: to };
+              target = { id: resolved, label: to! };
             }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
@@ -2807,9 +2844,10 @@ Usage:
       return;
     }
 
-    // session_info_changed is the shared identity contract. Keep this direct
-    // push as an idempotent fast path so /alias has completed broker presence
-    // synchronization before the command reports success.
+    // session_info_changed is the canonical identity contract where the host
+    // forwards it to extensions. Keep this direct push as an idempotent fast
+    // path so /alias has completed broker presence synchronization before the
+    // command reports success.
     syncPresenceIdentity(liveContext.sessionManager.getSessionId());
     notifyAliasCommand(liveContext, `Session alias set: ${alias}`, "info", commandGeneration);
   }

@@ -32,10 +32,21 @@ If upstream `pi-intercom` is already installed, remove it first so Pi does not l
 
 ```bash
 pi remove npm:pi-intercom
-pi install git:github.com/Scott-Meyer/pi-intercom-subagent-acl@v0.13.0-acl.4
+pi install git:github.com/Scott-Meyer/pi-intercom-subagent-acl@v0.13.0-acl.5
 ```
 
 For a fresh install, only the second command is needed. Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
+
+### Pi compatibility
+
+This package supports both Pi distributions:
+
+- `@mariozechner/pi-coding-agent` 0.73.1
+- `@earendil-works/pi-coding-agent` 0.80.3 or newer with a compatible sibling-package set; 0.80.3 is tested with `pi-agent-core`, `pi-ai`, and `pi-tui` pinned to 0.80.3, while the current 0.85.1 release is tested with its default resolution
+
+Installing pi-intercom does not install or replace either coding-agent distribution or duplicate its host libraries. Pi, TUI, and TypeBox are optional peers supplied by the host; the package's only hard runtime dependency is `tsx`, used by the standalone broker. The fork loader maps the upstream-compatible extension imports to its own host modules. Fork hosts publish name changes to extensions immediately; upstream 0.73.1 exposes the same core event only to RPC/TUI consumers, so pi-intercom uses a one-second compatibility fallback there. `npm run test:host-compat` packs the extension and boots it under upstream 0.73.1, a coherent fork 0.80.3 dependency set, and fork 0.85.1 without allowing one coding-agent distribution to pull in the other.
+
+The ACL additions are also optional at runtime. An ordinary Pi session without pi-subagents bridge metadata gets normal intercom behavior. Child-only visibility and the fallback `contact_supervisor` tool activate only when pi-subagents provides the corresponding environment metadata; if its native supervisor channel is available, pi-intercom leaves that tool to the native channel.
 
 **Recommended:** Add this snippet to your project's `AGENTS.md` to help agents understand when to coordinate across sessions:
 
@@ -455,7 +466,8 @@ Other Pi extensions can use intercom's broker for bounded, non-conversational co
 Register during `session_start` so intercom includes the capability in its deferred broker registration:
 
 ```typescript
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+// Use @earendil-works/pi-coding-agent here when targeting that distribution.
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
   type IntercomExtensionChannel,

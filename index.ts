@@ -631,7 +631,10 @@ function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): stri
 }
 function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: boolean, idPrefix: string): string {
   const name = session.name || "Unnamed session";
-  const tags = [isSelf ? "self" : session.cwd === currentCwd ? "same cwd" : undefined, session.status]
+  const remote = session.federation
+    ? `remote:${session.federation.originLabel ?? session.federation.originId} · roster only`
+    : undefined;
+  const tags = [isSelf ? "self" : session.cwd === currentCwd ? "same cwd" : undefined, remote, session.status]
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
   const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : "";

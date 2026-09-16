@@ -23,18 +23,24 @@ import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapab
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { CollaborationStateStore } from "./collaboration-state.ts";
-import { isValidSessionDescription, isValidSessionName } from "../session-profile.ts";
+import { isValidSessionDescription, isValidSessionName, RESERVED_SESSION_NAME_PREFIX } from "../session-profile.ts";
 import {
   isBrokerAcceptPeerRequest,
   isBrokerDialPeerRequest,
   isFederationCorrelationId,
   isPeerHello,
 } from "./federation-protocol.ts";
-import { FederationPeerError, PeerLinkManager, type PreparedInboundPeer } from "./peer-link.ts";
+import { FederationPeerError, PeerLinkManager, type FederationPeerLink, type PreparedInboundPeer } from "./peer-link.ts";
+import {
+  FederationRosterState,
+  type ImportedRosterChange,
+  type LocallyOwnedFederationSession,
+} from "./federation-roster.ts";
 import {
   FEDERATION_PROTOCOL_NAME,
   FEDERATION_PROTOCOL_VERSION,
   FEDERATION_REQUIRED_FEATURES,
+  FEDERATION_ROSTER_FEATURE,
   type BrokerDialPeerRequest,
   type FederationFailureCode,
 } from "./federation-types.ts";
@@ -317,6 +323,7 @@ class IntercomBroker {
   private extensionStateManager: ExtensionStateManager;
   private collaborationState: CollaborationStateStore;
   private peerLinks: PeerLinkManager;
+  private federationRoster: FederationRosterState;
 
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
@@ -328,8 +335,22 @@ class IntercomBroker {
     this.peerLinks = new PeerLinkManager({
       onSocketOpened: (socket) => this.connections.add(socket),
       onSocketClosed: (socket) => this.connections.delete(socket),
-      onLinkUp: () => this.cancelShutdownTimer(),
-      onLinkDown: () => this.scheduleShutdownCheck(),
+      onLinkUp: (link) => {
+        this.cancelShutdownTimer();
+        this.federationRoster.linkUp(link);
+      },
+      onLinkDown: (link) => {
+        this.federationRoster.linkDown(link.linkId);
+        this.scheduleShutdownCheck();
+      },
+      onPeerMessage: (link, value) => this.handleFederationPeerMessage(link, value),
+    });
+    this.federationRoster = new FederationRosterState({
+      originEpoch: randomUUID(),
+      listLocalSessions: () => this.listLocallyOwnedFederationSessions(),
+      send: (link, frame) => writeMessage(link.socket, frame),
+      onImportedChange: (change) => this.handleImportedRosterChange(change),
+      onLinkError: (link, error) => link.socket.destroy(error),
     });
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
@@ -569,7 +590,7 @@ class IntercomBroker {
       const claimedType = typeof record?.type === "string" ? record.type : undefined;
 
       if (connectionRole === "peer") {
-        this.peerLinks.assertNoPostHandshakeMessage(peerLinkId!, msg);
+        this.peerLinks.handlePostHandshakeMessage(peerLinkId!, msg);
         return;
       }
       if (connectionRole === "control") {
@@ -615,6 +636,7 @@ class IntercomBroker {
         }
         connectionRole = "peer";
         peerLinkId = accepted.link.linkId;
+        this.peerLinks.activateLink(accepted.link.linkId);
         return;
       }
 
@@ -718,6 +740,7 @@ class IntercomBroker {
           this.sessions.delete(sessionKey);
           this.clearMessageReceiptRoutesForSession(sessionKey);
           this.broadcastScoped({ type: "session_left", sessionId: existing.info.id }, existing.info, sessionKey, existing.scopeId);
+          this.federationRoster.reconcileLocalRoster();
           this.recomputeNamespaceOwners();
         }
       }
@@ -789,6 +812,51 @@ class IntercomBroker {
         this.shutdown();
       }
     }, 5000);
+  }
+
+  private listLocallyOwnedFederationSessions(): LocallyOwnedFederationSession[] {
+    return [...this.sessions.values()].map((session) => ({
+      ownership: "local" as const,
+      exportEligible: !isRestrictedSubagent(session.info),
+      localScopeId: session.scopeId ?? null,
+      info: session.info,
+    }));
+  }
+
+  private handleFederationPeerMessage(link: FederationPeerLink, value: unknown): void {
+    if (!link.features.includes(FEDERATION_ROSTER_FEATURE)) {
+      throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Peer sent a roster frame without negotiating roster support");
+    }
+    if (!this.federationRoster.handlePeerFrame(link.linkId, value)) {
+      throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Unsupported federation peer frame");
+    }
+  }
+
+  private handleImportedRosterChange(change: ImportedRosterChange): void {
+    for (const imported of change.joined) {
+      this.broadcastScoped(
+        { type: "session_joined", session: imported.info },
+        imported.info,
+        undefined,
+        imported.localScopeId ?? undefined,
+      );
+    }
+    for (const imported of change.updated) {
+      this.broadcastScoped(
+        { type: "presence_update", session: imported.info },
+        imported.info,
+        undefined,
+        imported.localScopeId ?? undefined,
+      );
+    }
+    for (const imported of change.left) {
+      this.broadcastScoped(
+        { type: "session_left", sessionId: imported.info.id },
+        imported.info,
+        undefined,
+        imported.localScopeId ?? undefined,
+      );
+    }
   }
 
   private async handleDialPeerControl(
@@ -976,6 +1044,7 @@ class IntercomBroker {
           session: info,
         });
         this.broadcastScoped({ type: "session_joined", session: info }, info, key, scopeId);
+        this.federationRoster.reconcileLocalRoster();
 
         this.recomputeNamespaceOwners();
         this.flushMailboxForSession(connectedSession);
@@ -1012,6 +1081,7 @@ class IntercomBroker {
           this.sessions.delete(currentKey);
           this.clearMessageReceiptRoutesForSession(currentKey);
           this.broadcastScoped({ type: "session_left", sessionId: existing.info.id }, existing.info, currentKey, existing.scopeId);
+          this.federationRoster.reconcileLocalRoster();
           this.recomputeNamespaceOwners();
           this.scheduleShutdownCheck();
         }
@@ -1066,10 +1136,18 @@ class IntercomBroker {
         if (!requester || requester.socket !== socket) {
           throw new Error("List session not found");
         }
-        const sessions = Array.from(this.sessions.values())
+        const localSessions = Array.from(this.sessions.values())
           .filter(session => sameScope(session.scopeId, requester.scopeId) && canSeeSession(requester.info, session.info))
           .map(s => s.info);
-        writeMessage(socket, { type: "sessions", requestId: clientMessage.requestId, sessions });
+        const importedSessions = this.federationRoster.listImported()
+          .filter(session => sameScope(session.localScopeId ?? undefined, requester.scopeId)
+            && canSeeSession(requester.info, session.info))
+          .map(session => session.info);
+        writeMessage(socket, {
+          type: "sessions",
+          requestId: clientMessage.requestId,
+          sessions: [...localSessions, ...importedSessions],
+        });
         break;
       }
 
@@ -1160,6 +1238,7 @@ class IntercomBroker {
         // so this reaches every previously-blind session as well as everyone
         // who could already see it -- exactly the newly-widened audience.
         this.broadcastScoped({ type: "presence_update", session: self.info }, self.info, currentKey, self.scopeId);
+        this.federationRoster.reconcileLocalRoster();
         break;
       }
 
@@ -1177,6 +1256,15 @@ class IntercomBroker {
         const contactKind = clientMessage.contactKind ?? "direct";
         if (contactKind !== "direct" && contactKind !== "broadcast") {
           this.writeDeliveryFailure(socket, message.id, "Invalid contact kind", "E_INVALID_MESSAGE");
+          break;
+        }
+        if (clientMessage.to.startsWith(RESERVED_SESSION_NAME_PREFIX)) {
+          // Origin-qualified identities belong to imported federation rows,
+          // which are roster-only until routed delivery ships. They must never
+          // fall through to local name or mailbox resolution.
+          const fingerprint = this.deliveryFingerprint(message, clientMessage.to, contactKind);
+          this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Remote federation sessions are roster-only until routed delivery ships", "E_TARGET_NOT_FOUND");
+          this.writeDeliveryFailure(socket, message.id, "Remote federation sessions are roster-only until routed delivery ships", "E_TARGET_NOT_FOUND");
           break;
         }
         const fromSession = this.sessions.get(currentKey);
@@ -1470,6 +1558,7 @@ class IntercomBroker {
             currentKey,
             session.scopeId,
           );
+          this.federationRoster.reconcileLocalRoster();
           writeMessage(socket, {
             type: "compaction_recorded",
             eventId: clientMessage.eventId,
@@ -1704,6 +1793,7 @@ class IntercomBroker {
           if (changed || now - session.lastPresenceBroadcastAt >= PRESENCE_HEARTBEAT_MS) {
             session.lastPresenceBroadcastAt = now;
             this.broadcastScoped({ type: "presence_update", session: session.info }, session.info, currentKey, session.scopeId);
+            this.federationRoster.reconcileLocalRoster();
           }
         }
         break;

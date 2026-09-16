@@ -8,6 +8,7 @@ import {
   FEDERATION_PROTOCOL_NAME,
   FEDERATION_PROTOCOL_VERSION,
   FEDERATION_REQUIRED_FEATURES,
+  FEDERATION_SUPPORTED_FEATURES,
   type BrokerAcceptPeerRequest,
   type BrokerDialPeerRequest,
   type PeerHello,
@@ -55,6 +56,7 @@ test("inbound hello must match independently prepared origin and local scope aut
   assert.deepEqual(accepted.link?.localOrigin, remoteOrigin);
   assert.deepEqual(accepted.link?.remoteOrigin, localOrigin);
   assert.deepEqual(accepted.link?.scopeBindings, remoteBindings);
+  assert.deepEqual(accepted.link?.features, [...FEDERATION_REQUIRED_FEATURES]);
   assert.equal(manager.size, 1);
 
   const mismatchedScopes = manager.acceptInbound(
@@ -125,10 +127,146 @@ test("outbound dial writes attachment before hello, sends no raw scope ID, and w
     assert.equal(link.direction, "outbound");
     assert.equal(link.remoteOrigin.id, remoteOrigin.id);
     assert.deepEqual(link.scopeBindings, localBindings);
+    assert.deepEqual(link.features, [...FEDERATION_REQUIRED_FEATURES]);
     assert.equal(isFederationBridgeAttach(received[0]), true);
     assert.equal(isPeerHello(received[1]), true);
     assert.equal((received[0] as { linkId: string }).linkId, (received[1] as { linkId: string }).linkId);
     assert.equal(JSON.stringify(received[1]).includes("local-private"), false);
+  } finally {
+    manager.close();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("outbound activation precedes a post-handshake frame coalesced with the ack", async () => {
+  let activated = false;
+  let resolveFrame!: (value: unknown) => void;
+  const postHandshakeFrame = new Promise<unknown>((resolve) => { resolveFrame = resolve; });
+  const encodeFrame = (value: unknown): Buffer => {
+    const payload = Buffer.from(JSON.stringify(value));
+    const frame = Buffer.allocUnsafe(4 + payload.length);
+    frame.writeUInt32BE(payload.length, 0);
+    payload.copy(frame, 4);
+    return frame;
+  };
+  const server = net.createServer((socket) => {
+    const reader = createMessageReader((value) => {
+      if (!isPeerHello(value)) return;
+      socket.write(Buffer.concat([
+        encodeFrame({
+          type: "peer_hello_ack",
+          protocol: FEDERATION_PROTOCOL_NAME,
+          version: FEDERATION_PROTOCOL_VERSION,
+          linkId: value.linkId,
+          accepted: true,
+          origin: remoteOrigin,
+          acceptedPeerOriginId: localOrigin.id,
+          scopeMappings: value.scopeMappings,
+          features: [...FEDERATION_SUPPORTED_FEATURES],
+        }),
+        encodeFrame({ type: "synthetic_post_handshake" }),
+      ]));
+    }, (error) => socket.destroy(error));
+    socket.on("data", reader);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const manager = new PeerLinkManager({
+    onLinkUp: () => { activated = true; },
+    onPeerMessage: (_link, value) => {
+      assert.equal(activated, true);
+      resolveFrame(value);
+    },
+  });
+  try {
+    const link = await manager.dial(dialRequest(address.port));
+    assert.equal(link.features.includes("peer-roster-v1"), true);
+    assert.deepEqual(await postHandshakeFrame, { type: "synthetic_post_handshake" });
+  } finally {
+    manager.close();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("outbound peer frames use the same bounded token bucket as inbound broker sockets", async () => {
+  let received = 0;
+  let resolveDown!: () => void;
+  const down = new Promise<void>((resolve) => { resolveDown = resolve; });
+  const server = net.createServer((socket) => {
+    const reader = createMessageReader((value) => {
+      if (!isPeerHello(value)) return;
+      writeMessage(socket, {
+        type: "peer_hello_ack",
+        protocol: FEDERATION_PROTOCOL_NAME,
+        version: FEDERATION_PROTOCOL_VERSION,
+        linkId: value.linkId,
+        accepted: true,
+        origin: remoteOrigin,
+        acceptedPeerOriginId: localOrigin.id,
+        scopeMappings: value.scopeMappings,
+        features: [...FEDERATION_SUPPORTED_FEATURES],
+      });
+      for (let index = 0; index < 300; index += 1) writeMessage(socket, { type: "peer_frame", index });
+    }, (error) => socket.destroy(error));
+    socket.on("data", reader);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const manager = new PeerLinkManager({
+    onPeerMessage: () => { received += 1; },
+    onLinkDown: () => resolveDown(),
+  });
+  try {
+    await manager.dial(dialRequest(address.port));
+    await down;
+    assert.ok(received >= 240 && received < 300);
+    assert.equal(manager.size, 0);
+  } finally {
+    manager.close();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("post-handshake parser errors tear down and prune an outbound peer link", async () => {
+  let resolveDown!: () => void;
+  const down = new Promise<void>((resolve) => { resolveDown = resolve; });
+  const server = net.createServer((socket) => {
+    const reader = createMessageReader((value) => {
+      if (!isPeerHello(value)) return;
+      writeMessage(socket, {
+        type: "peer_hello_ack",
+        protocol: FEDERATION_PROTOCOL_NAME,
+        version: FEDERATION_PROTOCOL_VERSION,
+        linkId: value.linkId,
+        accepted: true,
+        origin: remoteOrigin,
+        acceptedPeerOriginId: localOrigin.id,
+        scopeMappings: value.scopeMappings,
+        features: [...FEDERATION_SUPPORTED_FEATURES],
+      });
+      writeMessage(socket, { type: "malformed_roster" });
+    }, (error) => socket.destroy(error));
+    socket.on("data", reader);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const manager = new PeerLinkManager({
+    onPeerMessage: () => { throw new Error("malformed peer roster frame"); },
+    onLinkDown: () => resolveDown(),
+  });
+  try {
+    await manager.dial(dialRequest(address.port));
+    await down;
+    assert.equal(manager.size, 0);
   } finally {
     manager.close();
     server.close();
@@ -202,7 +340,7 @@ test("outbound dial rejects acknowledgement features it did not offer", async ()
   const { server, port } = await createAckServer(remoteOrigin, [...FEDERATION_REQUIRED_FEATURES, "future-roster-v2"]);
   const manager = new PeerLinkManager();
   try {
-    await assert.rejects(manager.dial(dialRequest(port)), /not offered/);
+    await assert.rejects(manager.dial(dialRequest(port)), /unoffered/);
     assert.equal(manager.size, 0);
   } finally {
     manager.close();

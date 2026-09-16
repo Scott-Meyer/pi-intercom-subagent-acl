@@ -11,6 +11,7 @@ export const FEDERATION_PROTOCOL_NAME = "pi-intercom-peer" as const;
 export const FEDERATION_PROTOCOL_VERSION = 1 as const;
 export const FEDERATION_IDENTITY_FEATURE = "peer-identity-v1" as const;
 export const FEDERATION_SINGLE_HOP_FEATURE = "peer-single-hop-v1" as const;
+export const FEDERATION_ROSTER_FEATURE = "peer-roster-v1" as const;
 export const FEDERATION_CAPABILITY_MIN_LENGTH = 32;
 export const FEDERATION_CAPABILITY_MAX_LENGTH = 128;
 export const FEDERATION_CORRELATION_ID_MAX_LENGTH = 128;
@@ -25,6 +26,11 @@ export const FEDERATION_LOCAL_SCOPE_ID_MAX_LENGTH = 256;
 export const FEDERATION_REQUIRED_FEATURES = [
   FEDERATION_IDENTITY_FEATURE,
   FEDERATION_SINGLE_HOP_FEATURE,
+] as const;
+
+export const FEDERATION_SUPPORTED_FEATURES = [
+  ...FEDERATION_REQUIRED_FEATURES,
+  FEDERATION_ROSTER_FEATURE,
 ] as const;
 
 export type FederationRequiredFeature = typeof FEDERATION_REQUIRED_FEATURES[number];

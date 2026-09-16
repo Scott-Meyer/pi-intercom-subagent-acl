@@ -10,6 +10,11 @@ import type {
   SessionRegistration,
 } from "../types.ts";
 import { isValidSessionDescription, isValidSessionName } from "../session-profile.ts";
+import {
+  encodeOriginQualifiedSessionIdentity,
+  isCanonicalFederationOriginId,
+  isCanonicalFederationScopeAlias,
+} from "./federation-protocol.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -218,6 +223,37 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   if (value.advertised !== undefined && typeof value.advertised !== "boolean") {
     return false;
   }
+  if (value.federation !== undefined) {
+    if (!isRecord(value.federation)) return false;
+    const keys = Object.keys(value.federation);
+    if (!keys.every((key) => ["originId", "originLabel", "remoteScopeAlias", "remoteStableSessionId"].includes(key))) return false;
+    if (!isCanonicalFederationOriginId(value.federation.originId)
+      || !isCanonicalFederationScopeAlias(value.federation.remoteScopeAlias)
+      || typeof value.federation.remoteStableSessionId !== "string"
+      || value.federation.remoteStableSessionId.length < 1
+      || value.federation.remoteStableSessionId.length > 512
+      || /[\p{Cc}\p{Cf}]/u.test(value.federation.remoteStableSessionId)
+      || (value.federation.originLabel !== undefined
+        && (typeof value.federation.originLabel !== "string"
+          || value.federation.originLabel.length < 1
+          || value.federation.originLabel.length > 80
+          || /[\p{Cc}\p{Cf}]/u.test(value.federation.originLabel)))) return false;
+    if (value.trustedLocal !== false
+      || value.peerUid !== undefined
+      || value.isSubagent !== undefined
+      || value.supervisorSessionId !== undefined
+      || value.supervisorName !== undefined
+      || value.advertised !== undefined) return false;
+    try {
+      if (value.id !== encodeOriginQualifiedSessionIdentity({
+        originId: value.federation.originId,
+        remoteScopeAlias: value.federation.remoteScopeAlias,
+        remoteStableSessionId: value.federation.remoteStableSessionId,
+      })) return false;
+    } catch {
+      return false;
+    }
+  }
 
   return value.trustedLocal === undefined || typeof value.trustedLocal === "boolean";
 }
@@ -230,7 +266,11 @@ export function isAuthoredMessage(value: unknown): value is Message {
 }
 
 export function isSessionId(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+  return typeof value === "string"
+    && value.trim().length > 0
+    && value.length <= 512
+    && !/[\p{Cc}\p{Cf}]/u.test(value)
+    && !value.startsWith("oqs1.");
 }
 
 export function isSessionRegistration(value: unknown): value is SessionRegistration {

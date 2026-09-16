@@ -85,6 +85,14 @@ export interface SessionInfo {
    *  provenance rather than erased. Broker-authoritative; never set directly
    *  by a presence update. */
   advertised?: boolean;
+  /** Broker-authored provenance for a live session imported from one peer link.
+   *  The tuple is the canonical remote routing identity; labels remain display-only. */
+  federation?: {
+    originId: string;
+    originLabel?: string;
+    remoteScopeAlias: string;
+    remoteStableSessionId: string;
+  };
 }
 
 export interface Message {

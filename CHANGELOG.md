@@ -4,6 +4,19 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.13.0-acl.10] - 2026-09-16
+
+### Added
+- Federation Slice 2 negotiates optional `peer-roster-v1` support and replicates only locally owned mains and explicitly advertised subagents through bounded authoritative snapshots plus sequenced deltas. Origin epochs, exact-next sequencing, stale-epoch rejection, deduplicated resync requests, and atomic per-link disconnect pruning prevent partial or ghost rosters.
+- Imported sessions use canonical origin-qualified IDs, bind remote aliases to independently authorized local scopes, carry broker-authored federation provenance, remain explicitly untrusted, and appear in list/overlay output as remote roster-only rows. Local scope and subagent visibility rules still apply.
+
+### Security
+- The `oqs1.` imported-ID namespace is reserved from local registration, and clients reject federation metadata unless `trustedLocal` is false and the visible ID exactly encodes its origin/scope/stable-ID tuple.
+- Snapshot, delta, aggregate visible-roster, origin-epoch, and peer-frame rate bounds prevent one peer from overflowing framing or unbounded state. Malformed outbound-link frames, roster overflow, and reconciliation errors tear down only the peer link instead of disconnecting ordinary local sessions.
+
+### Notes
+- Remote rows are intentionally non-selectable and direct routing, broadcast, queued mailboxes, extension channels, and compaction awareness remain host-local. ACL.9 peers can retain the base federation link without falsely negotiating roster support.
+
 ## [0.13.0-acl.9] - 2026-09-16
 
 ### Added

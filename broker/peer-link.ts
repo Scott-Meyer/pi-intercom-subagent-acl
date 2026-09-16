@@ -5,6 +5,7 @@ import {
   FEDERATION_PROTOCOL_NAME,
   FEDERATION_PROTOCOL_VERSION,
   FEDERATION_REQUIRED_FEATURES,
+  FEDERATION_SUPPORTED_FEATURES,
   type BrokerAcceptPeerRequest,
   type BrokerDialPeerRequest,
   type FederationFailureCode,
@@ -25,6 +26,8 @@ import {
 
 const PEER_HANDSHAKE_TIMEOUT_MS = 5_000;
 const MAX_PEER_LINKS = 16;
+const PEER_FRAME_RATE_CAPACITY = 240;
+const PEER_FRAME_REFILL_PER_SECOND = 120;
 
 export interface FederationPeerLink {
   linkId: string;
@@ -57,10 +60,12 @@ export interface PeerLinkManagerOptions {
   onSocketClosed?: (socket: net.Socket) => void;
   onLinkUp?: (link: FederationPeerLink) => void;
   onLinkDown?: (link: FederationPeerLink) => void;
+  onPeerMessage?: (link: FederationPeerLink, value: unknown) => void;
 }
 
-function sameFeatures(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((feature) => right.includes(feature));
+function isValidNegotiatedFeatures(negotiated: readonly string[], offered: readonly string[]): boolean {
+  return FEDERATION_REQUIRED_FEATURES.every((feature) => negotiated.includes(feature))
+    && negotiated.every((feature) => offered.includes(feature));
 }
 
 function sameMappings(left: FederationScopeMapping[], right: FederationScopeMapping[]): boolean {
@@ -87,6 +92,8 @@ function rejection(hello: PeerHello, code: FederationFailureCode, error: string)
 export class PeerLinkManager {
   private readonly linksById = new Map<string, FederationPeerLink>();
   private readonly linkIdByRemoteOrigin = new Map<string, string>();
+  private readonly activatedLinkIds = new Set<string>();
+  private readonly outboundFrameLimits = new Map<string, { tokens: number; lastRefillAt: number }>();
   private localOrigin: FederationOrigin | undefined;
 
   constructor(private readonly options: PeerLinkManagerOptions = {}) {}
@@ -149,6 +156,7 @@ export class PeerLinkManager {
       return { ack: rejection(hello, "E_ALREADY_CONNECTED", "Peer link limit reached") };
     }
 
+    const negotiatedFeatures = FEDERATION_SUPPORTED_FEATURES.filter((feature) => hello.features.includes(feature));
     const link: FederationPeerLink = {
       linkId: hello.linkId,
       direction: "inbound",
@@ -156,7 +164,7 @@ export class PeerLinkManager {
       localOrigin: prepared.localOrigin,
       remoteOrigin: prepared.remoteOrigin,
       scopeBindings: prepared.scopeBindings,
-      features: [...FEDERATION_REQUIRED_FEATURES],
+      features: negotiatedFeatures,
       connectedAt: Date.now(),
     };
     try {
@@ -178,7 +186,7 @@ export class PeerLinkManager {
         origin: prepared.localOrigin,
         acceptedPeerOriginId: prepared.remoteOrigin.id,
         scopeMappings: hello.scopeMappings,
-        features: [...FEDERATION_REQUIRED_FEATURES],
+        features: negotiatedFeatures,
       },
     };
   }
@@ -240,7 +248,24 @@ export class PeerLinkManager {
 
       const reader = createMessageReader((value) => {
         if (active) {
-          socket.destroy(new Error("Federation Slice 1 does not accept post-handshake frames"));
+          const link = this.linksById.get(linkId);
+          if (!link) {
+            socket.destroy(new Error("Federation peer link is no longer active"));
+            return;
+          }
+          if (!this.options.onPeerMessage) {
+            socket.destroy(new Error("Federation peer frames are not supported by this broker"));
+            return;
+          }
+          if (link.direction === "outbound" && !this.consumeOutboundFrameToken(link.linkId)) {
+            socket.destroy(new Error("Federation peer frame rate limit exceeded"));
+            return;
+          }
+          try {
+            this.options.onPeerMessage(link, value);
+          } catch (error) {
+            socket.destroy(error instanceof Error ? error : new Error(String(error)));
+          }
           return;
         }
         if (!isPeerHelloAck(value)) {
@@ -259,8 +284,8 @@ export class PeerLinkManager {
           finishFailure(new FederationPeerError("E_SCOPE_MISMATCH", "Peer acknowledgement did not match the requested scopes"));
           return;
         }
-        if (!sameFeatures(value.features, FEDERATION_REQUIRED_FEATURES)) {
-          finishFailure(new FederationPeerError("E_FEATURE_UNSUPPORTED", "Peer acknowledged features that were not offered"));
+        if (!isValidNegotiatedFeatures(value.features, FEDERATION_SUPPORTED_FEATURES)) {
+          finishFailure(new FederationPeerError("E_FEATURE_UNSUPPORTED", "Peer acknowledged invalid or unoffered features"));
           return;
         }
         const link: FederationPeerLink = {
@@ -268,7 +293,7 @@ export class PeerLinkManager {
           direction: "outbound",
           socket,
           localOrigin,
-          remoteOrigin: value.origin,
+          remoteOrigin,
           scopeBindings,
           features: value.features,
           connectedAt: Date.now(),
@@ -282,12 +307,20 @@ export class PeerLinkManager {
           return;
         }
         active = true;
+        try {
+          this.activateLink(link.linkId);
+        } catch (error) {
+          active = false;
+          finishFailure(new FederationPeerError("E_HANDSHAKE_FAILED", "Failed to activate peer link", { cause: error }));
+          return;
+        }
         settled = true;
         clearTimeout(timeout);
         signal?.removeEventListener("abort", onAbort);
         resolve(link);
       }, (error) => {
-        finishFailure(new FederationPeerError("E_HANDSHAKE_FAILED", "Failed to read peer handshake", { cause: error }));
+        if (active) socket.destroy(error);
+        else finishFailure(new FederationPeerError("E_HANDSHAKE_FAILED", "Failed to read peer handshake", { cause: error }));
       });
 
       const onAbort = () => finishFailure(new FederationPeerError("E_DIAL_FAILED", "Peer dial control was abandoned"));
@@ -311,7 +344,7 @@ export class PeerLinkManager {
             origin: localOrigin,
             expectedPeerOrigin: remoteOrigin,
             scopeMappings,
-            features: [...FEDERATION_REQUIRED_FEATURES],
+            features: [...FEDERATION_SUPPORTED_FEATURES],
           });
         } catch (error) {
           capability = "";
@@ -336,9 +369,25 @@ export class PeerLinkManager {
     });
   }
 
-  assertNoPostHandshakeMessage(linkId: string, _value: unknown): void {
-    if (!this.linksById.has(linkId)) throw new FederationPeerError("E_INVALID_REQUEST", "Unknown peer link");
-    throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Federation Slice 1 does not accept roster or routing frames");
+  activateLink(linkId: string): void {
+    const link = this.linksById.get(linkId);
+    if (!link || this.activatedLinkIds.has(linkId)) return;
+    this.activatedLinkIds.add(linkId);
+    try {
+      this.options.onLinkUp?.(link);
+    } catch (error) {
+      this.activatedLinkIds.delete(linkId);
+      throw error;
+    }
+  }
+
+  handlePostHandshakeMessage(linkId: string, value: unknown): void {
+    const link = this.linksById.get(linkId);
+    if (!link) throw new FederationPeerError("E_INVALID_REQUEST", "Unknown peer link");
+    if (!this.options.onPeerMessage) {
+      throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Federation peer frames are not supported by this broker");
+    }
+    this.options.onPeerMessage(link, value);
   }
 
   closeLink(linkId: string): boolean {
@@ -403,7 +452,9 @@ export class PeerLinkManager {
     this.localOrigin ??= link.localOrigin;
     this.linksById.set(link.linkId, link);
     this.linkIdByRemoteOrigin.set(link.remoteOrigin.id, link.linkId);
-    this.options.onLinkUp?.(link);
+    if (link.direction === "outbound") {
+      this.outboundFrameLimits.set(link.linkId, { tokens: PEER_FRAME_RATE_CAPACITY, lastRefillAt: Date.now() });
+    }
   }
 
   private removeLinkBySocket(socket: net.Socket): FederationPeerLink | undefined {
@@ -415,7 +466,23 @@ export class PeerLinkManager {
     return undefined;
   }
 
+  private consumeOutboundFrameToken(linkId: string, now = Date.now()): boolean {
+    const state = this.outboundFrameLimits.get(linkId);
+    if (!state) return false;
+    const elapsedMs = Math.max(0, now - state.lastRefillAt);
+    state.tokens = Math.min(
+      PEER_FRAME_RATE_CAPACITY,
+      state.tokens + elapsedMs * PEER_FRAME_REFILL_PER_SECOND / 1000,
+    );
+    state.lastRefillAt = now;
+    if (state.tokens < 1) return false;
+    state.tokens -= 1;
+    return true;
+  }
+
   private unregisterLink(link: FederationPeerLink): void {
+    this.activatedLinkIds.delete(link.linkId);
+    this.outboundFrameLimits.delete(link.linkId);
     this.linksById.delete(link.linkId);
     if (this.linkIdByRemoteOrigin.get(link.remoteOrigin.id) === link.linkId) {
       this.linkIdByRemoteOrigin.delete(link.remoteOrigin.id);

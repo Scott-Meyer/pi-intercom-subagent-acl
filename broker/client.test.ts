@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { IntercomClient } from "./client.ts";
+import { encodeOriginQualifiedSessionIdentity } from "./federation-protocol.ts";
+import { isSessionId } from "./protocol.ts";
 
 test("validated session lifecycle messages reach broker-message subscribers", () => {
   const client = new IntercomClient();
@@ -25,6 +27,50 @@ test("validated session lifecycle messages reach broker-message subscribers", ()
     { type: "presence_update", session },
     { type: "session_left", sessionId: "session-2" },
   ]);
+});
+
+test("federated session lifecycle metadata is accepted only for canonical provenance", () => {
+  const client = new IntercomClient();
+  (client as any)._sessionId = "session-1";
+  const federation = {
+    originId: "host:penguin",
+    originLabel: "Penguin",
+    remoteScopeAlias: "mistfall-remote",
+    remoteStableSessionId: "remote / session",
+  };
+  const session = {
+    id: encodeOriginQualifiedSessionIdentity({
+      originId: federation.originId,
+      remoteScopeAlias: federation.remoteScopeAlias,
+      remoteStableSessionId: federation.remoteStableSessionId,
+    }),
+    name: "Remote Specialist",
+    cwd: "/remote/test",
+    model: "test",
+    pid: 2,
+    startedAt: 1,
+    lastActivity: 1,
+    trustedLocal: false,
+    federation,
+  };
+  assert.doesNotThrow(() => (client as any).handleBrokerMessage({ type: "session_joined", session }));
+  for (const forged of [
+    { ...session, federation: { ...session.federation, linkId: "transient-link" } },
+    { ...session, trustedLocal: true },
+    { ...session, id: "oqs1.not-the-canonical-tuple" },
+  ]) {
+    assert.throws(
+      () => (client as any).handleBrokerMessage({ type: "session_joined", session: forged }),
+      /Invalid session_joined/,
+    );
+  }
+});
+
+test("local registration IDs cannot collide with the federated identity namespace", () => {
+  assert.equal(isSessionId("ordinary stable / id"), true);
+  assert.equal(isSessionId("oqs1.attacker-controlled"), false);
+  assert.equal(isSessionId(`id-${"x".repeat(510)}`), false);
+  assert.equal(isSessionId("unsafe\nidentity"), false);
 });
 
 test("registered feature negotiation rejects non-string feature entries", () => {

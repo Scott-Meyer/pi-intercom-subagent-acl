@@ -100,3 +100,32 @@ test("session list overlay renders lines at the declared overlay width", () => {
   }
   assert.match(overlay.render(88).join("\n"), /Reviewing peer discovery profiles now/);
 });
+
+test("session list overlay identifies federated sessions by remote origin", () => {
+  const remote: SessionInfo = {
+    ...session,
+    id: "oqs1.remote-qualified-id",
+    name: "Remote Specialist",
+    federation: {
+      originId: "host:penguin",
+      originLabel: "Penguin",
+      remoteScopeAlias: "mistfall-remote",
+      remoteStableSessionId: "remote-session-123",
+    },
+    trustedLocal: false,
+  };
+  let selected: SessionInfo | undefined;
+  const selectingKeys = {
+    ...keybindings,
+    matches(data: string, id: string): boolean {
+      return data === "enter" && id === "tui.select.confirm";
+    },
+  };
+  const overlay = new SessionListOverlay(theme as any, selectingKeys as any, session, [remote], (value) => { selected = value; });
+  const rendered = overlay.render(88).join("\n");
+  assert.match(rendered, /remote:Penguin/);
+  assert.match(rendered, /roster only/);
+  assert.match(rendered, /remote-s/);
+  overlay.handleInput("enter");
+  assert.equal(selected, undefined);
+});

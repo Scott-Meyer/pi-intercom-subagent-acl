@@ -16,6 +16,7 @@ import {
   FEDERATION_IDENTITY_FEATURE,
   FEDERATION_PROTOCOL_NAME,
   FEDERATION_PROTOCOL_VERSION,
+  FEDERATION_ROSTER_FEATURE,
   FEDERATION_SESSION_ID_MAX_LENGTH,
   FEDERATION_SINGLE_HOP_FEATURE,
 } from "./federation-types.ts";
@@ -145,6 +146,7 @@ test("bridge attachment preface is strict and carries only attachment authority"
 test("peer hello negotiates explicit v1 single-hop identity between distinct origins", () => {
   const hello = validHello();
   assert.equal(isPeerHello(hello), true);
+  assert.equal(isPeerHello({ ...hello, features: [...features, FEDERATION_ROSTER_FEATURE] }), true);
   assert.equal(isPeerHello({ ...hello, version: 2 }), false);
   assert.equal(isPeerHello({ ...hello, expectedPeerOrigin: localOrigin }), false);
   assert.equal(isPeerHello({ ...hello, features: [FEDERATION_IDENTITY_FEATURE] }), false);

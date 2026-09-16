@@ -29,17 +29,20 @@ function middleTruncate(text: string, maxWidth: number): string {
   return truncateToWidth(`${left}…${right}`, maxWidth, "");
 }
 
-function shortSessionId(sessionId: string): string {
-  return sessionId.slice(0, 8);
+function shortSessionId(session: SessionInfo): string {
+  return (session.federation?.remoteStableSessionId ?? session.id).slice(0, 8);
 }
 
 function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?: boolean }): string {
   const name = session.name || "Unnamed session";
-  const tags = [options?.self ? "self" : undefined, options?.sameCwd ? "same cwd" : undefined]
+  const remote = session.federation
+    ? `remote:${session.federation.originLabel ?? session.federation.originId} · roster only`
+    : undefined;
+  const tags = [options?.self ? "self" : undefined, options?.sameCwd ? "same cwd" : undefined, remote]
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
   const description = session.description ? ` — ${session.description}` : "";
-  return `${name} (${shortSessionId(session.id)})${suffix}${description}`;
+  return `${name} (${shortSessionId(session)})${suffix}${description}`;
 }
 
 export class SessionListOverlay implements Component {
@@ -67,7 +70,7 @@ export class SessionListOverlay implements Component {
 
   private onSessionSelect(sessionId: string): void {
     const session = this.sessions.find(s => s.id === sessionId);
-    if (!session) return;
+    if (!session || session.federation) return;
     this.done(session);
   }
 

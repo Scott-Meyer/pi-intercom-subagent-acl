@@ -18,8 +18,15 @@ function containsUnsafeControlCharacters(value: string): boolean {
   return UNSAFE_CONTROL_CHARACTERS.test(value);
 }
 
+// Canonical origin-qualified federation identities occupy this reserved
+// prefix, so a local session can never claim a name that collides with an
+// imported remote row.
+export const RESERVED_SESSION_NAME_PREFIX = "oqs1.";
+
 export function isValidSessionName(value: unknown): value is string {
-  return typeof value === "string" && !containsUnsafeControlCharacters(value);
+  return typeof value === "string"
+    && !containsUnsafeControlCharacters(value)
+    && !value.startsWith(RESERVED_SESSION_NAME_PREFIX);
 }
 
 export function normalizeSessionDescription(value: string): string {

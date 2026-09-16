@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { isSessionRegistration } from "./broker/protocol.ts";
 import {
   isValidSessionDescription,
+  isValidSessionName,
   normalizeSelfProfileUpdate,
   SESSION_DESCRIPTION_MAX_LENGTH,
 } from "./session-profile.ts";
@@ -42,6 +43,9 @@ test("raw registrations reject unnormalized or control-bearing descriptions", ()
   assert.equal(isSessionRegistration({ ...registration, description: "Reviewing raw\u202E broker profile registration behavior" }), false);
   assert.equal(isSessionRegistration({ ...registration, name: "worker\u001b[2J" }), false);
   assert.equal(isSessionRegistration({ ...registration, name: "worker\u202E" }), false);
+  assert.equal(isSessionRegistration({ ...registration, name: "oqs1.impersonating-a-remote-row" }), false, "the origin-qualified namespace is reserved from local names");
+  assert.equal(isValidSessionName("oqs1.anything"), false);
+  assert.equal(isValidSessionName("ordinary worker"), true);
 });
 
 test("self profile validation rejects descriptions outside word and character bounds", () => {

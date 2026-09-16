@@ -14,6 +14,8 @@ import {
   FEDERATION_SESSION_ID_MAX_LENGTH,
   FEDERATION_SINGLE_HOP_FEATURE,
   type BrokerAcceptPeerRequest,
+  type BrokerListScopesRequest,
+  type BrokerListScopesResult,
   type BrokerAcceptPeerResult,
   type BrokerDialPeerRequest,
   type BrokerDialPeerResult,
@@ -198,6 +200,47 @@ export function isBrokerAcceptPeerRequest(value: unknown): value is BrokerAccept
     && value.localOrigin.id !== value.remoteOrigin.id
     && isScopeBindings(value.scopeBindings)
     && (value.stateId === undefined || isFederationCorrelationId(value.stateId));
+}
+
+export function isBrokerListScopesRequest(value: unknown): value is BrokerListScopesRequest {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["type", "requestId"], ["stateId"])) return false;
+  return value.type === "broker_list_scopes"
+    && isFederationCorrelationId(value.requestId)
+    && (value.stateId === undefined || isFederationCorrelationId(value.stateId));
+}
+
+export function isBrokerListScopesResult(value: unknown): value is BrokerListScopesResult {
+  if (!isRecord(value) || !hasOnlyKeys(
+    value,
+    ["type", "requestId", "ok"],
+    ["localOrigin", "scopes", "code", "error"],
+  )) return false;
+  if (value.type !== "broker_list_scopes_result"
+    || !isFederationCorrelationId(value.requestId)) return false;
+  if (value.ok === true) {
+    if (!isRecord(value.localOrigin)
+      || !hasOnlyKeys(value.localOrigin, ["id"], [])
+      || !isCanonicalFederationOriginId(value.localOrigin.id)) return false;
+    if (!Array.isArray(value.scopes) || value.scopes.length > 64) return false;
+    const seen = new Set<string>();
+    for (const scope of value.scopes) {
+      if (!isRecord(scope) || !hasOnlyKeys(scope, ["scopeId", "liveSessions"])) return false;
+      const scopeId: unknown = scope.scopeId;
+      if (scopeId !== null && (typeof scopeId !== "string"
+        || scopeId.length === 0
+        || scopeId.length > 256
+        || /[\p{Cc}\p{Cf}]/u.test(scopeId))) return false;
+      if (!Number.isSafeInteger(scope.liveSessions) || (scope.liveSessions as number) < 0) return false;
+      if (seen.has(scopeId as string)) return false;
+      seen.add(scopeId as string);
+    }
+    return true;
+  }
+  if (value.ok !== false) return false;
+  return typeof value.code === "string"
+    && typeof value.error === "string"
+    && value.error.length > 0
+    && value.error.length <= 256;
 }
 
 export function isFederationBridgeAttach(value: unknown): value is FederationBridgeAttach {

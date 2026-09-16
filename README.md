@@ -137,14 +137,14 @@ intercom({
 })
 // → Message accepted for 2 of 2 targets.
 
-// Send to a visible peer session in another codebase, opening a Herdr project pane if needed
+// Send to a visible peer session in another codebase, launching Pi there if needed
 intercom({
   action: "send",
   cwd: "/Users/me/projects/billing",
   openProjectPaneIfMissing: true,
   message: "Let's discuss the billing retry design in this repo."
 })
-// → Opened Herdr project pane pane-... for /Users/me/projects/billing and sent message to session-...
+// → Launched Pi in /Users/me/projects/billing via project launcher flightdeck and sent message to session-...
 
 // Check connection status
 intercom({ action: "status" })
@@ -394,8 +394,8 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 | `supersedes` | string | Optional previous message ID that this send/ask explicitly replaces |
 | `retryOf` | string | Optional previous message ID that this send/ask explicitly retries |
 | `cwd` | string | Working directory filter for `list-cwd`. For send/ask, scopes target lookup to that directory; without `to`, selects the sole live peer there. |
-| `openProjectPaneIfMissing` | boolean | For `send`/`ask` with `cwd`, open a visible Herdr project pane and launch Pi when no matching live session exists |
-| `focus` | boolean | For `openProjectPaneIfMissing`, focus the new Herdr pane. Defaults to true |
+| `openProjectPaneIfMissing` | boolean | For `send`/`ask` with `cwd`, launch Pi in that project through a registered generic project launcher when no matching live session exists |
+| `focus` | boolean | For `openProjectPaneIfMissing`, focus the new terminal when the launcher supports it. Defaults to true |
 
 ### contact_supervisor
 
@@ -417,7 +417,10 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 **`list`** — Returns the current session plus other active intercom-connected sessions with name, short ID, working directory, model, and live status. Status is derived automatically from Pi lifecycle events: `idle`, `thinking`, `tool:<name>`, or, on supported hosts, `compacting`. Compaction status is passive presence—it does not wake or steer peer agents.
 
-**`send`** — Sends a message to one session with `to`, or independently to 1–32 explicit sessions with `targets`. Every multi-target recipient gets a distinct message ID, delivery record, receipt route, and outcome; aliases that resolve to the same live session are delivered only once, and one failure does not roll back successful recipients. Multi-target sends are intentionally unthreaded, so they reject `replyTo`, `supersedes`, and `retryOf`. Singular sends retain reply inference: if the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply send to a different target—and every batch send—is rejected so the answer cannot be misdirected. Set `confirmSend: true` to confirm ordinary sends once before delivery; multi-target confirmation displays and pins the resolved endpoint snapshot so an alias cannot rebind to a different recipient after approval. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
+**`send`** — Sends a message to one session with `to`, or independently to 1–32 explicit sessions with `targets`. Every multi-target recipient gets a distinct message ID, delivery record, receipt route, and outcome; aliases that resolve to the same live session are delivered only once, and one failure does not roll back successful recipients. Multi-target sends are intentionally unthreaded, so they reject `replyTo`, `supersedes`, and `retryOf`. Singular sends retain reply inference: if the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply send to a different target—and every batch send—is rejected so the answer cannot be misdirected. Set `confirmSend: true` to confirm ordinary sends once before delivery; multi-target confirmation displays and pins the resolved endpoint snapshot so an alias cannot rebind to a different recipient after approval. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom launches Pi in the target project through a **generic project launcher** — never a hard-coded terminal manager. Two integration paths exist, in order:
+
+1. **Mesh providers**: any live intercom session — FlightDeck, a terminal manager, or a small helper — registers by advertising the `pi-intercom/project-launch-v1` extension capability in its registration (or a later `extension_capabilities_update`). pi-intercom asks the longest-running visible provider with a JSON request (`{"type":"pi-intercom/project-launch-request","root":"…","command":"pi","focus":true}`) delivered as an ordinary intercom message; the provider opens a terminal there. Providers that cannot comply should reply with a plain error message. Registration on the intercom roster — not any provider reply — is what completes the launch.
+2. **Configured default command**: `PI_INTERCOM_PROJECT_LAUNCHER` (env, takes precedence) or config `projectLauncher`, for example `tmux new-window -c {root} pi`. `{root}` is substituted with a safely shell-quoted path (write it bare — pi-intercom adds the quoting, so hostile directory names cannot break out of the argument), and the raw root is exported as `PI_INTERCOM_PROJECT_ROOT` for commands that need it verbatim. There is deliberately **no built-in default**; with no provider and no configured command the send fails with a standalone error describing both integration paths.
 
 **`broadcast`** — Sends independent messages to every currently connected session visible through the caller's existing scope and subagent ACL, excluding the sender. The recipient set is a live roster snapshot; disconnected sessions are not queued, and sessions joining afterward are not included. Broadcast interrupts every recipient, so prefer `send` with `to` or `targets` whenever you know who needs the information. Broadcast rejects targeting and conversation-specific fields.
 
@@ -591,9 +594,13 @@ The broker is a standalone TypeScript process that manages session registration 
 
 Messages use length-prefixed JSON over a local socket/pipe transport (4-byte length + JSON payload) to handle fragmentation properly. The protocol includes request correlation for session listing, explicit delivery failures, validation for malformed or out-of-order messages, a frame-size cap, per-connection local rate limiting, and no-op presence coalescing.
 
-**Experimental broker federation transport (Slices 1–2).** A trusted local controller such as FlightDeck can ask the broker to dial an ephemeral loopback bridge with a single-use capability. The broker writes a capability-bearing `bridge_attach` preface for FlightDeck to consume. Before opaque forwarding begins, FlightDeck independently prepares the destination broker's expected origins and local scope bindings through `broker_accept_peer`; that exact prepared destination connection becomes the opaque pipe, and the brokers then complete a strict `peer_hello` / `peer_hello_ack` exchange. Link IDs are broker-generated, public scope aliases never expose private local scope IDs to the peer, reciprocal dials converge through deterministic origin ordering, and accepted peer links use an explicit connection role rather than impersonating ordinary clients.
+**Experimental broker federation transport (Slices 1–3).** A trusted local controller such as FlightDeck can ask the broker to dial an ephemeral loopback bridge with a single-use capability. The broker writes a capability-bearing `bridge_attach` preface for FlightDeck to consume. Before opaque forwarding begins, FlightDeck independently prepares the destination broker's expected origins and local scope bindings through `broker_accept_peer`; that exact prepared destination connection becomes the opaque pipe, and the brokers then complete a strict `peer_hello` / `peer_hello_ack` exchange. Link IDs are broker-generated, public scope aliases never expose private local scope IDs to the peer, reciprocal dials converge through deterministic origin ordering, and accepted peer links use an explicit connection role rather than impersonating ordinary clients.
 
-When both brokers negotiate `peer-roster-v1`, each link exchanges an authoritative bounded snapshot followed by monotonically sequenced deltas under a broker-lifetime origin epoch. Sequence gaps request a fresh snapshot; stale epochs cannot roll state back; and disconnect atomically prunes only that link's imported sessions. Brokers export only locally owned mains and explicitly advertised subagents, never re-export imports. Raw local scope IDs remain link-local authority while public aliases qualify remote identities. Imported rows are visibly marked `remote:… · roster only`, are never `trustedLocal`, respect local scope/subagent visibility, and cannot be selected for messaging yet.
+When both brokers negotiate `peer-roster-v1`, each link exchanges an authoritative bounded snapshot followed by monotonically sequenced deltas under a broker-lifetime origin epoch. Sequence gaps request a fresh snapshot; stale epochs cannot roll state back; and disconnect atomically prunes only that link's imported sessions. Brokers export only locally owned mains and explicitly advertised subagents, never re-export imports. Raw local scope IDs remain link-local authority while public aliases qualify remote identities. Imported rows are visibly marked `remote:…`, are never `trustedLocal`, and respect local scope/subagent visibility.
+
+When both brokers also negotiate `peer-send-v1`, direct sends to imported `oqs1.*` targets route over the link: the origin broker replays/records locally, correlates the send, and accepts delivery only when the destination broker's correlated result arrives (link drop or a bounded deadline fails it deterministically). The destination resolves the sender from its broker-authoritative imported roster, requires a locally owned, scope-matched, ACL-visible target, dedupes per-link send ids, and delivers through the ordinary message pipeline so steering and waking behave exactly like local delivery. V1 remote sends are direct text-only (≤32 KiB): asks, replies, supersession, attachments, broadcast, and mailbox queueing remain host-local.
+
+The broker owns a persisted canonical federation origin (adopted from the first controller-supplied id or minted as `install:<uuid>`), exposed with live scope enumeration through the trusted-local `broker_list_scopes` control; every dial/accept must present exactly it.
 
 Direct remote routing is deliberately absent until the next slice. Broadcast, queued mailboxes, extension channels, and compaction awareness remain host-local in federation v1. Mixed ACL.9 peers can retain the base identity link without falsely negotiating roster support.
 
@@ -639,13 +646,15 @@ Use pi-messenger for multi-agent swarms working in a shared room. Use pi-interco
 ├── index.ts              # Extension entry point
 ├── types.ts              # SessionInfo, Message, protocol types
 ├── config.ts             # Config loading
-├── project-agent.ts      # Herdr project-pane launch and cwd target resolution
+├── project-agent.ts      # Generic project-launch providers/commands and cwd target resolution
 ├── broker/
 │   ├── broker.ts         # Broker process and connection roles
 │   ├── client.ts         # IntercomClient class
 │   ├── federation-types.ts    # Broker-peer wire contracts
 │   ├── federation-protocol.ts # Strict validators and qualified ID codec
 │   ├── federation-roster.ts   # Snapshot/delta import and resynchronization
+│   ├── federation-send.ts     # Routed direct send frames and correlation
+│   ├── federation-origin.ts   # Persisted canonical federation origin
 │   ├── peer-link.ts      # Peer authority, handshake, and lifecycle
 │   ├── framing.ts        # Length-prefixed JSON protocol
 │   ├── paths.ts          # Platform-specific socket/pipe paths
@@ -663,7 +672,7 @@ Use pi-messenger for multi-agent swarms working in a shared room. Use pi-interco
 
 ## Limitations
 
-- **Remote routing not yet enabled** — Federation Slices 1–2 establish FlightDeck-bridged broker identity and a roster-only remote view; direct messages arrive in a later slice
+- **Remote asks/replies not yet enabled** — Federation Slices 1–3 establish FlightDeck-bridged broker identity, a replicated remote roster, and routed direct text sends; remote asks, replies, receipts, and attachments arrive in a later slice
 - **No dedicated intercom log** — Messages are kept in Pi session history, but there is no separate intercom transcript or inbox
 - **No attachments UI** — `file`, `snippet`, and `context` attachments are supported in the protocol, but not in the compose overlay
 - **Only connected sessions appear** — The list shows Pi sessions that have loaded `pi-intercom` and successfully registered with the broker, not every open Pi process on the machine

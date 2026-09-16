@@ -43,6 +43,11 @@ export interface IntercomConfig {
 
   /** Optional stable intercom session ID for restart-stable addressing */
   stableId?: string;
+
+  /** Optional default project launch command for openProjectPaneIfMissing
+   * (e.g. `tmux new-window -c "{root}" pi`). No built-in default; a live
+   * mesh provider advertising pi-intercom/project-launch-v1 is preferred. */
+  projectLauncher?: string;
   
   /** Enable/disable intercom (default: true) */
   enabled: boolean;
@@ -153,6 +158,20 @@ export function loadConfig(): IntercomConfig {
         throw new Error(`"stableId" must not be empty`);
       }
       config.stableId = stableId;
+    }
+
+    if (Object.hasOwn(parsedConfig, "projectLauncher")) {
+      if (typeof parsedConfig.projectLauncher !== "string") {
+        throw new Error(`"projectLauncher" must be a string`);
+      }
+      const projectLauncher = parsedConfig.projectLauncher.trim();
+      if (!projectLauncher) {
+        throw new Error(`"projectLauncher" must not be empty`);
+      }
+      if (projectLauncher.length > 1024) {
+        throw new Error(`"projectLauncher" must be at most 1024 characters`);
+      }
+      config.projectLauncher = projectLauncher;
     }
 
     return config;

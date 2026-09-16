@@ -2057,6 +2057,21 @@ test("multi-target and broadcast sends reject ambiguous targeting and conversati
     assert.equal(placeholderResult.details?.error, undefined);
     assert.match(placeholderResult.content[0]?.text ?? "", /Message sent to planner/);
 
+    // Some adapters duplicate the recipient into both optional fields; a
+    // single identical target is the same singular delivery intent.
+    const duplicatedDelivered = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const duplicatedResult = await intercomTool.execute("duplicated-singular-target", {
+      action: "send",
+      to: "planner",
+      targets: ["planner"],
+      message: "Duplicated singular recipient should deliver once",
+      profile: { name: "", description: "Auditing leaderboard claims and statistical trust" },
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, duplicatedMessage] = await duplicatedDelivered;
+    assert.equal(duplicatedMessage.content.text, "Duplicated singular recipient should deliver once");
+    assert.equal(duplicatedResult.details?.error, undefined);
+    assert.match(duplicatedResult.content[0]?.text ?? "", /Message sent to planner/);
+
     const mixedBlankTargets = await intercomTool.execute("mixed-blank-targets", {
       action: "send",
       targets: ["planner", ""],
@@ -2138,7 +2153,13 @@ test("multi-target and broadcast sends reject ambiguous targeting and conversati
       ["E_CANCELLED", "E_CANCELLED"],
     );
     await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(receivedMessages.length, 1, "only the schema-placeholder regression send should be delivered");
+    assert.equal(
+      receivedMessages.length,
+      2,
+      "only the placeholder regression send and the duplicated-singular send should be delivered",
+    );
+    assert.equal(receivedMessages[0]?.content.text, "Optional schema placeholders should be ignored");
+    assert.equal(receivedMessages[1]?.content.text, "Duplicated singular recipient should deliver once");
 
   } finally {
     await harness.emitLifecycle("session_shutdown").catch(() => undefined);

@@ -61,7 +61,7 @@ export interface SessionInfo {
   contextWindow?: number;
   /** tmux pane id (e.g. "%212") of the session's terminal, read from
    *  $TMUX_PANE at registration. Present only when the session runs inside a
-   *  tmux pane; absent for cloud, headless, IDE-embedded, or Herdr sessions.
+   *  tmux pane; absent for cloud, headless, IDE-embedded, or terminal-manager sessions.
    *  The pane id is immutable for the process lifetime — unlike the window
    *  name, which is mutable — so a peer can live-resolve the current window
    *  from it via tmux when it needs to introspect or drive that pane. */
@@ -85,6 +85,10 @@ export interface SessionInfo {
    *  provenance rather than erased. Broker-authoritative; never set directly
    *  by a presence update. */
   advertised?: boolean;
+  /** Generic capabilities this session offers to other sessions through the
+   *  roster (e.g. the pi-intercom/project-launch-v1 provider namespace).
+   *  Broker-authoritative from registration and extension_capabilities_update. */
+  extensions?: ExtensionCapability[];
   /** Broker-authored provenance for a live session imported from one peer link.
    *  The tuple is the canonical remote routing identity; labels remain display-only. */
   federation?: {
@@ -158,9 +162,7 @@ export interface ExtensionCapability {
   ownerEligible: boolean;
 }
 
-export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal"> & {
-  extensions?: ExtensionCapability[];
-};
+export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "peerUid" | "trustedLocal">;
 
 export type ClientMessage =
   | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string; clientFeatures?: string[] }

@@ -27,22 +27,46 @@ import { isValidSessionDescription, isValidSessionName, RESERVED_SESSION_NAME_PR
 import {
   isBrokerAcceptPeerRequest,
   isBrokerDialPeerRequest,
+  isBrokerListScopesRequest,
+  isCanonicalFederationOriginId,
   isFederationCorrelationId,
   isPeerHello,
 } from "./federation-protocol.ts";
 import { FederationPeerError, PeerLinkManager, type FederationPeerLink, type PreparedInboundPeer } from "./peer-link.ts";
 import {
   FederationRosterState,
+  type ImportedFederatedSession,
   type ImportedRosterChange,
   type LocallyOwnedFederationSession,
 } from "./federation-roster.ts";
+import {
+  loadPersistedFederationOrigin,
+  mintFederationOriginId,
+  persistFederationOrigin,
+  type PersistedFederationOrigin,
+} from "./federation-origin.ts";
+import {
+  FEDERATION_SEND_TEXT_MAX_LENGTH,
+  isPeerSendRequest,
+  isPeerSendResult,
+  PeerSendDedup,
+  PendingPeerSendTracker,
+  type PendingPeerSend,
+  type PeerSendFailureCode,
+  type PeerSendRequest,
+  type PeerSendResult,
+} from "./federation-send.ts";
 import {
   FEDERATION_PROTOCOL_NAME,
   FEDERATION_PROTOCOL_VERSION,
   FEDERATION_REQUIRED_FEATURES,
   FEDERATION_ROSTER_FEATURE,
+  FEDERATION_SEND_FEATURE,
   type BrokerDialPeerRequest,
+  type BrokerListScopesResult,
+  type BrokerScopeSummary,
   type FederationFailureCode,
+  type FederationOrigin,
 } from "./federation-types.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
@@ -324,9 +348,15 @@ class IntercomBroker {
   private collaborationState: CollaborationStateStore;
   private peerLinks: PeerLinkManager;
   private federationRoster: FederationRosterState;
+  private federationOrigin: PersistedFederationOrigin | undefined;
+  private federationSendDedup = new Map<string, PeerSendDedup>();
+  private federationPendingSends = new PendingPeerSendTracker();
+  private federationInFlightMessageIds = new Set<string>();
+  private federationSendSweepTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
+    this.federationOrigin = loadPersistedFederationOrigin(INTERCOM_DIR);
     assertNoLiveBroker(PID_PATH);
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
@@ -341,6 +371,10 @@ class IntercomBroker {
       },
       onLinkDown: (link) => {
         this.federationRoster.linkDown(link.linkId);
+        this.federationSendDedup.delete(link.linkId);
+        for (const pending of this.federationPendingSends.dropLink(link.linkId)) {
+          this.failPendingFederatedSend(pending, "Remote federation link disconnected before delivery", "E_TARGET_DISCONNECTED", true);
+        }
         this.scheduleShutdownCheck();
       },
       onPeerMessage: (link, value) => this.handleFederationPeerMessage(link, value),
@@ -663,6 +697,43 @@ class IntercomBroker {
         return;
       }
 
+      if (connectionRole === "unregistered" && claimedType === "broker_list_scopes") {
+        connectionRole = "control";
+        clearRegistrationTimeout();
+        const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";
+        if (requiresEndpointAuth && record?.stateId !== BROKER_STATE_ID) {
+          throw new Error("Invalid intercom TCP endpoint credentials");
+        }
+        const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
+        if (!isBrokerListScopesRequest(msg)) {
+          if (requestId) writeMessage(socket, { type: "broker_list_scopes_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker list scopes request" });
+          else writeMessage(socket, { type: "error", error: "Invalid broker list scopes request" });
+          socket.end();
+          return;
+        }
+        let result: BrokerListScopesResult;
+        try {
+          result = {
+            type: "broker_list_scopes_result",
+            requestId: msg.requestId,
+            ok: true,
+            localOrigin: this.getCanonicalFederationOrigin(),
+            scopes: this.summarizeScopes(),
+          };
+        } catch (error) {
+          result = {
+            type: "broker_list_scopes_result",
+            requestId: msg.requestId,
+            ok: false,
+            code: "E_INVALID_REQUEST",
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        writeMessage(socket, result);
+        socket.end();
+        return;
+      }
+
       if (connectionRole === "unregistered" && claimedType === "broker_accept_peer") {
         connectionRole = "control";
         clearRegistrationTimeout();
@@ -678,6 +749,7 @@ class IntercomBroker {
           return;
         }
         try {
+          this.enforceCanonicalFederationOrigin(msg.localOrigin);
           preparedPeer = this.peerLinks.prepareInbound(msg);
           connectionRole = "peer-prepared";
           this.cancelShutdownTimer();
@@ -823,13 +895,301 @@ class IntercomBroker {
     }));
   }
 
+  /**
+   * The canonical federation origin belongs to this broker install. First
+   * federation use adopts a controller-supplied canonical id when offered, or
+   * mints a fresh install identity; afterwards every controller must present
+   * exactly it.
+   */
+  private getCanonicalFederationOrigin(preferred?: FederationOrigin): FederationOrigin {
+    if (this.federationOrigin) return { id: this.federationOrigin.originId };
+    const originId = preferred && isCanonicalFederationOriginId(preferred.id)
+      ? preferred.id
+      : mintFederationOriginId();
+    this.federationOrigin = { originId, mintedAt: Date.now() };
+    try {
+      persistFederationOrigin(INTERCOM_DIR, this.federationOrigin);
+    } catch (error) {
+      // Fail closed: the dial is refused, and because no identity persisted,
+      // the next first use mints a fresh one. The in-process identity stays
+      // unusable so nothing dials under an unpersisted origin.
+      this.federationOrigin = undefined;
+      throw new FederationPeerError("E_INVALID_REQUEST", "Failed to persist the canonical federation origin", { cause: error });
+    }
+    return { id: originId };
+  }
+
+  private enforceCanonicalFederationOrigin(requested: FederationOrigin): void {
+    const canonical = this.getCanonicalFederationOrigin(requested);
+    if (canonical.id !== requested.id) {
+      throw new FederationPeerError(
+        "E_ORIGIN_MISMATCH",
+        `Local federation origin is fixed to ${canonical.id} for this broker install; read it with broker_list_scopes.`,
+      );
+    }
+  }
+
+  private summarizeScopes(): BrokerScopeSummary[] {
+    const counts = new Map<string | null, number>();
+    for (const session of this.sessions.values()) {
+      counts.set(session.scopeId ?? null, (counts.get(session.scopeId ?? null) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([scopeId, liveSessions]) => ({ scopeId, liveSessions }))
+      .sort((left, right) => (left.scopeId ?? "").localeCompare(right.scopeId ?? ""))
+      .slice(0, 64);
+  }
+
   private handleFederationPeerMessage(link: FederationPeerLink, value: unknown): void {
+    if (isPeerSendRequest(value)) {
+      this.handleFederationPeerSend(link, value);
+      return;
+    }
+    if (isPeerSendResult(value)) {
+      this.handleFederationPeerSendResult(link, value);
+      return;
+    }
     if (!link.features.includes(FEDERATION_ROSTER_FEATURE)) {
       throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Peer sent a roster frame without negotiating roster support");
     }
     if (!this.federationRoster.handlePeerFrame(link.linkId, value)) {
       throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Unsupported federation peer frame");
     }
+  }
+
+  /** Destination side: resolve a peer send against broker-authoritative state and deliver. */
+  private handleFederationPeerSend(link: FederationPeerLink, frame: PeerSendRequest): void {
+    if (!link.features.includes(FEDERATION_SEND_FEATURE) || !link.features.includes(FEDERATION_ROSTER_FEATURE)) {
+      throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Peer sent a routed send without negotiating send support");
+    }
+    if (frame.originId !== link.remoteOrigin.id) {
+      throw new FederationPeerError("E_ORIGIN_MISMATCH", "Routed send origin does not match the peer link");
+    }
+    const fail = (code: PeerSendFailureCode, error: string): void => {
+      writeMessage(link.socket, this.peerSendResultFrame(link, frame.sendId, false, code, error));
+    };
+    let dedup = this.federationSendDedup.get(link.linkId);
+    if (!dedup) {
+      dedup = new PeerSendDedup();
+      this.federationSendDedup.set(link.linkId, dedup);
+    }
+    if (!dedup.observe(frame.sendId)) {
+      fail("E_SEND_DUPLICATE", "This routed send was already observed on the link");
+      return;
+    }
+    // The sender must exist in our imported roster for this exact link; the
+    // peer never supplies a trusted projection of its own sender.
+    const sender = this.federationRoster.findImportedByRemoteTuple(
+      link.linkId,
+      frame.senderScopeAlias,
+      frame.senderStableSessionId,
+    );
+    if (!sender) {
+      fail("E_SEND_UNAUTHORIZED", "Sending session is not present in the federated roster for this link");
+      return;
+    }
+    const binding = link.scopeBindings.find((candidate) => candidate.localScopeAlias === frame.targetScopeAlias);
+    if (!binding) {
+      fail("E_SEND_INVALID", "Target scope alias was never exported on this link");
+      return;
+    }
+    const target = this.sessions.get(scopedSessionKey(binding.localScopeId ?? undefined, frame.targetStableSessionId));
+    if (!target || !sameScope(target.scopeId, sender.localScopeId ?? undefined) || !canSeeSession(sender.info, target.info)) {
+      fail("E_SEND_TARGET_NOT_FOUND", "Target session is not visible to the sending session on this broker");
+      return;
+    }
+    const now = Date.now();
+    writeMessage(target.socket, {
+      type: "message",
+      from: sender.info,
+      message: {
+        id: frame.message.id,
+        timestamp: frame.message.timestamp,
+        brokerReceivedAt: now,
+        brokerDeliveredAt: now,
+        content: { text: frame.message.text },
+      },
+    });
+    writeMessage(link.socket, this.peerSendResultFrame(link, frame.sendId, true, undefined, undefined, now));
+  }
+
+  /** Origin side: a correlated result is the only acceptance of delivery. */
+  private handleFederationPeerSendResult(link: FederationPeerLink, frame: PeerSendResult): void {
+    if (!link.features.includes(FEDERATION_SEND_FEATURE)) {
+      throw new FederationPeerError("E_FEATURE_UNSUPPORTED", "Peer sent a routed send result without negotiating send support");
+    }
+    if (frame.originId !== link.remoteOrigin.id) {
+      throw new FederationPeerError("E_ORIGIN_MISMATCH", "Routed send result origin does not match the peer link");
+    }
+    const pending = this.federationPendingSends.peek(frame.sendId);
+    // Unknown ids are late results for already-expired sends; ignore them.
+    if (!pending) return;
+    if (pending.linkId !== link.linkId) {
+      // A result arriving on a different link than it was sent on cannot
+      // correlate; ignore the forgery and keep waiting on the real link.
+      return;
+    }
+    this.federationPendingSends.resolve(frame.sendId);
+    if (frame.ok) {
+      this.federationInFlightMessageIds.delete(JSON.stringify([pending.senderKey, pending.messageId]));
+      this.recordDelivery(pending.senderKey, pending.messageId, pending.fingerprint, "socket_delivered");
+      const session = this.sessions.get(pending.senderKey);
+      if (session) this.writeDeliverySuccess(session.socket, pending.messageId, "socket_delivered");
+      return;
+    }
+    this.failPendingFederatedSend(
+      pending,
+      frame.error,
+      frame.code,
+      frame.code === "E_SEND_TARGET_DISCONNECTED",
+    );
+  }
+
+  private peerSendResultFrame(
+    link: FederationPeerLink,
+    sendId: string,
+    ok: boolean,
+    code?: PeerSendFailureCode,
+    error?: string,
+    deliveredAt?: number,
+  ): PeerSendResult {
+    return {
+      type: "peer_send_result",
+      protocol: FEDERATION_PROTOCOL_NAME,
+      version: FEDERATION_PROTOCOL_VERSION,
+      originId: link.localOrigin.id,
+      sendId,
+      ...(ok
+        ? { ok: true as const, deliveredAt: deliveredAt ?? Date.now() }
+        : { ok: false as const, code: code!, error: error! }),
+    };
+  }
+
+  private failPendingFederatedSend(
+    pending: PendingPeerSend,
+    reason: string,
+    code: string,
+    retryable: boolean,
+  ): void {
+    this.federationInFlightMessageIds.delete(JSON.stringify([pending.senderKey, pending.messageId]));
+    this.recordDelivery(pending.senderKey, pending.messageId, pending.fingerprint, "failed", reason, code, retryable);
+    const session = this.sessions.get(pending.senderKey);
+    if (session) this.writeDeliveryFailure(session.socket, pending.messageId, reason, code, retryable);
+  }
+
+  private ensureFederationSendSweep(): void {
+    if (this.federationSendSweepTimer) return;
+    this.federationSendSweepTimer = setInterval(() => {
+      for (const expired of this.federationPendingSends.expire()) {
+        this.failPendingFederatedSend(expired, "Remote federation delivery timed out", "E_TARGET_DISCONNECTED", true);
+      }
+      if (this.federationPendingSends.size === 0 && this.federationSendSweepTimer) {
+        clearInterval(this.federationSendSweepTimer);
+        this.federationSendSweepTimer = null;
+      }
+    }, 1000);
+    this.federationSendSweepTimer.unref?.();
+  }
+
+  /**
+   * Origin side of a routed federation direct send: validates the v1 direct
+   * send contract, replays/records like a local delivery, and reports the
+   * client outcome only when the destination broker's correlated result
+   * arrives (or the link drops / the correlation deadline passes).
+   */
+  private attemptFederatedSend(
+    socket: net.Socket,
+    currentKey: string,
+    fromSession: ConnectedSession,
+    qualifiedId: string,
+    message: Message,
+    contactKind: "direct" | "broadcast",
+    imported: ImportedFederatedSession,
+  ): void {
+    const reject = (reason: string, code: string, retryable = false): void => {
+      const fingerprint = this.deliveryFingerprint(message, qualifiedId, contactKind);
+      this.recordDelivery(currentKey, message.id, fingerprint, "failed", reason, code, retryable);
+      this.writeDeliveryFailure(socket, message.id, reason, code, retryable);
+    };
+    if (contactKind !== "direct") {
+      reject("Broadcast remains host-local in federation v1", "E_INVALID_MESSAGE");
+      return;
+    }
+    if (message.expectsReply || message.replyTo || message.supersedes) {
+      reject("Remote asks, replies, and supersession arrive in a later federation slice", "E_INVALID_MESSAGE");
+      return;
+    }
+    if (message.content.attachments?.length) {
+      reject("Attachments cannot cross federation yet", "E_INVALID_MESSAGE");
+      return;
+    }
+    if (message.content.text.length > FEDERATION_SEND_TEXT_MAX_LENGTH) {
+      reject(`Message text exceeds the ${FEDERATION_SEND_TEXT_MAX_LENGTH} character federated delivery limit`, "E_INVALID_MESSAGE");
+      return;
+    }
+    const link = this.peerLinks.getLink(imported.linkId);
+    if (!link || !link.features.includes(FEDERATION_SEND_FEATURE) || !link.features.includes(FEDERATION_ROSTER_FEATURE)) {
+      reject("Remote session is roster-only on this link until both brokers negotiate routed delivery", "E_TARGET_NOT_FOUND");
+      return;
+    }
+    // The sender must be exported on that link; restricted subagents and other
+    // hidden sessions are not visible to remote peers.
+    const senderTuple = this.federationRoster.findExportedTuple(link.linkId, fromSession.scopeId ?? null, fromSession.info.id);
+    if (!senderTuple) {
+      reject("This session is not visible to remote peers", "E_SEND_UNAUTHORIZED");
+      return;
+    }
+    const fingerprint = this.deliveryFingerprint(message, qualifiedId, contactKind);
+    const inFlightKey = JSON.stringify([currentKey, message.id]);
+    if (this.federationInFlightMessageIds.has(inFlightKey)) {
+      reject("A delivery for this message id is already in flight", "E_MESSAGE_ID_REUSE");
+      return;
+    }
+    if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
+      return;
+    }
+    const sendId = randomUUID();
+    const pending = this.federationPendingSends.add(sendId, {
+      linkId: link.linkId,
+      messageId: message.id,
+      senderKey: currentKey,
+      fingerprint,
+    });
+    if (!pending) {
+      reject("The broker is saturated with pending remote deliveries; retry shortly", "E_TARGET_DISCONNECTED", true);
+      return;
+    }
+    const frame: PeerSendRequest = {
+      type: "peer_send",
+      protocol: FEDERATION_PROTOCOL_NAME,
+      version: FEDERATION_PROTOCOL_VERSION,
+      originId: link.localOrigin.id,
+      sendId,
+      senderScopeAlias: senderTuple.scopeAlias,
+      senderStableSessionId: senderTuple.stableSessionId,
+      targetScopeAlias: imported.info.federation.remoteScopeAlias,
+      targetStableSessionId: imported.info.federation.remoteStableSessionId,
+      message: {
+        id: message.id,
+        timestamp: message.timestamp,
+        text: message.content.text,
+      },
+    };
+    if (!isPeerSendRequest(frame)) {
+      this.federationPendingSends.resolve(sendId);
+      reject("Message cannot be represented safely for federated delivery", "E_INVALID_MESSAGE");
+      return;
+    }
+    this.federationInFlightMessageIds.add(inFlightKey);
+    try {
+      writeMessage(link.socket, frame);
+    } catch (error) {
+      this.federationPendingSends.resolve(sendId);
+      this.federationInFlightMessageIds.delete(inFlightKey);
+      reject(`Failed to write the routed send to the federation link: ${error instanceof Error ? error.message : String(error)}`, "E_TARGET_DISCONNECTED", true);
+      return;
+    }
+    this.ensureFederationSendSweep();
   }
 
   private handleImportedRosterChange(change: ImportedRosterChange): void {
@@ -865,6 +1225,7 @@ class IntercomBroker {
     signal: AbortSignal,
   ): Promise<void> {
     try {
+      this.enforceCanonicalFederationOrigin(request.localOrigin);
       const link = await this.peerLinks.dial(request, signal);
       if (socket.writable && !socket.destroyed) {
         try {
@@ -1016,6 +1377,7 @@ class IntercomBroker {
           ...(session.isSubagent !== undefined ? { isSubagent: session.isSubagent } : {}),
           ...(session.supervisorSessionId !== undefined ? { supervisorSessionId: session.supervisorSessionId } : {}),
           ...(session.supervisorName !== undefined ? { supervisorName: session.supervisorName } : {}),
+          ...(extensions?.length ? { extensions } : {}),
           trustedLocal: typeof LISTEN_TARGET === "string" && process.platform !== "win32",
         };
 
@@ -1107,6 +1469,12 @@ class IntercomBroker {
           }
         }
         session.extensions = extensions;
+        // Capability changes are roster-visible to local peers: keep the session
+        // info in sync so local sessions can discover providers through the
+        // ordinary roster. Federation v1 deliberately does not carry them.
+        if (extensions.length > 0) session.info.extensions = extensions;
+        else delete session.info.extensions;
+        this.broadcastScoped({ type: "presence_update", session: session.info }, session.info, currentKey, session.scopeId);
         this.recomputeNamespaceOwners();
         for (const extension of extensions) {
           const owner = this.namespaceOwners.get(scopedExtensionKey(session.scopeId, extension.namespace));
@@ -1258,18 +1626,23 @@ class IntercomBroker {
           this.writeDeliveryFailure(socket, message.id, "Invalid contact kind", "E_INVALID_MESSAGE");
           break;
         }
-        if (clientMessage.to.startsWith(RESERVED_SESSION_NAME_PREFIX)) {
-          // Origin-qualified identities belong to imported federation rows,
-          // which are roster-only until routed delivery ships. They must never
-          // fall through to local name or mailbox resolution.
-          const fingerprint = this.deliveryFingerprint(message, clientMessage.to, contactKind);
-          this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Remote federation sessions are roster-only until routed delivery ships", "E_TARGET_NOT_FOUND");
-          this.writeDeliveryFailure(socket, message.id, "Remote federation sessions are roster-only until routed delivery ships", "E_TARGET_NOT_FOUND");
-          break;
-        }
         const fromSession = this.sessions.get(currentKey);
         if (!fromSession || fromSession.socket !== socket) {
           this.writeDeliveryFailure(socket, message.id, "Sender session not found", "E_SENDER_NOT_FOUND");
+          break;
+        }
+        if (clientMessage.to.startsWith(RESERVED_SESSION_NAME_PREFIX)) {
+          // Origin-qualified identities are imported federation rows. They
+          // route over the peer link only when routed delivery is negotiated;
+          // they never fall through to local name or mailbox resolution.
+          const imported = this.federationRoster.findImportedByQualifiedId(clientMessage.to);
+          if (imported) {
+            this.attemptFederatedSend(socket, currentKey, fromSession, clientMessage.to, message, contactKind, imported);
+          } else {
+            const fingerprint = this.deliveryFingerprint(message, clientMessage.to, contactKind);
+            this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Remote federation session is not present in the federated roster", "E_TARGET_NOT_FOUND");
+            this.writeDeliveryFailure(socket, message.id, "Remote federation session is not present in the federated roster", "E_TARGET_NOT_FOUND");
+          }
           break;
         }
 
@@ -1291,6 +1664,22 @@ class IntercomBroker {
         if (hasTargetId && hasTargetEpoch) {
           const targetId = clientMessage.targetId as string;
           const targetEpoch = clientMessage.targetEpoch as string;
+          if (targetId.startsWith(RESERVED_SESSION_NAME_PREFIX)) {
+            const imported = this.federationRoster.findImportedByQualifiedId(targetId);
+            const fingerprint = this.deliveryFingerprint(message, targetId, contactKind);
+            if (!imported) {
+              this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Session not found", "E_TARGET_NOT_FOUND");
+              this.writeDeliveryFailure(socket, message.id, "Session not found", "E_TARGET_NOT_FOUND");
+              break;
+            }
+            if (imported.info.endpointEpoch !== targetEpoch) {
+              this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
+              this.writeDeliveryFailure(socket, message.id, "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
+              break;
+            }
+            this.attemptFederatedSend(socket, currentKey, fromSession, targetId, message, contactKind, imported);
+            break;
+          }
           const fingerprint = this.deliveryFingerprint(message, targetId, contactKind);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;

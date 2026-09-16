@@ -432,6 +432,46 @@ export class FederationRosterState {
     return [...this.links.values()].flatMap((state) => [...state.imported.values()]);
   }
 
+  /** Resolves an origin-qualified imported identity across every live link. */
+  findImportedByQualifiedId(id: string): ImportedFederatedSession | undefined {
+    for (const state of this.links.values()) {
+      const imported = state.imported.get(id);
+      if (imported) return imported;
+    }
+    return undefined;
+  }
+
+  /** Destination-side sender resolution: the peer's own exported tuple on one link. */
+  findImportedByRemoteTuple(
+    linkId: string,
+    remoteScopeAlias: string,
+    remoteStableSessionId: string,
+  ): ImportedFederatedSession | undefined {
+    const state = this.links.get(linkId);
+    if (!state) return undefined;
+    for (const imported of state.imported.values()) {
+      if (imported.info.federation.remoteScopeAlias === remoteScopeAlias
+        && imported.info.federation.remoteStableSessionId === remoteStableSessionId) {
+        return imported;
+      }
+    }
+    return undefined;
+  }
+
+  /** Origin-side sender identity: the tuple a locally owned session is exported under. */
+  findExportedTuple(
+    linkId: string,
+    localScopeId: string | null,
+    stableSessionId: string,
+  ): { scopeAlias: string; stableSessionId: string } | undefined {
+    const state = this.links.get(linkId);
+    if (!state) return undefined;
+    const binding = state.link.scopeBindings.find((candidate) => candidate.localScopeId === localScopeId);
+    if (!binding) return undefined;
+    const entry = state.exported.get(rosterKey(binding.localScopeAlias, stableSessionId));
+    return entry ? { scopeAlias: entry.scopeAlias, stableSessionId: entry.stableSessionId } : undefined;
+  }
+
   private sendDeltaChunks(
     state: LinkRosterState,
     upserts: FederationRosterEntry[],

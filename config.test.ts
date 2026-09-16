@@ -86,6 +86,29 @@ test("loadConfig accepts a restart-stable intercom id", async () => {
   }
 });
 
+test("loadConfig validates the optional default project launcher command", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
+  try {
+    mkdirSync(join(root, "intercom"), { recursive: true });
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ projectLauncher: " tmux new-window -c \"{root}\" pi " }));
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().projectLauncher, "tmux new-window -c \"{root}\" pi");
+    });
+
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ projectLauncher: "" }));
+    await withAgentDir(root, () => {
+      assert.throws(() => loadConfig(), /"projectLauncher" must not be empty/);
+    });
+
+    writeFileSync(join(root, "intercom", "config.json"), JSON.stringify({ projectLauncher: 42 }));
+    await withAgentDir(root, () => {
+      assert.throws(() => loadConfig(), /"projectLauncher" must be a string/);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig rejects invalid inboundTrigger values", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-intercom-config-"));
   try {

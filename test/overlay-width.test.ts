@@ -124,8 +124,7 @@ test("session list overlay identifies federated sessions by remote origin", () =
   const overlay = new SessionListOverlay(theme as any, selectingKeys as any, session, [remote], (value) => { selected = value; });
   const rendered = overlay.render(88).join("\n");
   assert.match(rendered, /remote:Penguin/);
-  assert.match(rendered, /roster only/);
   assert.match(rendered, /remote-s/);
   overlay.handleInput("enter");
-  assert.equal(selected, undefined);
+  assert.equal(selected?.id, remote.id);
 });

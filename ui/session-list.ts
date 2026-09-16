@@ -36,7 +36,7 @@ function shortSessionId(session: SessionInfo): string {
 function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?: boolean }): string {
   const name = session.name || "Unnamed session";
   const remote = session.federation
-    ? `remote:${session.federation.originLabel ?? session.federation.originId} · roster only`
+    ? `remote:${session.federation.originLabel ?? session.federation.originId}`
     : undefined;
   const tags = [options?.self ? "self" : undefined, options?.sameCwd ? "same cwd" : undefined, remote]
     .filter((tag): tag is string => Boolean(tag));
@@ -70,7 +70,7 @@ export class SessionListOverlay implements Component {
 
   private onSessionSelect(sessionId: string): void {
     const session = this.sessions.find(s => s.id === sessionId);
-    if (!session || session.federation) return;
+    if (!session) return;
     this.done(session);
   }
 

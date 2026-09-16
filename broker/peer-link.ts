@@ -102,10 +102,6 @@ export class PeerLinkManager {
     return this.linksById.size;
   }
 
-  getLink(linkId: string): FederationPeerLink | undefined {
-    return this.linksById.get(linkId);
-  }
-
   listLinks(): FederationPeerLink[] {
     return [...this.linksById.values()];
   }
@@ -367,6 +363,10 @@ export class PeerLinkManager {
         }
       });
     });
+  }
+
+  getLink(linkId: string): FederationPeerLink | undefined {
+    return this.linksById.get(linkId);
   }
 
   activateLink(linkId: string): void {

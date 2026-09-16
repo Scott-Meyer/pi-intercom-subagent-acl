@@ -223,6 +223,17 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   if (value.advertised !== undefined && typeof value.advertised !== "boolean") {
     return false;
   }
+  if (value.extensions !== undefined) {
+    if (!Array.isArray(value.extensions) || value.extensions.length > 32) return false;
+    for (const extension of value.extensions) {
+      if (!isRecord(extension) || Object.keys(extension).some((key) => key !== "namespace" && key !== "ownerEligible")) return false;
+      if (typeof extension.namespace !== "string"
+        || extension.namespace.length === 0
+        || extension.namespace.length > 64
+        || !/^[a-z0-9][a-z0-9._/-]*$/.test(extension.namespace)
+        || typeof extension.ownerEligible !== "boolean") return false;
+    }
+  }
   if (value.federation !== undefined) {
     if (!isRecord(value.federation)) return false;
     const keys = Object.keys(value.federation);
@@ -243,7 +254,8 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
       || value.isSubagent !== undefined
       || value.supervisorSessionId !== undefined
       || value.supervisorName !== undefined
-      || value.advertised !== undefined) return false;
+      || value.advertised !== undefined
+      || value.extensions !== undefined) return false;
     try {
       if (value.id !== encodeOriginQualifiedSessionIdentity({
         originId: value.federation.originId,

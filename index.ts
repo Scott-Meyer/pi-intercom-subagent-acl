@@ -31,7 +31,14 @@ import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { formatPeerCompactionNotice } from "./compaction-awareness.ts";
-import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
+import {
+  openProjectPane,
+  projectLaunchRequestText,
+  resolveProjectLauncherCommand,
+  resolveTargetInCwd,
+  waitForProjectSession,
+  type ProjectPaneLaunch,
+} from "./project-agent.ts";
 import { isValidSessionDescription, isValidSessionName, normalizeSelfProfileUpdate, type SelfProfileUpdate } from "./session-profile.ts";
 
 type SessionInfoChangedEvent = Extract<AgentSessionEvent, { type: "session_info_changed" }>;
@@ -522,7 +529,7 @@ function duplicateSessionNames(sessions: SessionInfo[]): Set<string> {
       .filter((name, index, names) => names.indexOf(name) !== index)
   );
 }
-function sessionIdPrefixes(sessions: SessionInfo[]): Map<string, string> {
+export function sessionIdPrefixes(sessions: SessionInfo[]): Map<string, string> {
   const prefixes = new Map<string, string>();
   for (const session of sessions) {
     let longestSharedPrefix = 0;
@@ -537,8 +544,17 @@ function sessionIdPrefixes(sessions: SessionInfo[]): Map<string, string> {
       longestSharedPrefix = Math.max(longestSharedPrefix, length);
     }
     const minimumLength = Math.max(8, longestSharedPrefix + 1);
-    const groupBoundary = session.id.indexOf("-", minimumLength);
-    const length = groupBoundary === -1 ? minimumLength : groupBoundary;
+    // Prefer a clean segment boundary over slicing mid-segment, and never
+    // truncate the final segment: ids like "mistfall-remote:game:t226" whose
+    // unique tail follows the last separator would otherwise display as "t2".
+    let groupBoundary = -1;
+    for (const separator of ["-", ":"]) {
+      const boundary = session.id.indexOf(separator, minimumLength);
+      if (boundary !== -1 && (groupBoundary === -1 || boundary < groupBoundary)) {
+        groupBoundary = boundary;
+      }
+    }
+    const length = groupBoundary === -1 ? session.id.length : groupBoundary;
     prefixes.set(session.id, session.id.slice(0, length));
   }
   return prefixes;
@@ -632,7 +648,7 @@ function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): stri
 function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: boolean, idPrefix: string): string {
   const name = session.name || "Unnamed session";
   const remote = session.federation
-    ? `remote:${session.federation.originLabel ?? session.federation.originId} · roster only`
+    ? `remote:${session.federation.originLabel ?? session.federation.originId}`
     : undefined;
   const tags = [isSelf ? "self" : session.cwd === currentCwd ? "same cwd" : undefined, remote, session.status]
     .filter((tag): tag is string => Boolean(tag));
@@ -2004,11 +2020,22 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
     }
     if (!options.openProjectPaneIfMissing) {
-      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} Pass openProjectPaneIfMissing: true to open a Herdr project pane and start Pi there.`);
+      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} Pass openProjectPaneIfMissing: true to launch Pi there through a registered project launcher.`);
     }
 
     const beforeSessionIds = new Set(sessions.map((session) => session.id));
-    const projectPane = await openProjectPane({ cwd: targetCwd, focus: options.focus, signal: options.signal });
+    const projectPane = await openProjectPane({
+      cwd: targetCwd,
+      focus: options.focus,
+      sessions,
+      currentSessionId,
+      launcherCommand: resolveProjectLauncherCommand(process.env, config.projectLauncher),
+      sendRequest: (provider, request) => activeClient.send(provider.id, {
+        text: projectLaunchRequestText(request),
+        signal: options.signal,
+      }).then((result) => ({ delivered: result.delivered, ...(result.reason ? { reason: result.reason } : {}) })),
+      signal: options.signal,
+    });
     const session = await waitForProjectSession(activeClient, {
       projectRoot: projectPane.projectRoot,
       currentSessionId,
@@ -2949,7 +2976,7 @@ Usage:
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send to one session
   intercom({ action: "send", targets: ["name-or-id", "other-id"], message: "..." }) → Send independently to several explicit sessions
   intercom({ action: "broadcast", message: "..." }) → Send to every visible live session on this machine; avoid this when explicit targets are known
-  intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
+  intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Launch Pi in /path through a registered project launcher, then send
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
   intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
@@ -3018,10 +3045,10 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
         description: "Working directory filter for 'list-cwd'. For send/ask, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
       })),
       openProjectPaneIfMissing: Type.Optional(Type.Boolean({
-        description: "For send/ask with cwd, open a visible Herdr project pane and launch Pi there when no matching live session is connected.",
+        description: "For send/ask with cwd, launch Pi in that project through a registered generic project launcher when no matching live session exists.",
       })),
       focus: Type.Optional(Type.Boolean({
-        description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
+        description: "For openProjectPaneIfMissing, focus the new terminal when the launcher supports it. Defaults to true.",
       })),
       name: Type.Optional(Type.String({
         description: "For 'advertise': the public name this subagent wants to claim. Must be unique among currently connected sessions.",
@@ -3086,7 +3113,19 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
       // Some tool-schema adapters materialize optional arrays as [""]. Treat
       // an all-blank placeholder as omitted while preserving errors for mixed
       // real/blank recipient lists.
-      const targets = params.targets?.every((target) => !target.trim()) ? undefined : params.targets;
+      const allBlankTargets = params.targets?.every((target) => !target.trim()) ?? false;
+      // Some adapters also duplicate the recipient into both optional fields;
+      // a single target identical to `to` is the same singular delivery
+      // intent (multicast already delivers same-session aliases once), so it
+      // is treated as `to` alone. Genuinely different or multi-element lists
+      // still conflict.
+      const duplicatedSingularTarget = params.targets !== undefined
+        && to !== undefined
+        && params.targets.length === 1
+        && params.targets[0]?.trim() === to.trim();
+      const targets = params.targets === undefined || allBlankTargets || duplicatedSingularTarget
+        ? undefined
+        : params.targets;
 
       if (messageId && action !== "cancel") {
         return {
@@ -3574,7 +3613,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               dismissIncomingAsk(effectiveReplyTo);
             }
             const sentText = target.projectPane
-              ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
+              ? `Launched Pi in ${target.projectPane.projectRoot} via ${target.projectPane.provider.kind === "session" ? `project launcher ${target.projectPane.provider.name}` : "the configured project launcher command"} and sent message to ${targetDisplay}`
               : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${targetDisplay}`;
             const deliveryText = result.delivery === "queued"
               ? `${sentText}\n\n${queuedDeliveryNote(targetDisplay)}`
@@ -3591,7 +3630,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               details: {
                 ...deliveryDetails(result),
                 ...(effectiveReplyTo ? { replyTo: effectiveReplyTo } : {}),
-                ...(target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {}),
+                ...(target.projectPane ? { openedProjectPane: true, projectRoot: target.projectPane.projectRoot, projectLauncher: target.projectPane.provider.kind === "session" ? target.projectPane.provider.name : "configured-command" } : {}),
               },
             };
           } catch (error) {
@@ -3744,7 +3783,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               details: {
                 ...deliveryDetails(sendResult),
                 ...(latestCompaction ? { peerCompaction: latestCompaction } : {}),
-                ...(target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {}),
+                ...(target.projectPane ? { openedProjectPane: true, projectRoot: target.projectPane.projectRoot, projectLauncher: target.projectPane.provider.kind === "session" ? target.projectPane.provider.name : "configured-command" } : {}),
               },
             };
           } catch (error) {

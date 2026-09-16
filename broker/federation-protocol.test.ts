@@ -7,6 +7,8 @@ import {
   isBrokerAcceptPeerResult,
   isBrokerDialPeerRequest,
   isBrokerDialPeerResult,
+  isBrokerListScopesRequest,
+  isBrokerListScopesResult,
   isFederationBridgeAttach,
   isPeerHello,
   isPeerHelloAck,
@@ -102,6 +104,46 @@ test("origin-qualified identity decoding rejects noncanonical and unsafe values"
     remoteScopeAlias: "mistfall-remote",
     remoteStableSessionId: "s".repeat(FEDERATION_SESSION_ID_MAX_LENGTH + 1),
   }), /Invalid origin-qualified session identity/);
+});
+
+test("broker list scopes requests and results validate strictly", () => {
+  assert.equal(isBrokerListScopesRequest({ type: "broker_list_scopes", requestId: "list_scopes_0001" }), true);
+  assert.equal(isBrokerListScopesRequest({ type: "broker_list_scopes", requestId: "short" }), false);
+  assert.equal(isBrokerListScopesRequest({ type: "broker_list_scopes", requestId: "list_scopes_0001", stateId: "state_0001_ab" }), true);
+  assert.equal(isBrokerListScopesRequest({ type: "broker_list_scopes", requestId: "list_scopes_0001", extra: true }), false);
+  assert.equal(isBrokerListScopesRequest({ type: "broker_list_scopes" }), false);
+
+  const okResult = {
+    type: "broker_list_scopes_result",
+    requestId: "list_scopes_0001",
+    ok: true,
+    localOrigin: { id: "install:550e8400-e29b-41d4-a716-446655440000" },
+    scopes: [
+      { scopeId: "project-a", liveSessions: 2 },
+      { scopeId: null, liveSessions: 1 },
+    ],
+  };
+  assert.equal(isBrokerListScopesResult(okResult), true);
+  for (const mutation of [
+    { ...okResult, localOrigin: { id: "host:unlabeled", label: "Extra" } },
+    { ...okResult, localOrigin: { id: "host:unlabeled" }, scopes: [{ scopeId: "dup", liveSessions: 1 }, { scopeId: "dup", liveSessions: 2 }] },
+    { ...okResult, localOrigin: { id: "host:unlabeled" }, scopes: [{ scopeId: "", liveSessions: 1 }] },
+    { ...okResult, localOrigin: { id: "host:unlabeled" }, scopes: [{ scopeId: 7, liveSessions: 1 }] },
+    { ...okResult, localOrigin: { id: "host:unlabeled" }, scopes: [{ scopeId: "x", liveSessions: -1 }] },
+    { ...okResult, localOrigin: { id: "host:unlabeled" }, scopes: [{ scopeId: "x", liveSessions: 1, extra: true }] },
+    { ...okResult, ok: false },
+    { ...okResult, ok: false, code: "E_INVALID_REQUEST" },
+    { ...okResult, ok: "yes" },
+  ]) {
+    assert.equal(isBrokerListScopesResult(mutation), false, `expected rejection for ${JSON.stringify(mutation)}`);
+  }
+  assert.equal(isBrokerListScopesResult({
+    type: "broker_list_scopes_result",
+    requestId: "list_scopes_0001",
+    ok: false,
+    code: "E_INVALID_REQUEST",
+    error: "Failed to persist the canonical federation origin",
+  }), true);
 });
 
 test("dial and accept controls bind local raw scopes but expose only aliases to peers", () => {

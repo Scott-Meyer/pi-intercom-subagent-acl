@@ -12,6 +12,7 @@ export const FEDERATION_PROTOCOL_VERSION = 1 as const;
 export const FEDERATION_IDENTITY_FEATURE = "peer-identity-v1" as const;
 export const FEDERATION_SINGLE_HOP_FEATURE = "peer-single-hop-v1" as const;
 export const FEDERATION_ROSTER_FEATURE = "peer-roster-v1" as const;
+export const FEDERATION_SEND_FEATURE = "peer-send-v1" as const;
 export const FEDERATION_CAPABILITY_MIN_LENGTH = 32;
 export const FEDERATION_CAPABILITY_MAX_LENGTH = 128;
 export const FEDERATION_CORRELATION_ID_MAX_LENGTH = 128;
@@ -31,6 +32,7 @@ export const FEDERATION_REQUIRED_FEATURES = [
 export const FEDERATION_SUPPORTED_FEATURES = [
   ...FEDERATION_REQUIRED_FEATURES,
   FEDERATION_ROSTER_FEATURE,
+  FEDERATION_SEND_FEATURE,
 ] as const;
 
 export type FederationRequiredFeature = typeof FEDERATION_REQUIRED_FEATURES[number];
@@ -116,21 +118,6 @@ export type BrokerDialPeerResult =
       error: string;
     };
 
-export type BrokerAcceptPeerResult =
-  | {
-      type: "broker_accept_peer_result";
-      requestId: string;
-      ok: true;
-      linkId: string;
-    }
-  | {
-      type: "broker_accept_peer_result";
-      requestId: string;
-      ok: false;
-      code: FederationFailureCode;
-      error: string;
-    };
-
 /** First frame on the broker -> FlightDeck attachment socket. */
 export interface FederationBridgeAttach {
   type: "bridge_attach";
@@ -181,5 +168,51 @@ export interface OriginQualifiedSessionIdentity {
   remoteStableSessionId: string;
 }
 
-export type FederationControlMessage = BrokerDialPeerRequest | BrokerAcceptPeerRequest;
+export type BrokerAcceptPeerResult =
+  | {
+      type: "broker_accept_peer_result";
+      requestId: string;
+      ok: true;
+      linkId: string;
+    }
+  | {
+      type: "broker_accept_peer_result";
+      requestId: string;
+      ok: false;
+      code: FederationFailureCode;
+      error: string;
+    };
+
+/** Trusted-local enumeration of the canonical federation origin and known
+ * local scopes, for controller pickers. Raw scope ids never leave the
+ * machine through a peer link. */
+export interface BrokerListScopesRequest {
+  type: "broker_list_scopes";
+  requestId: string;
+  stateId?: string;
+}
+
+export interface BrokerScopeSummary {
+  /** Exact local PI_INTERCOM_SCOPE_ID, or null for the unscoped namespace. */
+  scopeId: string | null;
+  liveSessions: number;
+}
+
+export type BrokerListScopesResult =
+  | {
+      type: "broker_list_scopes_result";
+      requestId: string;
+      ok: true;
+      localOrigin: { id: string };
+      scopes: BrokerScopeSummary[];
+    }
+  | {
+      type: "broker_list_scopes_result";
+      requestId: string;
+      ok: false;
+      code: FederationFailureCode;
+      error: string;
+    };
+
+export type FederationControlMessage = BrokerDialPeerRequest | BrokerAcceptPeerRequest | BrokerListScopesRequest;
 export type FederationPeerMessage = PeerHello | PeerHelloAck;

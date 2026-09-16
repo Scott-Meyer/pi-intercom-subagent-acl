@@ -4,6 +4,29 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.13.0-acl.11] - 2026-09-16
+
+### Added
+- Federation Slice 3 (`peer-send-v1`): routed direct sends from locally owned sessions to imported `oqs1.*` targets over a negotiated peer link, with end-to-end result correlation — delivery is accepted only when the destination broker's correlated `peer_send_result` arrives, never because a frame was written. Remote sessions deliver through the ordinary message pipeline, so steering, waking, and visibility behave exactly like local delivery.
+- `broker_list_scopes` trusted-local control: canonical federation origin plus live local scope enumeration (raw scope ids with live session counts) in one call, for controller pickers.
+- Persisted canonical federation origin: first federation use adopts a controller-supplied canonical id or mints `install:<uuid>`, durable across broker restarts in the runtime dir; every later dial/accept must present exactly it (`E_ORIGIN_MISMATCH` otherwise).
+- Generic project-launch integration replaces the previous Herdr-specific pane launching: any local intercom session registers as a provider by advertising the `pi-intercom/project-launch-v1` extension capability and answering its JSON launch requests; `PI_INTERCOM_PROJECT_LAUNCHER` or config `projectLauncher` supplies an opt-in default command (`{root}` is substituted with a safely shell-quoted path — no injection surface, no built-in default). Session `extensions` capabilities are now visible to local peers through the roster and update live; federation v1 deliberately does not carry capabilities across links, and remote rows are never picked as providers.
+
+### Fixed
+- Adapters that duplicate the recipient into both `to` and `targets` are treated as a singular send when the single target is identical (multicast already delivers same-session aliases once); genuinely different or multi-element lists still conflict.
+- Short roster IDs never truncate the final id segment: ids like `mistfall-remote:game:t226` whose unique tail follows the last separator previously displayed as `mistfall-remote:game:t2`; uniqueness prefixes now extend to the next `-`/`:` boundary or keep the full id.
+- Corrupt persisted federation-origin files warn before adopting or minting a fresh identity.
+
+### Security
+- Remote v1 send contract: direct text-only sends (≤32 KiB), no remote asks/replies/supersession, attachments, broadcast, or mailbox queueing; senders must be exported on the link (restricted subagents cannot send remotely), targets must be locally owned, scope-matched, and ACL-visible to the broker-authoritative imported sender; per-link duplicate-send dedupe and in-flight duplicate message id refusal; pending correlations fail deterministically on link drop or a bounded deadline (below the client timeout).
+- Routed sends to unknown qualified ids and sends on roster-only links fail with explicit codes instead of falling through to local name or mailbox resolution.
+
+### Notes
+- Asks/replies/receipts across federation remain Slice 4; broadcast, queued mailboxes, extension channels, and compaction awareness remain host-local in federation v1.
+- Routed-send correlation is at-least-once under timeout races: if a destination result races the bounded deadline, the sender observes a retryable failure even though delivery may have completed, and a client retry delivers again.
+- Destination duplicate-send dedup is a bounded FIFO window (4096 sendIds per link): a peer churning sendIds can evict old ids and replay them. Trusted-peer federation makes this a low-priority concern; the origin never reuses sendIds.
+- ACL.9/ACL.10 peers remain compatible: `peer-send-v1` is intersection-negotiated and absent from older links.
+
 ## [0.13.0-acl.10] - 2026-09-16
 
 ### Added

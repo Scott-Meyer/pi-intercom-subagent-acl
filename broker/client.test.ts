@@ -35,6 +35,39 @@ test("registered feature negotiation rejects non-string feature entries", () => 
   );
 });
 
+test("registered handshake exposes the broker-owned self projection", () => {
+  const client = new IntercomClient();
+  const session = {
+    id: "session-1",
+    name: "worker-2",
+    description: "Reviewing broker owned self profile projection",
+    cwd: "/test",
+    model: "test",
+    pid: 1,
+    startedAt: 1,
+    lastActivity: 1,
+  };
+
+  (client as any).handleBrokerMessage({
+    type: "registered",
+    sessionId: "session-1",
+    features: ["session-profile-v1"],
+    session,
+  });
+  assert.deepEqual(client.getSelfSession(), session);
+  assert.equal(client.supportsFeature("session-profile-v1"), true);
+
+  const invalidClient = new IntercomClient();
+  assert.throws(
+    () => (invalidClient as any).handleBrokerMessage({
+      type: "registered",
+      sessionId: "session-1",
+      session: { ...session, id: "different-session" },
+    }),
+    /Invalid registered session/,
+  );
+});
+
 test("malformed extension broker messages are rejected", () => {
   const client = new IntercomClient();
   (client as any)._sessionId = "session-1";

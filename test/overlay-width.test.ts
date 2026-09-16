@@ -27,6 +27,7 @@ const keybindings = {
 const session: SessionInfo = {
   id: "session-12345678",
   name: "session-019ecaf6",
+  description: "Reviewing peer discovery profiles now",
   cwd: "/Users/envvar/.config/ghostty",
   model: "bsy-deepseek-v4-pro",
   pid: 1,
@@ -97,4 +98,5 @@ test("session list overlay renders lines at the declared overlay width", () => {
   for (const width of [1, 2, 20, 50, 88]) {
     assertLineWidths("session list overlay", overlay.render(width), width);
   }
+  assert.match(overlay.render(88).join("\n"), /Reviewing peer discovery profiles now/);
 });

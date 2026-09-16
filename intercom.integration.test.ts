@@ -175,6 +175,7 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
   ui?: unknown;
   sessionId?: string | (() => string);
   activeTools?: string[];
+  appendEntryError?: () => Error | undefined;
 } = {}) {
   const events = new EventEmitter();
   const lifecycleHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
@@ -213,7 +214,11 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     sendMessage: (message: { customType?: string; content?: string; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: string }) => {
       sentMessages.push({ message, options, activeTools: [...activeToolNames] });
     },
-    appendEntry: (type: string, data: unknown) => entries.push({ type, data }),
+    appendEntry: (type: string, data: unknown) => {
+      const error = options.appendEntryError?.();
+      if (error) throw error;
+      entries.push({ type, data });
+    },
   };
   const ctx = {
     cwd: repoDir,
@@ -397,11 +402,13 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
         lastActivity: Date.now(),
       },
     }, true);
-    assert.deepEqual(registerMessages, [{
-      type: "registered",
-      sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1", "compaction-awareness-v1"],
-    }]);
+    assert.equal(registerMessages.length, 1);
+    const registered = registerMessages[0] as { type: string; sessionId: string; features: string[]; session: SessionInfo };
+    assert.equal(registered.type, "registered");
+    assert.equal(registered.sessionId, "authorized-tcp-client");
+    assert.deepEqual(registered.features, ["extension-bus-v1", "exact-send-v1", "compaction-awareness-v1", "session-profile-v1"]);
+    assert.equal(registered.session.id, "authorized-tcp-client");
+    assert.equal(registered.session.name, "authorized");
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
       broker.kill("SIGTERM");
@@ -545,6 +552,21 @@ async function waitForSessionByName(client: InstanceType<typeof IntercomClient>,
   }
   const sessions = await client.listSessions();
   throw new Error(`Timed out waiting for ${name}; saw ${JSON.stringify(sessions.map((session) => session.name))}`);
+}
+
+async function waitForSessionDescription(
+  client: InstanceType<typeof IntercomClient>,
+  name: string,
+  description: string | undefined,
+): Promise<SessionInfo> {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    const session = (await client.listSessions()).find((candidate) => candidate.name === name);
+    if (session && session.description === description) return session;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const sessions = await client.listSessions();
+  throw new Error(`Timed out waiting for ${name} description ${String(description)}; saw ${JSON.stringify(sessions.map((session) => ({ name: session.name, description: session.description })))}`);
 }
 
 async function waitForSessionStatus(client: InstanceType<typeof IntercomClient>, name: string, status: string): Promise<SessionInfo> {
@@ -1121,6 +1143,13 @@ test("broker disconnects a connection that exceeds the local rate limit", { conc
     }
     await closed;
     assert.equal(raw.socket.destroyed, true);
+
+    const unsafePresence = await connectRawRegistered("unsafe-presence-id", "safe-presence-name");
+    unsafePresence.socket.on("error", () => undefined);
+    const unsafeClosed = once(unsafePresence.socket, "close");
+    unsafePresence.writeMessage(unsafePresence.socket, { type: "presence", name: "unsafe\u001b[2J-name" });
+    await unsafeClosed;
+    assert.equal(unsafePresence.socket.destroyed, true);
   } finally {
     raw.socket.destroy();
     await cleanup();
@@ -2008,6 +2037,33 @@ test("multi-target and broadcast sends reject ambiguous targeting and conversati
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
     const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const toolSchema = intercomTool.parameters as {
+      required?: string[];
+      properties?: { profile?: { required?: string[] } };
+    };
+    assert.deepEqual(toolSchema.required, ["action"], "the extension itself keeps addon fields optional");
+    assert.equal(toolSchema.properties?.profile?.required, undefined);
+
+    const placeholderDelivered = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const placeholderResult = await intercomTool.execute("schema-placeholder-targets", {
+      action: "send",
+      to: "planner",
+      targets: [""],
+      message: "Optional schema placeholders should be ignored",
+      profile: { name: "", description: "" },
+    }, new AbortController().signal, undefined, harness.ctx);
+    const [, placeholderMessage] = await placeholderDelivered;
+    assert.equal(placeholderMessage.content.text, "Optional schema placeholders should be ignored");
+    assert.equal(placeholderResult.details?.error, undefined);
+    assert.match(placeholderResult.content[0]?.text ?? "", /Message sent to planner/);
+
+    const mixedBlankTargets = await intercomTool.execute("mixed-blank-targets", {
+      action: "send",
+      targets: ["planner", ""],
+      message: "Malformed mixed recipients",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(mixedBlankTargets.details?.error, true);
+    assert.match(mixedBlankTargets.content[0]?.text ?? "", /1-32 non-empty/i);
 
     const bothTargetForms = await intercomTool.execute("invalid-targets", {
       action: "send",
@@ -2082,7 +2138,7 @@ test("multi-target and broadcast sends reject ambiguous targeting and conversati
       ["E_CANCELLED", "E_CANCELLED"],
     );
     await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(receivedMessages.length, 0);
+    assert.equal(receivedMessages.length, 1, "only the schema-placeholder regression send should be delivered");
 
   } finally {
     await harness.emitLifecycle("session_shutdown").catch(() => undefined);
@@ -2843,6 +2899,342 @@ test("session_info_changed propagates /name changes without other activity", { c
       name: sessionName,
     });
     await waitForSessionByName(planner, "idle-name-after");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("any intercom call can publish a durable short self description and returns self-profile metadata", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("profile-worker", { hasUI: true });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    assert.ok(intercomTool);
+
+    const result = await intercomTool.execute("profile-status", {
+      action: "status",
+      profile: { name: "", description: "Hardening lightweight peer discovery and profiles" },
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    assert.deepEqual(result.details?.selfProfile, {
+      name: "profile-worker",
+      description: "Hardening lightweight peer discovery and profiles",
+      intercomName: "profile-worker",
+      descriptionPublished: true,
+    });
+    assert.equal(
+      result.content.at(-1)?.text,
+      "Self profile: profile-worker — Hardening lightweight peer discovery and profiles",
+    );
+    const published = await waitForSessionDescription(planner, "profile-worker", "Hardening lightweight peer discovery and profiles");
+    assert.equal(published.description, "Hardening lightweight peer discovery and profiles");
+    const listed = await intercomTool.execute("profile-list", { action: "list" }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(listed.content[0]?.text ?? "", /profile-worker .*Hardening lightweight peer discovery and profiles/);
+    assert.ok(harness.entries.some((entry) => entry.type === "intercom_profile_updated"));
+
+    await harness.emitLifecycle("session_shutdown");
+    await harness.emitLifecycle("session_start");
+    const restored = await waitForSessionDescription(planner, "profile-worker", "Hardening lightweight peer discovery and profiles");
+    assert.equal(restored.description, "Hardening lightweight peer discovery and profiles");
+
+    const cleared = await intercomTool.execute("profile-clear", {
+      action: "status",
+      profile: { description: null },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal((cleared.details?.selfProfile as { description?: string }).description, undefined);
+    const clearedRoster = await waitForSessionDescription(planner, "profile-worker", undefined);
+    assert.equal(clearedRoster.description, undefined);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("profile names fill unnamed sessions but never replace an explicit Pi name", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const explicit = createExtensionHarness("FlightDeck Owner", { hasUI: true, sessionId: "profile-explicit" });
+  const unnamed = createExtensionHarness("", { hasUI: true, sessionId: "profile-unnamed" });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(explicit.pi as never);
+    piIntercomExtension(unnamed.pi as never);
+    await explicit.emitLifecycle("session_start");
+    await unnamed.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "FlightDeck Owner");
+    const explicitTool = explicit.tools.find((tool) => tool.name === "intercom");
+    const unnamedTool = unnamed.tools.find((tool) => tool.name === "intercom");
+    assert.ok(explicitTool);
+    assert.ok(unnamedTool);
+
+    const refused = await explicitTool.execute("profile-refused", {
+      action: "status",
+      profile: { name: "automatic-worker" },
+    }, new AbortController().signal, undefined, explicit.ctx);
+    assert.match(refused.content[0]?.text ?? "", /cannot replace the explicit session name "FlightDeck Owner"/);
+    assert.equal(explicit.pi.getSessionName(), "FlightDeck Owner");
+
+    const filled = await unnamedTool.execute("profile-filled", {
+      action: "status",
+      profile: { name: "FlightDeck Owner" },
+    }, new AbortController().signal, undefined, unnamed.ctx);
+    assert.deepEqual(filled.details?.selfProfile, {
+      name: "FlightDeck Owner",
+      intercomName: "FlightDeck Owner-2",
+      descriptionPublished: true,
+    });
+    assert.equal(unnamed.pi.getSessionName(), "FlightDeck Owner");
+    const stableProjection = await unnamedTool.execute("profile-projection-stable", {
+      action: "pending",
+    }, new AbortController().signal, undefined, unnamed.ctx);
+    assert.equal((stableProjection.details?.selfProfile as { intercomName?: string }).intercomName, "FlightDeck Owner-2");
+
+    await explicit.emitLifecycle("session_shutdown");
+    const healedProjection = await unnamedTool.execute("profile-projection-healed", {
+      action: "pending",
+    }, new AbortController().signal, undefined, unnamed.ctx);
+    assert.equal((healedProjection.details?.selfProfile as { intercomName?: string }).intercomName, "FlightDeck Owner");
+
+    const updated = await unnamedTool.execute("profile-updated", {
+      action: "status",
+      profile: { name: "discovery-reviewer" },
+    }, new AbortController().signal, undefined, unnamed.ctx);
+    assert.equal((updated.details?.selfProfile as { name?: string }).name, "discovery-reviewer");
+    assert.equal(unnamed.pi.getSessionName(), "discovery-reviewer");
+
+    unnamed.pi.setSessionName("Manual Owner");
+    await unnamed.emitLifecycle("session_info_changed", { type: "session_info_changed", name: "Manual Owner" });
+    const afterManualRename = await unnamedTool.execute("profile-after-manual", {
+      action: "status",
+      profile: { name: "automatic-reviewer" },
+    }, new AbortController().signal, undefined, unnamed.ctx);
+    assert.match(afterManualRename.content[0]?.text ?? "", /cannot replace the explicit session name "Manual Owner"/);
+    assert.equal(unnamed.pi.getSessionName(), "Manual Owner");
+    assert.ok(unnamed.entries.some((entry) =>
+      entry.type === "intercom_profile_updated"
+      && (entry.data as { managedName?: unknown }).managedName === null
+    ));
+
+    unnamed.pi.setSessionName("discovery-reviewer");
+    await unnamed.emitLifecycle("session_info_changed", { type: "session_info_changed", name: "discovery-reviewer" });
+    await unnamed.emitLifecycle("session_shutdown");
+    await unnamed.emitLifecycle("session_start");
+    const afterRestart = await unnamedTool.execute("profile-after-explicit-restore", {
+      action: "status",
+      profile: { name: "automatic-after-restart" },
+    }, new AbortController().signal, undefined, unnamed.ctx);
+    assert.match(afterRestart.content[0]?.text ?? "", /cannot replace the explicit session name "discovery-reviewer"/);
+    assert.equal(unnamed.pi.getSessionName(), "discovery-reviewer");
+  } finally {
+    await explicit.emitLifecycle("session_shutdown");
+    await unnamed.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("profile naming cannot diverge an advertised subagent from its broker identity", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const harness = createExtensionHarness("child-canonical", {
+    hasUI: true,
+    sessionId: "profile-advertised-child",
+  });
+
+  try {
+    await withChildOrchestratorEnv({
+      orchestratorTarget: "orchestrator",
+      orchestratorSessionId: orchestrator.sessionId ?? undefined,
+      runId: "profile-advertise-run",
+      agent: "reviewer",
+      index: "0",
+    }, async () => {
+      const { default: piIntercomExtension } = await import("./index.ts");
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+      assert.ok(intercomTool);
+
+      const advertised = await intercomTool.execute("profile-advertise", {
+        action: "advertise",
+        name: "public-reviewer",
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(advertised.content[0]?.text ?? "", /Advertised as \"public-reviewer\"/);
+
+      const refused = await intercomTool.execute("profile-advertised-rename", {
+        action: "status",
+        profile: { name: "different-canonical" },
+      }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(refused.content[0]?.text ?? "", /cannot rename an advertised subagent/);
+      assert.equal(harness.pi.getSessionName(), "child-canonical");
+      assert.equal((refused.details?.selfProfile as { intercomName?: string }).intercomName, "public-reviewer");
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("profile persistence failures stay retryable without publishing an undurable description", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  let failNextAppend = true;
+  const harness = createExtensionHarness("", {
+    hasUI: true,
+    sessionId: "profile-persistence-retry",
+    appendEntryError: () => {
+      if (!failNextAppend) return undefined;
+      failNextAppend = false;
+      return new Error("journal unavailable");
+    },
+  });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    assert.ok(intercomTool);
+
+    const failed = await intercomTool.execute("profile-persist-failed", {
+      action: "status",
+      profile: {
+        name: "retry-profile",
+        description: "Testing durable profile journal retry behavior",
+      },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(failed.content[0]?.text ?? "", /Unable to persist self profile.*journal unavailable/);
+    assert.equal((failed.details?.selfProfile as { description?: string }).description, undefined);
+    assert.equal(harness.pi.getSessionName(), "");
+    assert.equal((await planner.listSessions()).some((session) => session.name === "retry-profile"), false);
+
+    const retried = await intercomTool.execute("profile-persist-retried", {
+      action: "status",
+      profile: {
+        name: "retry-profile",
+        description: "Testing durable profile journal retry behavior",
+      },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal((retried.details?.selfProfile as { description?: string }).description, "Testing durable profile journal retry behavior");
+    assert.ok(harness.entries.some((entry) => entry.type === "intercom_profile_updated"));
+
+    const renamed = await intercomTool.execute("profile-persist-renamed", {
+      action: "status",
+      profile: { name: "retry-profile-renamed" },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal((renamed.details?.selfProfile as { name?: string }).name, "retry-profile-renamed");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("durable pending profiles recover name ownership after a commit append failure and restart", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  let appendCalls = 0;
+  const harness = createExtensionHarness("", {
+    hasUI: true,
+    sessionId: "profile-pending-recovery",
+    appendEntryError: () => {
+      appendCalls += 1;
+      return appendCalls === 2 ? new Error("commit journal unavailable") : undefined;
+    },
+  });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    assert.ok(intercomTool);
+
+    const staged = await intercomTool.execute("profile-staged", {
+      action: "status",
+      profile: {
+        name: "staged-profile",
+        description: "Recovering durable staged profile ownership after restart",
+      },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal((staged.details?.selfProfile as { name?: string }).name, "staged-profile");
+    assert.ok(harness.entries.some((entry) => entry.type === "intercom_profile_pending"));
+    assert.equal(harness.entries.some((entry) => entry.type === "intercom_profile_updated"), false);
+    await waitForSessionDescription(planner, "staged-profile", "Recovering durable staged profile ownership after restart");
+
+    await harness.emitLifecycle("session_shutdown");
+    await harness.emitLifecycle("session_start");
+    await waitForSessionDescription(planner, "staged-profile", "Recovering durable staged profile ownership after restart");
+
+    const renamed = await intercomTool.execute("profile-recovered-rename", {
+      action: "status",
+      profile: { name: "staged-profile-renamed" },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal((renamed.details?.selfProfile as { name?: string }).name, "staged-profile-renamed");
+    assert.equal(harness.pi.getSessionName(), "staged-profile-renamed");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("older brokers are reported as local-only instead of falsely claiming description publication", { concurrency: false }, async () => {
+  const originalSupportsFeature = IntercomClient.prototype.supportsFeature;
+  IntercomClient.prototype.supportsFeature = function (feature: string) {
+    if (feature === "session-profile-v1") return false;
+    return originalSupportsFeature.call(this, feature);
+  };
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("mixed-version-profile", { hasUI: true });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "mixed-version-profile");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    assert.ok(intercomTool);
+
+    const result = await intercomTool.execute("profile-old-broker", {
+      action: "status",
+      profile: { description: "Reviewing mixed version profile publication behavior" },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal((result.details?.selfProfile as { descriptionPublished?: boolean }).descriptionPublished, false);
+    assert.match(result.content.at(-1)?.text ?? "", /description local only: broker upgrade required/);
+    const peerView = await waitForSessionDescription(planner, "mixed-version-profile", undefined);
+    assert.equal(peerView.description, undefined);
+  } finally {
+    IntercomClient.prototype.supportsFeature = originalSupportsFeature;
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("profile descriptions enforce concise 5-9 word display metadata", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const harness = createExtensionHarness("bounded-profile", { hasUI: true });
+
+  try {
+    const { default: piIntercomExtension } = await import("./index.ts");
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    assert.ok(intercomTool);
+
+    const tooShort = await intercomTool.execute("profile-short", {
+      action: "status",
+      profile: { description: "Reviewing profiles now" },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(tooShort.content[0]?.text ?? "", /must contain 5-9 words \(received 3\)/);
+    assert.deepEqual(tooShort.details?.selfProfile, {
+      name: "bounded-profile",
+      descriptionPublished: true,
+    });
+    const unsafe = await intercomTool.execute("profile-control", {
+      action: "status",
+      profile: { description: "Reviewing peer\u001b[2J discovery profile behavior" },
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(unsafe.content[0]?.text ?? "", /unsupported control characters/);
   } finally {
     await harness.emitLifecycle("session_shutdown");
     await cleanup();

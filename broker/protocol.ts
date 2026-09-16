@@ -9,6 +9,7 @@ import type {
   SessionInfo,
   SessionRegistration,
 } from "../types.ts";
+import { isValidSessionDescription, isValidSessionName } from "../session-profile.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -176,7 +177,10 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
     return false;
   }
 
-  if (value.name !== undefined && typeof value.name !== "string") {
+  if (value.name !== undefined && !isValidSessionName(value.name)) {
+    return false;
+  }
+  if (value.description !== undefined && !isValidSessionDescription(value.description)) {
     return false;
   }
 
@@ -244,7 +248,10 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     return false;
   }
 
-  if (value.name !== undefined && typeof value.name !== "string") {
+  if (value.name !== undefined && !isValidSessionName(value.name)) {
+    return false;
+  }
+  if (value.description !== undefined && !isValidSessionDescription(value.description)) {
     return false;
   }
   if (value.runtimeFallbackAlias !== undefined && typeof value.runtimeFallbackAlias !== "boolean") {

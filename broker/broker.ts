@@ -18,11 +18,12 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { COMPACTION_AWARENESS_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "../types.ts";
 import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, PeerCompactionNotice } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { CollaborationStateStore } from "./collaboration-state.ts";
+import { isValidSessionDescription, isValidSessionName } from "../session-profile.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -728,6 +729,7 @@ class IntercomBroker {
           id,
           endpointEpoch: randomUUID(),
           ...(effectiveName !== undefined ? { name: effectiveName } : {}),
+          ...(session.description !== undefined ? { description: session.description } : {}),
           ...(session.runtimeFallbackAlias !== undefined ? { runtimeFallbackAlias: session.runtimeFallbackAlias } : {}),
           cwd: session.cwd,
           model: session.model,
@@ -766,7 +768,8 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, COMPACTION_AWARENESS_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, COMPACTION_AWARENESS_FEATURE, SESSION_PROFILE_FEATURE],
+          session: info,
         });
         this.broadcastScoped({ type: "session_joined", session: info }, info, key, scopeId);
 
@@ -1407,7 +1410,7 @@ class IntercomBroker {
           // pre-advertise fallback name behind the caller's back.
           const identityLocked = session.info.advertised === true;
           if (clientMessage.name !== undefined) {
-            if (typeof clientMessage.name !== "string") {
+            if (!isValidSessionName(clientMessage.name)) {
               throw new Error("Invalid presence name");
             }
             if (!identityLocked) {
@@ -1416,6 +1419,20 @@ class IntercomBroker {
                 session.info.name = effectiveName;
                 changed = true;
               }
+            }
+          }
+          if (clientMessage.description !== undefined) {
+            if (clientMessage.description !== null && !isValidSessionDescription(clientMessage.description)) {
+              throw new Error("Invalid presence description");
+            }
+            if (clientMessage.description === null) {
+              if (session.info.description !== undefined) {
+                delete session.info.description;
+                changed = true;
+              }
+            } else if (session.info.description !== clientMessage.description) {
+              session.info.description = clientMessage.description;
+              changed = true;
             }
           }
           if (clientMessage.runtimeFallbackAlias !== undefined) {

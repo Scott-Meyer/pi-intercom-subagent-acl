@@ -84,6 +84,7 @@ function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
 export class IntercomClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
+  private _selfSession: SessionInfo | null = null;
   private _features = new Set<string>();
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
@@ -120,6 +121,14 @@ export class IntercomClient extends EventEmitter {
 
   supportsFeature(feature: string): boolean {
     return this._features.has(feature);
+  }
+
+  getSelfSession(): SessionInfo | undefined {
+    return this._selfSession ? { ...this._selfSession } : undefined;
+  }
+
+  invalidateSelfSessionProjection(): void {
+    this._selfSession = null;
   }
 
   isConnected(): boolean {
@@ -252,6 +261,7 @@ export class IntercomClient extends EventEmitter {
           this.socket = null;
         }
         this._sessionId = null;
+        this._selfSession = null;
         this._features.clear();
         this.disconnectError = null;
         if (connectionEstablished && !wasDisconnecting) {
@@ -359,13 +369,21 @@ export class IntercomClient extends EventEmitter {
         ) {
           throw new Error("Invalid registered features");
         }
+        if (
+          brokerMessage.session !== undefined
+          && (!isSessionInfo(brokerMessage.session) || brokerMessage.session.id !== brokerMessage.sessionId)
+        ) {
+          throw new Error("Invalid registered session");
+        }
 
         this._sessionId = brokerMessage.sessionId;
+        this._selfSession = brokerMessage.session as SessionInfo | undefined ?? null;
         this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
         const registered: BrokerMessage = {
           type: "registered",
           sessionId: brokerMessage.sessionId,
           ...(this._features.size > 0 ? { features: [...this._features] } : {}),
+          ...(this._selfSession ? { session: { ...this._selfSession } } : {}),
         };
         this.emit("broker_message", registered);
         this.emit("_registered", registered);
@@ -435,6 +453,7 @@ export class IntercomClient extends EventEmitter {
         }
 
         this.pendingLists.delete(requestId);
+        this._selfSession = sessions.find((session) => session.id === this._sessionId) ?? this._selfSession;
         pending.resolve(sessions);
         break;
       }
@@ -449,6 +468,9 @@ export class IntercomClient extends EventEmitter {
           return;
         }
         this.pendingAdvertise.delete(requestId);
+        if (ok && typeof name === "string" && this._selfSession) {
+          this._selfSession = { ...this._selfSession, name, advertised: true };
+        }
         pending.resolve({
           ok,
           ...(typeof name === "string" ? { name } : {}),
@@ -528,6 +550,7 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid session_joined message");
         }
 
+        if (brokerMessage.session.id === this._sessionId) this._selfSession = brokerMessage.session;
         const message: BrokerMessage = { type: "session_joined", session: brokerMessage.session };
         this.emit("broker_message", message);
         this.emit("session_joined", brokerMessage.session);
@@ -550,6 +573,7 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid presence_update message");
         }
 
+        if (brokerMessage.session.id === this._sessionId) this._selfSession = brokerMessage.session;
         const message: BrokerMessage = { type: "presence_update", session: brokerMessage.session };
         this.emit("broker_message", message);
         this.emit("presence_update", brokerMessage.session);
@@ -1004,7 +1028,7 @@ export class IntercomClient extends EventEmitter {
     });
   }
 
-  updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }): void {
+  updatePresence(updates: { name?: string; description?: string | null; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }): void {
     if (this.disconnecting) {
       return;
     }
@@ -1014,6 +1038,14 @@ export class IntercomClient extends EventEmitter {
       return;
     }
 
+    if (this._selfSession && updates.description !== undefined) {
+      if (updates.description === null) {
+        const { description: _description, ...session } = this._selfSession;
+        this._selfSession = session;
+      } else {
+        this._selfSession = { ...this._selfSession, description: updates.description };
+      }
+    }
     writeMessage(socket, { type: "presence", ...updates });
   }
 

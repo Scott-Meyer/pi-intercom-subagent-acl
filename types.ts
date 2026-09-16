@@ -1,6 +1,7 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
 export const COMPACTION_AWARENESS_FEATURE = "compaction-awareness-v1";
+export const SESSION_PROFILE_FEATURE = "session-profile-v1";
 
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
 
@@ -37,6 +38,9 @@ export interface SessionInfo {
   /** Broker-owned lifetime of this live endpoint. */
   endpointEpoch?: string;
   name?: string;
+  /** Concise self-authored current focus for peer discovery (5-9 words).
+   *  Display metadata only: never used for routing, identity, ACLs, or mailbox ownership. */
+  description?: string;
   /** True only when the extension synthesized name for an unnamed runtime. */
   runtimeFallbackAlias?: boolean;
   cwd: string;
@@ -162,7 +166,7 @@ export type ClientMessage =
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
   | { type: "cancel_ask"; messageId: string }
-  | { type: "presence"; name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }
+  | { type: "presence"; name?: string; description?: string | null; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }
   | {
       type: "extension_publish";
       namespace: string;
@@ -180,7 +184,7 @@ export type ClientMessage =
     };
 
 export type BrokerMessage =
-  | { type: "registered"; sessionId: string; features?: string[] }
+  | { type: "registered"; sessionId: string; features?: string[]; session?: SessionInfo }
   | { type: "direct_contact_recorded"; token: string }
   | { type: "direct_contact_unknown"; token: string }
   | { type: "compaction_recorded"; eventId: string; generation: number; compactedAt: number }

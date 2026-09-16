@@ -4,6 +4,17 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.13.0-acl.8] - 2026-09-16
+
+### Added
+- Every `intercom` action can optionally publish or clear a 5–9 word self-description and safely fill an unnamed/generated session name through `profile: { name?, description? }` (`description: null` clears stale focus). Descriptions appear in rosters and overlays, remain presentation-only, persist with the Pi session, and never participate in routing, ACLs, mailboxes, or continuity.
+- Tool results now distinguish the caller's canonical Pi name, broker-confirmed effective intercom name, description, and broker publication status as lightweight metadata, while static tool and skill guidance encourages early peer discovery for substantial potentially overlapping work.
+
+### Fixed
+- Profile-driven naming cannot replace an explicit user-, Pi-, or host-assigned session name; only unnamed/generated identities and previously profile-managed names can be changed through the profile addon.
+- Blank placeholder values materialized by tool-schema adapters (for example `targets: [""]` or an empty optional profile) are treated as omitted, while real `to`/`targets` conflicts and mixed invalid target arrays still fail.
+- Broker registration and presence reject control/format characters in raw session names, and profile-owned name provenance uses staged recovery plus durable revocation tombstones so journal failures, reconnects, explicit renames, and restarts cannot grant accidental rename authority.
+
 ## [0.13.0-acl.7] - 2026-09-16
 
 ### Added

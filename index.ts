@@ -1,4 +1,4 @@
-import type { AgentSessionEvent, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AgentSessionEvent, AgentToolResult, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@mariozechner/pi-tui";
@@ -9,7 +9,7 @@ import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
-import { COMPACTION_AWARENESS_FEATURE, EXTENSION_BUS_FEATURE } from "./types.ts";
+import { COMPACTION_AWARENESS_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceipt, MessageReceiptStatus, PeerCompactionNotice, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
@@ -32,6 +32,7 @@ import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { formatPeerCompactionNotice } from "./compaction-awareness.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
+import { isValidSessionDescription, isValidSessionName, normalizeSelfProfileUpdate, type SelfProfileUpdate } from "./session-profile.ts";
 
 type SessionInfoChangedEvent = Extract<AgentSessionEvent, { type: "session_info_changed" }>;
 
@@ -634,7 +635,8 @@ function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: 
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
   const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : "";
-  return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${suffix}`;
+  const description = session.description ? ` — ${session.description}` : "";
+  return `• ${name} (${idPrefix})${description} — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${suffix}`;
 }
 function previewText(value: unknown, maxLength = 72): string | undefined {
   if (typeof value !== "string") {
@@ -694,6 +696,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let startupConnectTimer: NodeJS.Timeout | null = null;
   let sessionNameCompatibilityTimer: NodeJS.Timeout | null = null;
   let observedSessionName: string | undefined;
+  let currentSessionDescription: string | undefined;
+  let profileManagedName: string | undefined;
+  let currentAdvertisedName: string | undefined;
+  let lastPresenceRequestedName: string | undefined;
+  let profileNameMutationTarget: string | undefined;
+  let profileOwnershipRevocationPending = false;
   let reconnectAttempt = 0;
   let shuttingDown = false;
   let disposed = true;
@@ -998,6 +1006,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const tmuxPane = currentTmuxPane();
     return {
       ...identity,
+      ...(currentSessionDescription ? { description: currentSessionDescription } : {}),
       cwd: liveContext.cwd,
       model: currentModel,
       pid: process.pid,
@@ -1050,12 +1059,46 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     return result;
   }
 
-  function syncPresenceIdentity(sessionId: string): void {
-    if (!client || !getLiveContext()) {
-      return;
+  function persistProfileOwnershipRevocation(): void {
+    if (!profileOwnershipRevocationPending) return;
+    try {
+      pi.appendEntry("intercom_profile_updated", {
+        managedName: null,
+        description: currentSessionDescription ?? null,
+        timestamp: Date.now(),
+      });
+      profileOwnershipRevocationPending = false;
+    } catch {
+      // Retry on the next lifecycle or tool-driven presence reconciliation.
     }
+  }
+
+  function syncPresenceIdentity(sessionId: string): void {
+    if (!getLiveContext()) return;
     const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? sessionId);
-    client.updatePresence({ ...identity, status: currentStatus(), ...currentContextUsage() });
+    if (
+      profileManagedName
+      && !identity.runtimeFallbackAlias
+      && identity.name !== profileManagedName
+      && identity.name !== profileNameMutationTarget
+    ) {
+      profileManagedName = undefined;
+      profileOwnershipRevocationPending = true;
+    }
+    persistProfileOwnershipRevocation();
+    if (!client) return;
+    if (lastPresenceRequestedName !== undefined && lastPresenceRequestedName !== identity.name) {
+      client.invalidateSelfSessionProjection();
+    }
+    lastPresenceRequestedName = identity.name;
+    client.updatePresence({
+      ...identity,
+      ...(client.supportsFeature(SESSION_PROFILE_FEATURE)
+        ? { description: currentSessionDescription ?? null }
+        : {}),
+      status: currentStatus(),
+      ...currentContextUsage(),
+    });
   }
   function publishIntercomSessionId(sessionId: string): void {
     process.env[INTERCOM_SESSION_ID_ENV] = sessionId;
@@ -1104,9 +1147,45 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   function restorePendingCompactionReports(ctx: ExtensionContext): void {
     pendingCompactionReports.clear();
     pendingReceiverBaselineTokens.clear();
+    currentSessionDescription = undefined;
+    profileManagedName = undefined;
+    currentAdvertisedName = undefined;
+    lastPresenceRequestedName = undefined;
+    profileNameMutationTarget = undefined;
+    profileOwnershipRevocationPending = false;
     const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & { getEntries?: () => ReturnType<typeof ctx.sessionManager.getEntries> };
     const entries = sessionManager.getEntries?.() ?? [];
-    for (const entry of entries) {
+    type PersistedProfileState = {
+      description?: string | null;
+      managedName?: string | null;
+      requiredName?: string;
+      index: number;
+    };
+    const pendingProfiles = new Map<string, PersistedProfileState>();
+    let lastAppliedProfileIndex = -1;
+    const parseProfileState = (data: {
+      description?: unknown;
+      managedName?: unknown;
+      requiredName?: unknown;
+    }, index: number): PersistedProfileState | undefined => {
+      if (data.description !== undefined && data.description !== null && !isValidSessionDescription(data.description)) return undefined;
+      if (data.managedName !== undefined && data.managedName !== null && !isValidSessionName(data.managedName)) return undefined;
+      if (data.requiredName !== undefined && !isValidSessionName(data.requiredName)) return undefined;
+      return {
+        ...(data.description === null || isValidSessionDescription(data.description) ? { description: data.description } : {}),
+        ...(data.managedName === null || typeof data.managedName === "string" ? { managedName: data.managedName } : {}),
+        ...(typeof data.requiredName === "string" ? { requiredName: data.requiredName } : {}),
+        index,
+      };
+    };
+    const applyProfileState = (state: PersistedProfileState): void => {
+      if (state.description === null) currentSessionDescription = undefined;
+      else if (state.description !== undefined) currentSessionDescription = state.description;
+      if (state.managedName === null) profileManagedName = undefined;
+      else if (state.managedName) profileManagedName = state.managedName;
+      lastAppliedProfileIndex = state.index;
+    };
+    for (const [entryIndex, entry] of entries.entries()) {
       if (entry.type === "custom_message" && typeof entry.details === "object" && entry.details !== null) {
         const details = entry.details as { message?: { contactToken?: unknown; contactBaseline?: unknown }; contactToken?: unknown; contactBaseline?: unknown };
         const delivered = details.message ?? details;
@@ -1116,7 +1195,27 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         continue;
       }
       if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) continue;
-      const data = entry.data as { eventId?: unknown; compactedAt?: unknown; token?: unknown };
+      const data = entry.data as {
+        eventId?: unknown;
+        compactedAt?: unknown;
+        token?: unknown;
+        description?: unknown;
+        managedName?: unknown;
+        requiredName?: unknown;
+        updateId?: unknown;
+      };
+      if (entry.customType === "intercom_profile_pending" && typeof data.updateId === "string") {
+        const state = parseProfileState(data, entryIndex);
+        if (state) pendingProfiles.set(data.updateId, state);
+      } else if (entry.customType === "intercom_profile_abandoned" && typeof data.updateId === "string") {
+        pendingProfiles.delete(data.updateId);
+      } else if (entry.customType === "intercom_profile_updated") {
+        const state = parseProfileState(data, entryIndex);
+        if (state) {
+          applyProfileState(state);
+          if (typeof data.updateId === "string") pendingProfiles.delete(data.updateId);
+        }
+      }
       if (entry.customType === "intercom_receiver_baseline_pending" && typeof data.token === "string") {
         pendingReceiverBaselineTokens.add(data.token);
       } else if (
@@ -1136,6 +1235,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         pendingCompactionReports.delete(data.eventId);
       }
     }
+    const currentName = pi.getSessionName()?.trim();
+    const recoverablePending = [...pendingProfiles.values()]
+      .filter((state) => state.index > lastAppliedProfileIndex && state.requiredName === currentName)
+      .sort((left, right) => right.index - left.index)[0];
+    if (recoverablePending) applyProfileState(recoverablePending);
+    if (profileManagedName !== currentName) profileManagedName = undefined;
   }
 
   function flushPendingCompactionReports(): void {
@@ -1744,6 +1849,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         emitLocalExtensionEvent(namespace, { type: "connection", connected: false, supported: false });
         emitLocalExtensionEvent(namespace, { type: "owner" });
       }
+      currentAdvertisedName = undefined;
+      lastPresenceRequestedName = undefined;
       client = null;
       if (!shuttingDown && !disposed) {
         clearReconnectTimer();
@@ -2228,6 +2335,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     runtimeContext = null;
     currentSessionId = null;
     currentIntercomSessionId = null;
+    currentSessionDescription = undefined;
+    profileManagedName = undefined;
+    currentAdvertisedName = undefined;
+    lastPresenceRequestedName = undefined;
+    profileNameMutationTarget = undefined;
+    profileOwnershipRevocationPending = false;
     sessionStartedAt = null;
   });
   // Upstream 0.73.1 emits this event but omitted it from ExtensionAPI's event
@@ -2660,6 +2773,162 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }));
   }
 
+  function normalizeToolProfilePlaceholders(profile: SelfProfileUpdate | undefined): SelfProfileUpdate | undefined {
+    if (!profile) return undefined;
+    const name = typeof profile.name === "string" && profile.name.trim() ? profile.name : undefined;
+    const description = profile.description === null
+      ? null
+      : typeof profile.description === "string" && profile.description.trim()
+        ? profile.description
+        : undefined;
+    if (name === undefined && description === undefined) return undefined;
+    return {
+      ...(name !== undefined ? { name } : {}),
+      ...(description !== undefined ? { description } : {}),
+    };
+  }
+
+  function applySelfProfile(profile: SelfProfileUpdate | undefined, ctx: ExtensionContext): string | undefined {
+    if (!profile) return undefined;
+    persistProfileOwnershipRevocation();
+    const normalized = normalizeSelfProfileUpdate(profile);
+    if (!normalized.ok) return normalized.error;
+    if (normalized.profile.name === undefined && normalized.profile.description === undefined) {
+      return "profile requires a name, a description, or both.";
+    }
+
+    const currentName = pi.getSessionName()?.trim();
+    const requestedName = normalized.profile.name;
+    const nameChanges = requestedName !== undefined && currentName !== requestedName;
+    if (requestedName !== undefined) {
+      const effectiveSession = client?.getSelfSession();
+      if (
+        nameChanges
+        && (currentAdvertisedName !== undefined || effectiveSession?.advertised === true)
+      ) {
+        return `profile.name cannot rename an advertised subagent (current intercom name: "${currentAdvertisedName ?? effectiveSession?.name ?? currentName ?? "unknown"}").`;
+      }
+      if (currentName && nameChanges && currentName !== profileManagedName) {
+        return `profile.name cannot replace the explicit session name "${currentName}". Omit it and update only the description.`;
+      }
+    }
+
+    const nextDescription = normalized.profile.description === undefined
+      ? currentSessionDescription
+      : normalized.profile.description ?? undefined;
+    const descriptionChanges = nextDescription !== currentSessionDescription;
+    if (!nameChanges && !descriptionChanges) {
+      syncPresenceIdentity(ctx.sessionManager.getSessionId());
+      return undefined;
+    }
+
+    const nextManagedName = nameChanges
+      ? requestedName
+      : profileOwnershipRevocationPending
+        ? null
+        : profileManagedName;
+    const profileState = {
+      ...(nextManagedName === null
+        ? { managedName: null }
+        : nextManagedName
+          ? { managedName: nextManagedName }
+          : {}),
+      description: nextDescription ?? null,
+      timestamp: Date.now(),
+    };
+
+    if (nameChanges && requestedName) {
+      const updateId = randomUUID();
+      try {
+        // Stage durable intent before changing Pi's canonical name. Recovery
+        // promotes it only when Pi persisted the same required name.
+        pi.appendEntry("intercom_profile_pending", {
+          ...profileState,
+          updateId,
+          requiredName: requestedName,
+        });
+      } catch (error) {
+        return `Unable to persist self profile; no changes were applied: ${getErrorMessage(error)}`;
+      }
+      profileNameMutationTarget = requestedName;
+      try {
+        pi.setSessionName(requestedName);
+      } catch (error) {
+        profileNameMutationTarget = undefined;
+        try {
+          pi.appendEntry("intercom_profile_abandoned", { updateId, timestamp: Date.now() });
+        } catch {
+          // The pending entry is conditional on Pi having persisted the new
+          // canonical name, so it remains inert if abandonment cannot journal.
+        }
+        return `Unable to update profile name: ${getErrorMessage(error)}`;
+      }
+      profileNameMutationTarget = undefined;
+      observedSessionName = requestedName;
+      profileManagedName = requestedName;
+      currentSessionDescription = nextDescription;
+      try {
+        pi.appendEntry("intercom_profile_updated", { ...profileState, updateId });
+        profileOwnershipRevocationPending = false;
+      } catch {
+        // The synchronously durable pending entry plus Pi's matching canonical
+        // name is sufficient for restart recovery; the commit is a cleanup aid.
+      }
+    } else {
+      try {
+        // Description-only changes are journaled before publication so a throw
+        // cannot leave an undurable focus visible to peers.
+        pi.appendEntry("intercom_profile_updated", profileState);
+        profileOwnershipRevocationPending = false;
+      } catch (error) {
+        return `Unable to persist self profile; no changes were applied: ${getErrorMessage(error)}`;
+      }
+      currentSessionDescription = nextDescription;
+    }
+
+    syncPresenceIdentity(ctx.sessionManager.getSessionId());
+    return undefined;
+  }
+
+  function currentSelfProfile(): {
+    name: string;
+    description?: string;
+    intercomName?: string;
+    descriptionPublished: boolean;
+  } {
+    const requestedName = pi.getSessionName()?.trim() || observedSessionName;
+    const fallbackId = currentIntercomSessionId ?? currentSessionId;
+    const name = requestedName || (fallbackId ? resolveIntercomPresenceName(undefined, fallbackId) : "unnamed");
+    const effectiveName = currentAdvertisedName ?? client?.getSelfSession()?.name;
+    return {
+      name,
+      ...(currentSessionDescription ? { description: currentSessionDescription } : {}),
+      ...(effectiveName ? { intercomName: effectiveName } : {}),
+      descriptionPublished: currentSessionDescription === undefined || client?.supportsFeature(SESSION_PROFILE_FEATURE) === true,
+    };
+  }
+
+  function attachSelfProfile(result: AgentToolResult<unknown>): AgentToolResult<unknown> {
+    const profile = currentSelfProfile();
+    const intercomProjection = profile.intercomName && profile.intercomName !== profile.name
+      ? ` (intercom: ${profile.intercomName})`
+      : profile.intercomName
+        ? ""
+        : " (intercom name awaiting broker confirmation)";
+    const publication = profile.description && !profile.descriptionPublished
+      ? " [description local only: broker upgrade required]"
+      : "";
+    result.content.push({
+      type: "text",
+      text: `Self profile: ${profile.name}${intercomProjection} — ${profile.description ?? "no description set"}${publication}`,
+    });
+    const existingDetails = typeof result.details === "object" && result.details !== null && !Array.isArray(result.details)
+      ? result.details as Record<string, unknown>
+      : {};
+    result.details = { ...existingDetails, selfProfile: profile };
+    return result;
+  }
+
   pi.registerTool(defineTool({
     name: "intercom",
     label: "Intercom",
@@ -2683,10 +2952,13 @@ Usage:
   intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
   intercom({ action: "pending" })                                      → List unresolved inbound asks
   intercom({ action: "status" })                  → Show connection status
-  intercom({ action: "advertise", name: "my-nickname" })  → Subagent-only: self-promote to full main-level visibility under a chosen name`,
+  intercom({ action: "advertise", name: "my-nickname" })  → Subagent-only: self-promote to full main-level visibility under a chosen name
+
+Any action may include profile: { name?, description? }. Use a concise 5-9 word current focus, or description: null to clear it. Profile text is display metadata, not routing identity.`,
     promptSnippet:
-      "Use to coordinate with other local pi sessions: list peers, send targeted updates, ask for help, or check intercom connectivity.",
+      "Discover and coordinate with other local Pi sessions: list peers, share focused updates, ask for help, or check intercom connectivity.",
     promptGuidelines: [
+      "Consider listing intercom peers early when substantial work may overlap or benefit from a nearby perspective. Any call can also publish a concise self profile.",
       "Prefer targeted intercom sends. Machine-wide broadcast interrupts every visible live session and is appropriate only when each one genuinely needs the same information.",
       "A compaction notice means the peer now relies on summarized conversational context. Continue normally, but make fragile references concrete with file paths, titled tickets, commits, or explicit decisions.",
     ],
@@ -2695,6 +2967,21 @@ Usage:
       action: StringEnum(["list", "list-cwd", "send", "broadcast", "ask", "reply", "pending", "status", "cancel", "advertise"] as const, {
         description: "Action: 'list', 'list-cwd', 'send', 'broadcast', 'ask', 'reply', 'pending', 'status', 'cancel', or 'advertise'",
       }),
+      profile: Type.Optional(Type.Object({
+        name: Type.Optional(Type.String({
+          description: "Optional self-update: a concise name for this Pi session. Preserves Pi as the canonical naming authority.",
+        })),
+        description: Type.Optional(Type.Union([
+          Type.String({
+            description: "A 5-9 word description of the session's current focus.",
+          }),
+          Type.Null({ description: "Clear the current focus description." }),
+        ], {
+          description: "Optional self-update: set a concise focus description, or use null to clear it. Display metadata only, never routing identity.",
+        })),
+      }, {
+        description: "Optionally update this session's name and/or short focus as part of any intercom call.",
+      })),
       to: Type.Optional(Type.String({
         description: "One target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
@@ -2739,6 +3026,16 @@ Usage:
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const toolResult = await (async (): Promise<AgentToolResult<unknown>> => {
+      const profile = normalizeToolProfilePlaceholders(params.profile);
+      const profileError = applySelfProfile(profile, ctx);
+      if (profileError) {
+        return {
+          content: [{ type: "text" as const, text: profileError }],
+          details: { error: true },
+        };
+      }
+
       let connectedClient: IntercomClient;
       try {
         connectedClient = await ensureConnected("tool");
@@ -2750,8 +3047,43 @@ Usage:
       }
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
+      const requestedPresenceName = buildPresenceIdentity(
+        pi,
+        currentIntercomSessionId ?? ctx.sessionManager.getSessionId(),
+      ).name;
+      const selfProjection = connectedClient.getSelfSession();
+      const projectionMayChange = currentAdvertisedName === undefined
+        && (selfProjection === undefined || selfProjection.name !== requestedPresenceName);
+      if (profile?.name !== undefined || projectionMayChange) {
+        try {
+          // Presence and list share one ordered local socket. The response gives
+          // us the broker-owned collision-resolved name without guessing it and
+          // observes later collision self-healing before metadata is returned.
+          await connectedClient.listSessions({ timeoutMs: 1_000 });
+        } catch {
+          // The action can still proceed. Result metadata distinguishes a
+          // missing effective projection from the canonical Pi name.
+        }
+      }
 
-      const { action, to, targets, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, name } = params;
+      const {
+        action,
+        to,
+        message,
+        attachments,
+        replyTo,
+        messageId,
+        supersedes,
+        retryOf,
+        cwd,
+        openProjectPaneIfMissing,
+        focus,
+        name,
+      } = params;
+      // Some tool-schema adapters materialize optional arrays as [""]. Treat
+      // an all-blank placeholder as omitted while preserving errors for mixed
+      // real/blank recipient lists.
+      const targets = params.targets?.every((target) => !target.trim()) ? undefined : params.targets;
 
       if (messageId && action !== "cancel") {
         return {
@@ -2787,6 +3119,7 @@ Usage:
               details: { error: true },
             };
           }
+          currentAdvertisedName = result.name;
 
           // Best-effort, non-blocking notice to the supervisor -- same ordinary
           // message pipeline as any other intercom send, delivered exactly once
@@ -3556,6 +3889,8 @@ Usage:
             details: { error: true },
           };
       }
+      })();
+      return attachSelfProfile(toolResult);
     },
     renderCall(args, theme) {
       const action = typeof args.action === "string" ? args.action : "intercom";

@@ -4,7 +4,7 @@ description: |
   Streamline session-to-session coordination with pi-intercom. Send messages,
   delegate tasks, and coordinate work across multiple pi sessions on the same
   machine. Use for planner-worker workflows, cross-session context sharing,
-  and real-time collaboration between sessions.
+  early discovery of potentially overlapping work, and real-time collaboration.
 ---
 
 # Pi Intercom Skill
@@ -24,6 +24,10 @@ This skill covers how to handle those orchestrator-side escalations.
 - **Clarification loops**: Worker asks questions, planner answers, work continues
 - **Multi-session workflows**: Coordinate between specialized sessions (frontend/backend, research/implementation)
 - **Cross-codebase peer messages**: Message an explicit live peer in another project, or open a visible Herdr project pane when a long-lived conversation is needed
+
+For substantial work that may overlap another session or benefit from a nearby
+perspective, consider listing peers early. Do not add routine discovery calls to
+trivial solo tasks.
 
 ## Core Patterns
 
@@ -70,9 +74,21 @@ intercom({
 Before sending, verify who's connected:
 
 ```typescript
-intercom({ action: "list" })
-// → Shows all connected sessions with names, cwd, models, and live status (`idle`, `thinking`, `tool:<name>`, plus `compacting` on supported hosts)
+intercom({
+  action: "list",
+  profile: { description: "Reviewing local session discovery and coordination" }
+})
+// → Shows connected sessions with names, short descriptions, cwd, models, and live status (`idle`, `thinking`, `tool:<name>`, plus `compacting` on supported hosts)
 ```
+
+Any action can carry `profile: { name?, description? }`, so publishing a concise
+5–9 word current focus does not require an extra call; use `description: null` to
+clear stale focus. Every result also repeats your canonical Pi name,
+broker-confirmed intercom name when available, description, and publication
+status as lightweight context. A profile name fills an
+unnamed/generated identity and may later revise that profile-managed name; it
+never replaces an explicit user or host name. Descriptions are presentation
+metadata only and never affect routing, ACLs, mailboxes, or session continuity.
 
 ### Pattern 3: Reply Naturally
 

@@ -38,7 +38,8 @@ function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?
   const tags = [options?.self ? "self" : undefined, options?.sameCwd ? "same cwd" : undefined]
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
-  return `${name} (${shortSessionId(session.id)})${suffix}`;
+  const description = session.description ? ` — ${session.description}` : "";
+  return `${name} (${shortSessionId(session.id)})${suffix}${description}`;
 }
 
 export class SessionListOverlay implements Component {

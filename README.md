@@ -16,7 +16,7 @@ Sometimes you're running multiple pi sessions — one researching, one executing
 
 - **User-driven orchestration** — Send context or findings from your research session to your execution session
 - **Agent collaboration** — An agent can reach out to another session when it needs help or wants to share results
-- **Session awareness** — See what other pi sessions are running and their current status
+- **Session awareness** — See what other pi sessions are running, their concise current focus, and live status
 
 Unlike pi-messenger (a shared chat room for multi-agent swarms), pi-intercom is optimized for targeted communication where you pick the recipients. It can send one message independently to several explicit sessions and has a deliberately discouraged machine-wide broadcast for the rare notice that genuinely concerns every visible live peer.
 
@@ -32,7 +32,7 @@ If upstream `pi-intercom` is already installed, remove it first so Pi does not l
 
 ```bash
 pi remove npm:pi-intercom
-pi install git:github.com/Scott-Meyer/pi-intercom-subagent-acl@v0.13.0-acl.7
+pi install git:github.com/Scott-Meyer/pi-intercom-subagent-acl@v0.13.0-acl.8
 ```
 
 For a fresh install, only the second command is needed. Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
@@ -54,7 +54,7 @@ The ACL additions are also optional at runtime. An ordinary Pi session without p
 <pi-intercom>
 Coordinate with other local pi sessions on related codebases. Use `/skill:pi-intercom` for patterns.
 
-**When:** Same codebase (parallel work), reference codebase (consulting patterns), related repos (shared libraries).
+**When:** Same codebase (parallel work), reference codebase (consulting patterns), related repos (shared libraries). For substantial work that may overlap or benefit from a nearby perspective, consider listing peers early.
 
 **Not when:** Unrelated codebases, trivial questions, or when you can proceed independently.
 
@@ -86,6 +86,16 @@ incoming message headers use it when available. In an interactive UI, `/alias`
 or `/alias menu` opens an input for the current session's alias; it does not
 rename other sessions. Use `/alias <name>` in non-UI modes.
 
+An agent may also add `profile: { name?, description? }` to any intercom action.
+The description is a 5–9 word current focus shown in lists and overlays; pass
+`description: null` to clear it. Each tool result repeats the caller's canonical
+Pi name, broker-confirmed intercom name when available, description, and
+publication status as lightweight context. A profile name can fill an
+unnamed/generated identity and later revise that profile-managed name, but
+cannot replace an explicit user or host name.
+Descriptions are display metadata only: they never affect routing, ACLs,
+mailboxes, or session continuity.
+
 ## Quick Start
 
 ### From the Keyboard
@@ -101,12 +111,16 @@ Press **Alt+M** or type `/intercom` to open the session list overlay:
 The agent can list sessions and send messages using the `intercom` tool. Tool calls and results render as compact transcript rows so send/ask/reply flows are easy to scan. Use `/intercom-id` to insert a handoff snippet for the current session's stable intercom target into the editor. For common patterns like planner-worker delegation, the bundled `pi-intercom` skill provides copy-paste ready examples:
 
 ```typescript
-// List active sessions
-intercom({ action: "list" })
+// List active sessions and publish a short focus in the same call
+intercom({
+  action: "list",
+  profile: { description: "Implementing local API validation and retries" }
+})
 // → **Current session:**
-// → • executor (20d43841) — ~/projects/api (claude-sonnet-4 · 42% ctx) [self, idle]
+// → • executor (20d43841) — Implementing local API validation and retries — ~/projects/api (claude-sonnet-4 · 42% ctx) [self, idle]
 // → **Other sessions:**
-// → • research (6332faab) — ~/projects/api (claude-sonnet-4) [same cwd, thinking]
+// → • research (6332faab) — Reviewing authentication edge cases and tests — ~/projects/api (claude-sonnet-4) [same cwd, thinking]
+// → Self profile: executor — Implementing local API validation and retries
 
 // List only peers in the same working directory
 intercom({ action: "list-cwd" })

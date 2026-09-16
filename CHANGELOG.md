@@ -4,6 +4,19 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.13.0-acl.9] - 2026-09-16
+
+### Added
+- Federation Slice 1 adds strict broker-peer v1 wire contracts, broker-generated link IDs, capability-bearing FlightDeck attachment prefaces, trusted destination preparation, explicit peer connection roles, origin-qualified session identity encoding, and correlated dial/accept/hello results.
+- Trusted local scope bindings keep exact broker scope IDs out of the peer stream while binding public origin/scope aliases to independently authorized local namespaces. Peer links keep an otherwise idle broker alive and are atomically removed when their transport disconnects.
+
+### Security
+- Federation dials accept only literal loopback endpoints, bounded one-time capabilities, canonical origins, and strict no-extra-field payloads. The destination broker accepts a hello only after FlightDeck independently prepares the expected link, origins, and local scope bindings; peer assertions cannot choose destination identity or export authorization.
+- Reciprocal simultaneous dials converge on one direction through canonical origin ordering, abandoned control requests tear down pending dials, failed dials cannot poison broker origin, and the active link does not retain the bridge capability.
+
+### Notes
+- This slice establishes authenticated transport attachment, identity negotiation, and lifecycle only. Remote roster import and message routing remain disabled until later SCO-116 phases; broadcast, mailboxes, extension channels, and compaction awareness remain host-local in federation v1.
+
 ## [0.13.0-acl.8] - 2026-09-16
 
 ### Added

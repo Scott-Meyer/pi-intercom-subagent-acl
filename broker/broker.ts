@@ -24,6 +24,20 @@ import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { CollaborationStateStore } from "./collaboration-state.ts";
 import { isValidSessionDescription, isValidSessionName } from "../session-profile.ts";
+import {
+  isBrokerAcceptPeerRequest,
+  isBrokerDialPeerRequest,
+  isFederationCorrelationId,
+  isPeerHello,
+} from "./federation-protocol.ts";
+import { FederationPeerError, PeerLinkManager, type PreparedInboundPeer } from "./peer-link.ts";
+import {
+  FEDERATION_PROTOCOL_NAME,
+  FEDERATION_PROTOCOL_VERSION,
+  FEDERATION_REQUIRED_FEATURES,
+  type BrokerDialPeerRequest,
+  type FederationFailureCode,
+} from "./federation-types.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -34,6 +48,7 @@ const BROKER_STATE_ID = randomUUID();
 const MAX_SESSIONS = 128;
 const MAX_UNREGISTERED_CONNECTIONS = 32;
 const REGISTRATION_TIMEOUT_MS = 1000;
+const PEER_PREPARED_TIMEOUT_MS = 5000;
 const RATE_LIMIT_CAPACITY = 240;
 const RATE_LIMIT_REFILL_PER_SECOND = 120;
 const ACK_RATE_LIMIT_CAPACITY = 1_024;
@@ -301,6 +316,7 @@ class IntercomBroker {
   private nextOwnerOrder = 1;
   private extensionStateManager: ExtensionStateManager;
   private collaborationState: CollaborationStateStore;
+  private peerLinks: PeerLinkManager;
 
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
@@ -309,6 +325,12 @@ class IntercomBroker {
     this.prunePendingAskRecords();
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
     this.collaborationState = new CollaborationStateStore(INTERCOM_DIR);
+    this.peerLinks = new PeerLinkManager({
+      onSocketOpened: (socket) => this.connections.add(socket),
+      onSocketClosed: (socket) => this.connections.delete(socket),
+      onLinkUp: () => this.cancelShutdownTimer(),
+      onLinkDown: () => this.scheduleShutdownCheck(),
+    });
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
         unlinkSync(LISTEN_TARGET);
@@ -497,8 +519,12 @@ class IntercomBroker {
   private handleConnection(socket: net.Socket): void {
     this.connections.add(socket);
     let sessionKey: string | null = null;
+    let connectionRole: "unregistered" | "client" | "peer-prepared" | "peer" | "control" = "unregistered";
+    let preparedPeer: PreparedInboundPeer | null = null;
+    let dialAbortController: AbortController | null = null;
+    let peerLinkId: string | null = null;
     let registrationTimeout: NodeJS.Timeout | null = null;
-    const armRegistrationTimeout = () => {
+    const armRegistrationTimeout = (timeoutMs = REGISTRATION_TIMEOUT_MS) => {
       if (registrationTimeout) {
         clearTimeout(registrationTimeout);
       }
@@ -506,10 +532,8 @@ class IntercomBroker {
       this.unregisteredConnections.add(socket);
       this.evictOldestUnregisteredConnections(socket);
       registrationTimeout = setTimeout(() => {
-        if (!sessionKey) {
-          socket.destroy();
-        }
-      }, REGISTRATION_TIMEOUT_MS);
+        if (connectionRole === "unregistered" || connectionRole === "peer-prepared") socket.destroy();
+      }, timeoutMs);
       registrationTimeout.unref?.();
     };
     const clearRegistrationTimeout = () => {
@@ -538,13 +562,139 @@ class IntercomBroker {
         socket.destroy(new Error("Intercom broker rate limit exceeded"));
         return;
       }
+
+      const record = typeof msg === "object" && msg !== null && !Array.isArray(msg)
+        ? msg as Record<string, unknown>
+        : undefined;
+      const claimedType = typeof record?.type === "string" ? record.type : undefined;
+
+      if (connectionRole === "peer") {
+        this.peerLinks.assertNoPostHandshakeMessage(peerLinkId!, msg);
+        return;
+      }
+      if (connectionRole === "control") {
+        throw new Error("Broker control connections accept exactly one request");
+      }
+
+      if (connectionRole === "peer-prepared") {
+        clearRegistrationTimeout();
+        if (!preparedPeer) throw new Error("Prepared peer authority missing");
+        if (!isPeerHello(msg)) {
+          const features = Array.isArray(record?.features) ? record.features : [];
+          const code: FederationFailureCode = record?.protocol !== FEDERATION_PROTOCOL_NAME
+            || record.version !== FEDERATION_PROTOCOL_VERSION
+            ? "E_VERSION_UNSUPPORTED"
+            : FEDERATION_REQUIRED_FEATURES.some((feature) => !features.includes(feature))
+              ? "E_FEATURE_UNSUPPORTED"
+              : "E_INVALID_REQUEST";
+          writeMessage(socket, {
+            type: "peer_hello_ack",
+            protocol: FEDERATION_PROTOCOL_NAME,
+            version: FEDERATION_PROTOCOL_VERSION,
+            linkId: preparedPeer.linkId,
+            accepted: false,
+            code,
+            error: code === "E_VERSION_UNSUPPORTED"
+              ? "Unsupported peer protocol version"
+              : code === "E_FEATURE_UNSUPPORTED"
+                ? "Unsupported or invalid peer features"
+                : "Invalid peer hello",
+          });
+          connectionRole = "control";
+          preparedPeer = null;
+          socket.end();
+          return;
+        }
+        const accepted = this.peerLinks.acceptInbound(socket, msg, preparedPeer);
+        preparedPeer = null;
+        writeMessage(socket, accepted.ack);
+        if (!accepted.link) {
+          connectionRole = "control";
+          socket.end();
+          return;
+        }
+        connectionRole = "peer";
+        peerLinkId = accepted.link.linkId;
+        return;
+      }
+
+      if (connectionRole === "unregistered" && claimedType === "broker_dial_peer") {
+        connectionRole = "control";
+        clearRegistrationTimeout();
+        const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";
+        if (requiresEndpointAuth && record?.stateId !== BROKER_STATE_ID) {
+          throw new Error("Invalid intercom TCP endpoint credentials");
+        }
+        const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
+        if (!isBrokerDialPeerRequest(msg)) {
+          if (requestId) writeMessage(socket, { type: "broker_dial_peer_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker dial peer request" });
+          else writeMessage(socket, { type: "error", error: "Invalid broker dial peer request" });
+          socket.end();
+          return;
+        }
+        this.cancelShutdownTimer();
+        const controller = new AbortController();
+        dialAbortController = controller;
+        void this.handleDialPeerControl(socket, msg, controller.signal).finally(() => {
+          if (dialAbortController === controller) dialAbortController = null;
+        });
+        return;
+      }
+
+      if (connectionRole === "unregistered" && claimedType === "broker_accept_peer") {
+        connectionRole = "control";
+        clearRegistrationTimeout();
+        const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";
+        if (requiresEndpointAuth && record?.stateId !== BROKER_STATE_ID) {
+          throw new Error("Invalid intercom TCP endpoint credentials");
+        }
+        const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
+        if (!isBrokerAcceptPeerRequest(msg)) {
+          if (requestId) writeMessage(socket, { type: "broker_accept_peer_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker accept peer request" });
+          else writeMessage(socket, { type: "error", error: "Invalid broker accept peer request" });
+          socket.end();
+          return;
+        }
+        try {
+          preparedPeer = this.peerLinks.prepareInbound(msg);
+          connectionRole = "peer-prepared";
+          this.cancelShutdownTimer();
+          armRegistrationTimeout(PEER_PREPARED_TIMEOUT_MS);
+          writeMessage(socket, { type: "broker_accept_peer_result", requestId: msg.requestId, ok: true, linkId: msg.linkId });
+        } catch (error) {
+          const failure = error instanceof FederationPeerError ? error : new FederationPeerError("E_INVALID_REQUEST", "Peer preparation failed", { cause: error });
+          writeMessage(socket, { type: "broker_accept_peer_result", requestId: msg.requestId, ok: false, code: failure.code, error: failure.message });
+          socket.end();
+        }
+        return;
+      }
+
+      if (connectionRole === "unregistered" && claimedType === "peer_hello") {
+        if (typeof LISTEN_TARGET !== "string") {
+          throw new Error("Invalid intercom TCP endpoint credentials");
+        }
+        connectionRole = "control";
+        clearRegistrationTimeout();
+        if (record && isFederationCorrelationId(record.linkId)) {
+          writeMessage(socket, {
+            type: "peer_hello_ack",
+            protocol: FEDERATION_PROTOCOL_NAME,
+            version: FEDERATION_PROTOCOL_VERSION,
+            linkId: record.linkId,
+            accepted: false,
+            code: "E_NOT_PREPARED",
+            error: "Destination broker was not prepared by the transport authority",
+          });
+        }
+        socket.end();
+        return;
+      }
+
       this.handleMessage(socket, msg, sessionKey, (id) => {
         sessionKey = id;
-        if (id) {
-          clearRegistrationTimeout();
-        } else {
-          armRegistrationTimeout();
-        }
+        connectionRole = id ? "client" : "unregistered";
+        if (id) clearRegistrationTimeout();
+        else armRegistrationTimeout();
       });
     }, (error) => {
       socket.destroy(error);
@@ -554,7 +704,13 @@ class IntercomBroker {
 
     socket.on("close", () => {
       clearRegistrationTimeout();
+      dialAbortController?.abort();
+      dialAbortController = null;
       this.connections.delete(socket);
+      if (peerLinkId) {
+        this.peerLinks.removeInbound(peerLinkId, socket);
+        peerLinkId = null;
+      }
       if (sessionKey) {
         const existing = this.sessions.get(sessionKey);
         if (existing?.socket === socket) {
@@ -563,9 +719,9 @@ class IntercomBroker {
           this.clearMessageReceiptRoutesForSession(sessionKey);
           this.broadcastScoped({ type: "session_left", sessionId: existing.info.id }, existing.info, sessionKey, existing.scopeId);
           this.recomputeNamespaceOwners();
-          this.scheduleShutdownCheck();
         }
       }
+      this.scheduleShutdownCheck();
     });
 
     socket.on("error", (error) => {
@@ -617,16 +773,67 @@ class IntercomBroker {
     return true;
   }
 
+  private cancelShutdownTimer(): void {
+    if (!this.shutdownTimer) return;
+    clearTimeout(this.shutdownTimer);
+    this.shutdownTimer = null;
+  }
+
   private scheduleShutdownCheck(): void {
     if (this.shutdownTimer) return;
 
     this.shutdownTimer = setTimeout(() => {
       this.shutdownTimer = null;
-      if (this.sessions.size === 0) {
+      if (this.sessions.size === 0 && this.peerLinks.size === 0) {
         console.log("No sessions connected, shutting down");
         this.shutdown();
       }
     }, 5000);
+  }
+
+  private async handleDialPeerControl(
+    socket: net.Socket,
+    request: BrokerDialPeerRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      const link = await this.peerLinks.dial(request, signal);
+      if (socket.writable && !socket.destroyed) {
+        try {
+          writeMessage(socket, {
+            type: "broker_dial_peer_result",
+            requestId: request.requestId,
+            ok: true,
+            linkId: link.linkId,
+          });
+        } catch (error) {
+          this.peerLinks.closeLink(link.linkId);
+          throw error;
+        }
+      } else {
+        this.peerLinks.closeLink(link.linkId);
+      }
+    } catch (error) {
+      const failure = error instanceof FederationPeerError
+        ? error
+        : new FederationPeerError("E_DIAL_FAILED", "Peer dial failed", { cause: error });
+      if (socket.writable && !socket.destroyed) {
+        try {
+          writeMessage(socket, {
+            type: "broker_dial_peer_result",
+            requestId: request.requestId,
+            ok: false,
+            code: failure.code,
+            error: failure.message,
+          });
+        } catch {
+          // The control socket is already unusable; link teardown happened above.
+        }
+      }
+      this.scheduleShutdownCheck();
+    } finally {
+      socket.end();
+    }
   }
 
   private handleMessage(
@@ -757,10 +964,7 @@ class IntercomBroker {
         this.sessions.set(key, connectedSession);
         this.disconnectedSessions.delete(key);
         
-        if (this.shutdownTimer) {
-          clearTimeout(this.shutdownTimer);
-          this.shutdownTimer = null;
-        }
+        this.cancelShutdownTimer();
 
         // This must be the first broker message. Older clients ignore the
         // additive features field; newer clients use it to avoid sending
@@ -2392,9 +2596,9 @@ class IntercomBroker {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
     }
-    for (const session of this.sessions.values()) {
-      session.socket.end();
-    }
+    this.peerLinks.close();
+    for (const connection of this.connections) connection.end();
+    this.connections.clear();
     this.sessions.clear();
     this.askEdges.clear();
     this.messageReceiptRoutes.clear();

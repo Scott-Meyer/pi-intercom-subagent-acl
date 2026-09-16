@@ -27,6 +27,8 @@ interface SendOptions {
   supersedes?: string;
   retryOf?: string;
   provenance?: MessageProvenance;
+  /** Stops retries that have not yet been written; it cannot retract an in-flight frame. */
+  signal?: AbortSignal;
 }
 
 export interface SendResult extends DeliveryDetails {
@@ -691,13 +693,34 @@ export class IntercomClient extends EventEmitter {
   }
 
   async send(to: string, options: SendOptions): Promise<SendResult> {
+    return this.sendInternal(to, options);
+  }
+
+  /**
+   * Send to a session from a caller-owned roster snapshot without listing the
+   * roster again. Multi-recipient callers can therefore expand visibility once,
+   * while every recipient still gets an ordinary message ID, delivery record,
+   * receipt route, rate-limit charge, and exact-endpoint rebound check.
+   */
+  async sendToSession(session: SessionInfo, options: SendOptions): Promise<SendResult> {
+    const exactTarget = session.endpointEpoch
+      ? { id: session.id, epoch: session.endpointEpoch }
+      : null;
+    return this.sendInternal(session.id, options, exactTarget);
+  }
+
+  private async sendInternal(
+    to: string,
+    options: SendOptions,
+    rosterTarget?: { id: string; epoch: string } | null,
+  ): Promise<SendResult> {
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
     } catch (error) {
       throw toError(error);
     }
-    
+
     const messageId = options.messageId ?? randomUUID();
     const message: Message = {
       id: messageId,
@@ -714,7 +737,19 @@ export class IntercomClient extends EventEmitter {
       },
     };
 
-    const sendOnce = (targetId?: string, targetEpoch?: string): Promise<SendResult> => new Promise((resolve, reject) => {
+    const cancelledResult = (): SendResult => ({
+      id: messageId,
+      delivered: false,
+      delivery: "failed",
+      retryable: true,
+      outcomeKnown: true,
+      code: "E_CANCELLED",
+      reason: "Send cancelled before the next delivery attempt",
+    });
+
+    const sendOnce = (targetId?: string, targetEpoch?: string): Promise<SendResult> => {
+      if (options.signal?.aborted) return Promise.resolve(cancelledResult());
+      return new Promise((resolve, reject) => {
       const wrappedResolve = (result: SendResult) => {
         clearTimeout(timeout);
         resolve(result);
@@ -739,6 +774,7 @@ export class IntercomClient extends EventEmitter {
         reject(toError(error));
       }
     });
+    };
 
     if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) {
       return sendOnce();
@@ -754,11 +790,15 @@ export class IntercomClient extends EventEmitter {
       return target?.endpointEpoch ? { id: target.id, epoch: target.endpointEpoch } : null;
     };
 
-    const target = await resolveTarget();
+    const target = rosterTarget === undefined ? await resolveTarget() : rosterTarget;
+    if (options.signal?.aborted) return cancelledResult();
     if (!target) return sendOnce();
     const result = await sendOnce(target.id, target.epoch);
-    if (result.code !== "E_TARGET_REBOUND") return result;
+    if (result.code !== "E_TARGET_REBOUND" || options.signal?.aborted) {
+      return options.signal?.aborted && !result.delivered ? cancelledResult() : result;
+    }
     const reboundTarget = await resolveTarget();
+    if (options.signal?.aborted) return cancelledResult();
     return reboundTarget ? sendOnce(reboundTarget.id, reboundTarget.epoch) : result;
   }
 

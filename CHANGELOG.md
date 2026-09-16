@@ -4,6 +4,17 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.13.0-acl.6] - 2026-09-16
+
+### Added
+- `send` accepts up to 32 explicit `targets`, delivering an independent message and outcome to each while deduplicating aliases for the same live session and preserving partial successes.
+- `broadcast` sends to every currently visible live session on the machine. Tool guidance deliberately recommends explicit targets instead; broadcast remains bounded by the caller's scope and subagent ACL and never queues disconnected sessions.
+- On Pi hosts that report unsuccessful compactions to extensions (Earendil Pi 0.85+), session presence publishes `compacting` from pre-compaction until success, failure, or abort, then restores the underlying thinking/tool/idle state without waking peers. Older hosts leave compaction presence disabled to avoid stale status.
+
+### Fixed
+- Multi-target confirmation resolves and displays the exact recipient snapshot before approval, then refuses to remap a departed approved endpoint to a replacement alias.
+- Fanout cancellation is rechecked before endpoint-rebound and offline-mailbox retries, and case-sensitive disconnected IDs remain distinct.
+
 ## [0.13.0-acl.5] - 2026-09-15
 
 ### Changed

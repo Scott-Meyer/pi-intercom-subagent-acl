@@ -121,12 +121,17 @@ export class ReplyTracker {
     return candidates.length === 1 ? candidates[0]! : null;
   }
 
-  findActiveReplyTargetMismatch(to: string, now = Date.now()): IntercomContext | null {
+  getActiveReplyTarget(now = Date.now()): IntercomContext | null {
     this.pruneExpired(now);
-    if (!this.currentTurnContext?.message.expectsReply) {
+    return this.currentTurnContext?.message.expectsReply ? this.currentTurnContext : null;
+  }
+
+  findActiveReplyTargetMismatch(to: string, now = Date.now()): IntercomContext | null {
+    const activeReplyTarget = this.getActiveReplyTarget(now);
+    if (!activeReplyTarget) {
       return null;
     }
-    return this.currentTurnContext.from.id === to ? null : this.currentTurnContext;
+    return activeReplyTarget.from.id === to ? null : activeReplyTarget;
   }
 
   markReplied(replyTo: string): void {

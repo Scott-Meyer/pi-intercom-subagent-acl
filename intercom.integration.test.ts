@@ -1289,6 +1289,404 @@ test("intercom tool prefers exact names over ID prefixes", { concurrency: false 
   }
 });
 
+test("send accepts multiple explicit targets, reports partial failure, and delivers only once per session", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("multicast-worker");
+  const plannerMessages: Message[] = [];
+  const orchestratorMessages: Message[] = [];
+  const onPlannerMessage = (_from: SessionInfo, message: Message) => plannerMessages.push(message);
+  const onOrchestratorMessage = (_from: SessionInfo, message: Message) => orchestratorMessages.push(message);
+
+  planner.on("message", onPlannerMessage);
+  orchestrator.on("message", onOrchestratorMessage);
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const result = await intercomTool.execute("send-many", {
+      action: "send",
+      targets: ["planner", orchestrator.sessionId!, "missing-peer", planner.sessionId!],
+      message: "Shared update",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(plannerMessages.length, 1, "name and id aliases for one session must not duplicate delivery");
+    assert.equal(orchestratorMessages.length, 1);
+    assert.equal(plannerMessages[0]?.content.text, "Shared update");
+    assert.equal(orchestratorMessages[0]?.content.text, "Shared update");
+    assert.match(result.content[0]?.text ?? "", /accepted for 2 of 3 targets/i);
+    assert.equal(result.details?.batch, true);
+    assert.equal(result.details?.requestedTargetCount, 4);
+    assert.equal(result.details?.recipientCount, 3);
+    assert.equal(result.details?.acceptedCount, 2);
+    assert.equal(result.details?.failedCount, 1);
+    assert.equal(result.details?.duplicateCount, 1);
+    const outcomes = result.details?.outcomes as Array<{ to: string; delivered: boolean; messageId?: string; reason?: string }>;
+    assert.equal(outcomes.filter((outcome) => outcome.delivered).length, 2);
+    assert.match(outcomes.find((outcome) => outcome.to === "missing-peer")?.reason ?? "", /not found/i);
+
+    const sentEntries = harness.entries.filter((entry) => entry.type === "intercom_sent");
+    assert.equal(sentEntries.length, 2);
+    assert.notEqual(
+      (sentEntries[0]?.data as { messageId: string }).messageId,
+      (sentEntries[1]?.data as { messageId: string }).messageId,
+      "each recipient needs an independent message id for receipts and cancellation",
+    );
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    planner.off("message", onPlannerMessage);
+    orchestrator.off("message", onOrchestratorMessage);
+    await cleanup();
+  }
+});
+
+test("confirmed multi-target sends preserve the resolved recipient snapshot", { concurrency: false }, async () => {
+  await withConfirmSendEnabled(async () => {
+    const { cleanup } = await setupClients();
+    const { default: piIntercomExtension } = await import("./index.ts");
+    const original = new IntercomClient();
+    const replacement = new IntercomClient();
+    const originalId = "confirmed-original-id";
+    const replacementMessages: Message[] = [];
+    const onReplacementMessage = (_from: SessionInfo, message: Message) => replacementMessages.push(message);
+    replacement.on("message", onReplacementMessage);
+    let confirmationText = "";
+    const registration = {
+      name: "confirmed-target",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    };
+    const harness = createExtensionHarness("confirmed-multicast-worker", {
+      hasUI: true,
+      ui: {
+        confirm: async (_title: string, text: string) => {
+          confirmationText = text;
+          await original.disconnect();
+          await replacement.connect({ ...registration, startedAt: Date.now(), lastActivity: Date.now() }, "confirmed-replacement-id");
+          return true;
+        },
+      },
+    });
+
+    try {
+      await original.connect(registration, originalId);
+      piIntercomExtension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+      const result = await intercomTool.execute("confirmed-snapshot", {
+        action: "send",
+        targets: ["confirmed-target"],
+        message: "Only for the approved endpoint",
+      }, new AbortController().signal, undefined, harness.ctx);
+
+      assert.match(confirmationText, new RegExp(originalId));
+      assert.equal(result.details?.acceptedCount, 0);
+      const outcomes = result.details?.outcomes as Array<{ targetId?: string; code?: string }>;
+      assert.equal(outcomes[0]?.targetId, originalId);
+      assert.match(outcomes[0]?.code ?? "", /E_TARGET_(?:NOT_FOUND|REBOUND)/);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(replacementMessages.length, 0, "a newly rebound alias must not receive a previously confirmed send");
+    } finally {
+      await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+      replacement.off("message", onReplacementMessage);
+      await original.disconnect().catch(() => undefined);
+      await replacement.disconnect().catch(() => undefined);
+      await cleanup();
+    }
+  });
+});
+
+test("multi-target send preserves ordinary queued-mail delivery for a disconnected recipient", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const disconnected = new IntercomClient();
+  const reconnected = new IntercomClient();
+  const harness = createExtensionHarness("multicast-mailbox-worker");
+  const disconnectedId = "multicast-offline-target";
+  const registration = {
+    name: "multicast-offline",
+    cwd: repoDir,
+    model: "test-model",
+    pid: process.pid,
+    startedAt: Date.now(),
+    lastActivity: Date.now(),
+  };
+
+  try {
+    await disconnected.connect(registration, disconnectedId);
+    await disconnected.disconnect();
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const plannerReceived = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const result = await intercomTool.execute("send-many-mailbox", {
+      action: "send",
+      targets: ["planner", disconnectedId],
+      message: "Live and queued update",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    const [, plannerMessage] = await plannerReceived;
+    assert.equal(plannerMessage.content.text, "Live and queued update");
+    const outcomes = result.details?.outcomes as Array<{ to: string; delivery: string; delivered: boolean }>;
+    assert.equal(outcomes.find((outcome) => outcome.to === "planner")?.delivery, "socket_delivered");
+    assert.equal(outcomes.find((outcome) => outcome.to === disconnectedId)?.delivery, "queued");
+    assert.match(result.content[0]?.text ?? "", /queued for offline delivery \(up to 24h while this broker remains running\)/i);
+
+    const queuedReceived = once(reconnected, "message") as Promise<[SessionInfo, Message]>;
+    await reconnected.connect({ ...registration, startedAt: Date.now(), lastActivity: Date.now() }, disconnectedId);
+    const [, queuedMessage] = await queuedReceived;
+    assert.equal(queuedMessage.content.text, "Live and queued update");
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await disconnected.disconnect().catch(() => undefined);
+    await reconnected.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("multi-target send keeps case-sensitive disconnected IDs distinct", { concurrency: false }, async () => {
+  const { cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const upper = new IntercomClient();
+  const lower = new IntercomClient();
+  const harness = createExtensionHarness("case-sensitive-target-worker");
+  const registration = (name: string) => ({
+    name,
+    cwd: repoDir,
+    model: "test-model",
+    pid: process.pid,
+    startedAt: Date.now(),
+    lastActivity: Date.now(),
+  });
+
+  try {
+    await upper.connect(registration("case-upper"), "Worker-A");
+    await lower.connect(registration("case-lower"), "worker-a");
+    await upper.disconnect();
+    await lower.disconnect();
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const result = await intercomTool.execute("case-sensitive-targets", {
+      action: "send",
+      targets: ["Worker-A", "worker-a"],
+      message: "Separate offline identities",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    assert.equal(result.details?.recipientCount, 2);
+    assert.equal(result.details?.acceptedCount, 2);
+    assert.equal(result.details?.duplicateCount, 0);
+    assert.deepEqual(
+      (result.details?.outcomes as Array<{ to: string; delivery: string }>).map((outcome) => [outcome.to, outcome.delivery]),
+      [["Worker-A", "queued"], ["worker-a", "queued"]],
+    );
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await upper.disconnect().catch(() => undefined);
+    await lower.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("broadcast reaches every visible live session across working directories and warns against routine use", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const otherProject = new IntercomClient();
+  const harness = createExtensionHarness("broadcast-worker");
+
+  try {
+    await otherProject.connect({
+      name: "other-project-worker",
+      cwd: path.join(repoDir, "other-project"),
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+
+    const plannerReceived = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const orchestratorReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    const otherProjectReceived = once(otherProject, "message") as Promise<[SessionInfo, Message]>;
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const result = await intercomTool.execute("broadcast", {
+      action: "broadcast",
+      message: "Machine-wide maintenance notice",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    const received = await Promise.race([
+      Promise.all([plannerReceived, orchestratorReceived, otherProjectReceived]),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("Timed out waiting for every broadcast recipient")), 2000).unref();
+      }),
+    ]);
+    assert.deepEqual(received.map(([, message]) => message.content.text), [
+      "Machine-wide maintenance notice",
+      "Machine-wide maintenance notice",
+      "Machine-wide maintenance notice",
+    ]);
+    assert.equal(result.details?.broadcast, true);
+    assert.equal(result.details?.recipientCount, 3);
+    assert.equal(result.details?.acceptedCount, 3);
+    assert.equal(result.details?.failedCount, 0);
+    assert.match(result.content[0]?.text ?? "", /broadcast accepted for 3 of 3 visible sessions/i);
+    assert.match(result.content[0]?.text ?? "", /prefer.*send.*targets/i);
+
+    const sentEntries = harness.entries.filter((entry) => entry.type === "intercom_sent");
+    assert.equal(sentEntries.length, 3);
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await otherProject.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("broadcast preserves subagent visibility instead of disclosing or messaging hidden sessions", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const plannerMessages: Message[] = [];
+  const onPlannerMessage = (_from: SessionInfo, message: Message) => plannerMessages.push(message);
+  planner.on("message", onPlannerMessage);
+
+  try {
+    await withChildOrchestratorEnv({
+      orchestratorTarget: "orchestrator",
+      runId: "broadcast-acl-run",
+      agent: "worker",
+      index: "0",
+    }, async () => {
+      const { default: piIntercomExtension } = await import("./index.ts");
+      const harness = createExtensionHarness("broadcast-acl-child");
+      try {
+        piIntercomExtension(harness.pi as never);
+        await harness.emitLifecycle("session_start");
+        const supervisorReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+        const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+        const result = await intercomTool.execute("broadcast-acl", {
+          action: "broadcast",
+          message: "Visible collaborators only",
+        }, new AbortController().signal, undefined, harness.ctx);
+
+        const [, supervisorMessage] = await supervisorReceived;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.equal(supervisorMessage.content.text, "Visible collaborators only");
+        assert.equal(plannerMessages.length, 0, "a restricted child must not reach or discover an unrelated main");
+        assert.equal(result.details?.recipientCount, 1);
+        assert.equal(result.details?.acceptedCount, 1);
+      } finally {
+        await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+      }
+    });
+  } finally {
+    planner.off("message", onPlannerMessage);
+    await cleanup();
+  }
+});
+
+test("multi-target and broadcast sends reject ambiguous targeting and conversation-specific metadata", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("multicast-validation-worker");
+  const receivedMessages: Message[] = [];
+  const onMessage = (_from: SessionInfo, message: Message) => receivedMessages.push(message);
+  planner.on("message", onMessage);
+  orchestrator.on("message", onMessage);
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const bothTargetForms = await intercomTool.execute("invalid-targets", {
+      action: "send",
+      to: "planner",
+      targets: ["orchestrator"],
+      message: "Ambiguous recipients",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(bothTargetForms.details?.error, true);
+    assert.match(bothTargetForms.content[0]?.text ?? "", /either 'to' or 'targets'/i);
+
+    const threadedBatch = await intercomTool.execute("invalid-thread", {
+      action: "send",
+      targets: ["planner", "orchestrator"],
+      message: "Not a valid shared reply",
+      replyTo: "one-conversation-only",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(threadedBatch.details?.error, true);
+    assert.match(threadedBatch.content[0]?.text ?? "", /cannot use replyTo, supersedes, or retryOf/i);
+
+    const addressedBroadcast = await intercomTool.execute("invalid-broadcast", {
+      action: "broadcast",
+      to: "planner",
+      message: "Not actually a broadcast",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(addressedBroadcast.details?.error, true);
+    assert.match(addressedBroadcast.content[0]?.text ?? "", /does not accept 'to'/i);
+
+    const threadedBroadcast = await intercomTool.execute("invalid-broadcast-thread", {
+      action: "broadcast",
+      message: "Not a shared reply",
+      retryOf: "one-recipient-message",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(threadedBroadcast.details?.error, true);
+    assert.match(threadedBroadcast.content[0]?.text ?? "", /cannot use replyTo, supersedes, or retryOf/i);
+
+    const callerSuppliedMessageId = await intercomTool.execute("invalid-message-id", {
+      action: "send",
+      to: "planner",
+      message: "Do not reuse this ID",
+      messageId: "caller-owned-id",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(callerSuppliedMessageId.details?.error, true);
+    assert.match(callerSuppliedMessageId.content[0]?.text ?? "", /only accepted by the cancel action/i);
+
+    const oversizedTargets = await intercomTool.execute("too-many-targets", {
+      action: "send",
+      targets: Array.from({ length: 33 }, (_, index) => `worker-${index}`),
+      message: "Too broad",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(oversizedTargets.details?.error, true);
+    assert.match(oversizedTargets.content[0]?.text ?? "", /1-32 non-empty/i);
+
+    const batchAsk = await intercomTool.execute("invalid-batch-ask", {
+      action: "ask",
+      to: "planner",
+      targets: ["planner", "orchestrator"],
+      message: "Everyone answer",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(batchAsk.details?.error, true);
+    assert.match(batchAsk.content[0]?.text ?? "", /ask accepts one recipient/i);
+
+    const abortController = new AbortController();
+    abortController.abort();
+    const cancelledBatch = await intercomTool.execute("cancelled-batch", {
+      action: "send",
+      targets: ["planner", "orchestrator"],
+      message: "Do not deliver",
+    }, abortController.signal, undefined, harness.ctx);
+    assert.equal(cancelledBatch.details?.acceptedCount, 0);
+    assert.deepEqual(
+      (cancelledBatch.details?.outcomes as Array<{ code: string }>).map((outcome) => outcome.code),
+      ["E_CANCELLED", "E_CANCELLED"],
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(receivedMessages.length, 0);
+
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    planner.off("message", onMessage);
+    orchestrator.off("message", onMessage);
+    await cleanup();
+  }
+});
+
 test("extension can pin a restart-stable intercom session id", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
@@ -1753,6 +2151,15 @@ test("intercom tool renders compact call and result rows", async () => {
     message: "Need a decision before I continue with this implementation.",
     attachments: [{ type: "snippet", name: "note.ts", content: "const ok = true;" }],
   }, renderTheme, {})), /intercom ask → planner \(1 attachment\)\n {2}Need a decision/);
+  assert.match(renderToText(intercomTool.renderCall({
+    action: "send",
+    targets: ["planner", "reviewer", "worker"],
+    message: "Shared update",
+  }, renderTheme, {})), /intercom send → planner, reviewer, worker\n {2}Shared update/);
+  assert.match(renderToText(intercomTool.renderCall({
+    action: "broadcast",
+    message: "Machine-wide notice",
+  }, renderTheme, {})), /intercom broadcast → all visible live sessions\n {2}Machine-wide notice/);
 
   const resultText = renderToText(intercomTool.renderResult({
     content: [{ type: "text", text: "Message sent to planner" }],
@@ -1892,15 +2299,68 @@ test("contact supervisor tool renders reason and reply state", async () => {
   });
 });
 
+test("hosts without compaction failure events do not publish stale compaction presence", { concurrency: false }, async () => {
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("legacy-compaction-worker", { hasUI: true });
+  const hostPackageDir = path.join(sharedHomeDir, "legacy-compaction-host", "node_modules", "@earendil-works", "pi-coding-agent");
+  mkdirSync(hostPackageDir, { recursive: true });
+  writeFileSync(path.join(hostPackageDir, "package.json"), JSON.stringify({
+    name: "@earendil-works/pi-coding-agent",
+    version: "0.84.9",
+  }));
+  const originalHostEntry = process.argv[1];
+
+  try {
+    process.argv[1] = path.join(hostPackageDir, "dist", "cli.js");
+    try {
+      piIntercomExtension(harness.pi as never);
+    } finally {
+      process.argv[1] = originalHostEntry;
+    }
+    await harness.emitLifecycle("session_start");
+    await waitForSessionStatus(planner, "legacy-compaction-worker", "idle");
+
+    await harness.emitLifecycle("session_before_compact", {
+      signal: new AbortController().signal,
+      reason: "manual",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForSessionStatus(planner, "legacy-compaction-worker", "idle");
+  } finally {
+    process.argv[1] = originalHostEntry;
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
 test("sessions publish automatic lifecycle status", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, cleanup } = await setupClients();
   const harness = createExtensionHarness("status-worker", { hasUI: true });
+  const hostPackageDir = path.join(sharedHomeDir, "compaction-host", "node_modules", "@earendil-works", "pi-coding-agent");
+  mkdirSync(hostPackageDir, { recursive: true });
+  writeFileSync(path.join(hostPackageDir, "package.json"), JSON.stringify({
+    name: "@earendil-works/pi-coding-agent",
+    version: "0.85.1",
+  }));
+  const originalHostEntry = process.argv[1];
 
   try {
-    piIntercomExtension(harness.pi as never);
+    process.argv[1] = path.join(hostPackageDir, "dist", "cli.js");
+    try {
+      piIntercomExtension(harness.pi as never);
+    } finally {
+      process.argv[1] = originalHostEntry;
+    }
     await harness.emitLifecycle("session_start");
 
+    await waitForSessionStatus(planner, "status-worker", "idle");
+
+    const idleCompaction = new AbortController();
+    await harness.emitLifecycle("session_before_compact", { signal: idleCompaction.signal, reason: "manual" });
+    await waitForSessionStatus(planner, "status-worker", "compacting");
+    await harness.emitLifecycle("session_compact", { reason: "manual" });
     await waitForSessionStatus(planner, "status-worker", "idle");
 
     const freshEventContext = {
@@ -1914,7 +2374,18 @@ test("sessions publish automatic lifecycle status", { concurrency: false }, asyn
     await harness.emitLifecycle("agent_start");
     await waitForSessionStatus(planner, "status-worker", "thinking");
 
+    const failedCompaction = new AbortController();
+    await harness.emitLifecycle("session_before_compact", { signal: failedCompaction.signal, reason: "threshold" });
+    await waitForSessionStatus(planner, "status-worker", "compacting");
+    await harness.emitLifecycle("session_compact_failed", { reason: "threshold", errorMessage: "summary failed" });
+    await waitForSessionStatus(planner, "status-worker", "thinking");
+
     await harness.emitLifecycle("tool_execution_start", { toolCallId: "tool-1", toolName: "bash" });
+    await waitForSessionStatus(planner, "status-worker", "tool:bash");
+    const toolCompaction = new AbortController();
+    await harness.emitLifecycle("session_before_compact", { signal: toolCompaction.signal, reason: "overflow" });
+    await waitForSessionStatus(planner, "status-worker", "compacting");
+    toolCompaction.abort();
     await waitForSessionStatus(planner, "status-worker", "tool:bash");
     await harness.emitLifecycle("tool_execution_start", { toolCallId: "tool-2", toolName: "read" });
 

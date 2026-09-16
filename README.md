@@ -4,7 +4,7 @@
 
 # Pi Intercom
 
-Direct 1:1 messaging between pi sessions on the same machine. Send context, findings, or requests from one session to another — whether you're driving the conversation or letting agents coordinate.
+Targeted messaging between pi sessions on the same machine. Send context, findings, or requests to one session or a deliberate group — whether you're driving the conversation or letting agents coordinate.
 
 ```text
 User flow: press Alt+M or run /intercom to pick a session and send a message
@@ -18,13 +18,13 @@ Sometimes you're running multiple pi sessions — one researching, one executing
 - **Agent collaboration** — An agent can reach out to another session when it needs help or wants to share results
 - **Session awareness** — See what other pi sessions are running and their current status
 
-Unlike pi-messenger (a shared chat room for multi-agent swarms), pi-intercom is for targeted 1:1 communication where you pick the recipient.
+Unlike pi-messenger (a shared chat room for multi-agent swarms), pi-intercom is optimized for targeted communication where you pick the recipients. It can send one message independently to several explicit sessions and has a deliberately discouraged machine-wide broadcast for the rare notice that genuinely concerns every visible live peer.
 
 Pi-intercom also integrates well with [pi-subagents](https://github.com/nicobailon/pi-subagents): delegated child agents get a child-only `contact_supervisor` tool when `pi-subagents` supplies bridge metadata. Use `reason: "need_decision"` for blocking clarification, `reason: "interview_request"` for multiple structured supervisor answers, and `reason: "progress_update"` for meaningful plan-changing updates. Normal sessions only see the regular `intercom` tool.
 
 ## In One Minute
 
-Each pi session that has `pi-intercom` loaded and enabled connects to a tiny local broker over a local IPC transport. The broker keeps track of connected sessions and routes direct messages to the one you target by name or session ID. The extension gives you both a tool (`intercom`) and a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately by default, and are also stored in Pi session history as extension entries. If you want a stricter local trust posture, `inboundTrigger` can reduce or disable auto-triggering.
+Each pi session that has `pi-intercom` loaded and enabled connects to a tiny local broker over a local IPC transport. The broker keeps track of connected sessions and routes an independent direct message to each session you target by name or session ID. The extension gives you both a tool (`intercom`) and a small overlay UI (`/intercom` or `Alt+M`). Incoming messages are rendered inline inside the recipient session, can trigger a turn immediately by default, and are also stored in Pi session history as extension entries. If you want a stricter local trust posture, `inboundTrigger` can reduce or disable auto-triggering.
 
 ## Install this ACL fork
 
@@ -32,7 +32,7 @@ If upstream `pi-intercom` is already installed, remove it first so Pi does not l
 
 ```bash
 pi remove npm:pi-intercom
-pi install git:github.com/Scott-Meyer/pi-intercom-subagent-acl@v0.13.0-acl.5
+pi install git:github.com/Scott-Meyer/pi-intercom-subagent-acl@v0.13.0-acl.6
 ```
 
 For a fresh install, only the second command is needed. Then restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-intercom` skill for common coordination patterns.
@@ -114,6 +114,14 @@ intercom({ action: "list-cwd" })
 // Send a message
 intercom({ action: "send", to: "research", message: "Check if UserService.validate() handles null" })
 // → Message sent to research
+
+// Send independently to a deliberate set of peers
+intercom({
+  action: "send",
+  targets: ["api-worker", "ui-worker"],
+  message: "The shared contract changed; pull the latest types before continuing."
+})
+// → Message accepted for 2 of 2 targets.
 
 // Send to a visible peer session in another codebase, opening a Herdr project pane if needed
 intercom({
@@ -362,12 +370,13 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `action` | string | `"list"`, `"list-cwd"`, `"send"`, `"ask"`, `"reply"`, `"pending"`, `"status"`, or `"cancel"` |
-| `to` | string | Target session name or ID. Without `cwd`, send/ask resolve it globally. With `cwd`, send/ask require the target to be in that directory. Also disambiguates reply. |
-| `message` | string | Message text (for send/ask/reply) |
+| `action` | string | `"list"`, `"list-cwd"`, `"send"`, `"broadcast"`, `"ask"`, `"reply"`, `"pending"`, `"status"`, `"cancel"`, or `"advertise"` |
+| `to` | string | One target session name or ID. Without `cwd`, send/ask resolve it globally. With `cwd`, send/ask require the target to be in that directory. Also disambiguates reply. |
+| `targets` | string[] | For `send`, 1–32 explicit session names or IDs. Each recipient gets an independent message and delivery outcome. Cannot be combined with `to`, cwd targeting, or conversation-specific reply/retry/supersede fields. |
+| `message` | string | Message text (for send/broadcast/ask/reply) |
 | `attachments` | array | Optional `file`, `snippet`, or `context` attachments |
 | `replyTo` | string | Optional message ID for threading or replying to an `ask` |
-| `messageId` | string | Optional explicit message ID for send/ask, or required message ID for `cancel` |
+| `messageId` | string | Message ID to cancel; required by `cancel` and rejected by every other action |
 | `supersedes` | string | Optional previous message ID that this send/ask explicitly replaces |
 | `retryOf` | string | Optional previous message ID that this send/ask explicitly retries |
 | `cwd` | string | Working directory filter for `list-cwd`. For send/ask, scopes target lookup to that directory; without `to`, selects the sole live peer there. |
@@ -392,9 +401,11 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 ### intercom actions
 
-**`list`** — Returns the current session plus other active intercom-connected sessions with name, short ID, working directory, model, and live status. Status is derived automatically from Pi lifecycle events: `idle`, `thinking`, or `tool:<name>`.
+**`list`** — Returns the current session plus other active intercom-connected sessions with name, short ID, working directory, model, and live status. Status is derived automatically from Pi lifecycle events: `idle`, `thinking`, `tool:<name>`, or, on supported hosts, `compacting`. Compaction status is passive presence—it does not wake or steer peer agents.
 
-**`send`** — Sends a message to the specified session and returns immediately after delivery. If the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply `send` to a different target is rejected so a guessed parent/root CWD cannot receive an accidental reply. Zero or multiple pending-ask matches remain unthreaded sends outside the active ask turn. Set `confirmSend: true` to confirm ordinary and inferred sends. A caller-supplied `replyTo` skips confirmation. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
+**`send`** — Sends a message to one session with `to`, or independently to 1–32 explicit sessions with `targets`. Every multi-target recipient gets a distinct message ID, delivery record, receipt route, and outcome; aliases that resolve to the same live session are delivered only once, and one failure does not roll back successful recipients. Multi-target sends are intentionally unthreaded, so they reject `replyTo`, `supersedes`, and `retryOf`. Singular sends retain reply inference: if the destination has exactly one pending inbound ask, `send` infers the message is its answer and returns `Reply sent to <target> (inferred from pending ask)`. During a turn triggered by an inbound ask, a non-reply send to a different target—and every batch send—is rejected so the answer cannot be misdirected. Set `confirmSend: true` to confirm ordinary sends once before delivery; multi-target confirmation displays and pins the resolved endpoint snapshot so an alias cannot rebind to a different recipient after approval. `to` alone resolves globally across all live sessions. `cwd` alone targets the sole live peer in that directory. `to` plus `cwd` requires that peer to be in the directory. With `openProjectPaneIfMissing: true`, pi-intercom opens a visible Herdr project pane, starts Pi there, waits for that session to register, then delivers the message through normal intercom routing.
+
+**`broadcast`** — Sends independent messages to every currently connected session visible through the caller's existing scope and subagent ACL, excluding the sender. The recipient set is a live roster snapshot; disconnected sessions are not queued, and sessions joining afterward are not included. Broadcast interrupts every recipient, so prefer `send` with `to` or `targets` whenever you know who needs the information. Broadcast rejects targeting and conversation-specific fields.
 
 **`ask`** — Requires a currently connected recipient, sends a message, and waits for the recipient to reply (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). A disconnected target fails immediately rather than queueing a blocking request. The reply is returned as the tool result. No confirmation dialog. Only one pending `ask` is allowed per session at a time. Use this when the agent needs the answer to continue working. The same `to`, `cwd`, and `openProjectPaneIfMissing` targeting rules apply.
 
@@ -453,7 +464,7 @@ Custom broker commands are trusted local configuration: anyone who can edit this
 }
 ```
 
-Pi-intercom publishes live session status automatically. Sessions register as `idle`, switch to `thinking` while the agent is running, show `tool:<name>` during tool execution, and return to `idle` on agent completion. If `status` is set in config, it is appended as context instead of replacing the lifecycle status.
+Pi-intercom publishes live session status automatically. Sessions register as `idle`, switch to `thinking` while the agent is running, and show `tool:<name>` during tool execution. On hosts that report unsuccessful compactions to extensions (Earendil Pi 0.85+), they also publish `compacting` from pre-compaction until success, failure, or abort; the underlying thinking/tool/idle state resumes afterward. Older hosts leave compaction presence disabled rather than risk stale status after an unreported failure. This is passive roster presence and never wakes peer agents. If `status` is set in config, it is appended as context instead of replacing the lifecycle status.
 
 Set `PI_INTERCOM_SCOPE_ID` before starting Pi to opt a session into an opaque broker routing scope. The value is trimmed. Empty values are treated as unscoped. A scoped session can list, address by full ID, name, ID prefix, or cwd, receive presence and session lifecycle events, recover queued mailbox messages, and use extension-channel owner, publish, and state traffic only with sessions that registered the exact same scope. Scoped sessions and unscoped sessions do not cross this boundary. Existing unscoped behavior is unchanged when the variable is not set.
 
@@ -584,13 +595,13 @@ Supported `config.json` keys include `stableId` for restart-stable addressing, `
 
 | Aspect | pi-intercom | pi-messenger |
 |--------|-------------|--------------|
-| **Model** | Direct 1:1 messaging | Shared chat room |
+| **Model** | Targeted messaging, with explicit groups and opt-in broadcast | Shared chat room |
 | **Primary use** | User orchestrating sessions | Autonomous agent coordination |
 | **Discovery** | Broker-based (real-time) | File-based registry |
-| **Messages** | Private, session-to-session | Broadcast to all agents |
+| **Messages** | Private by default; recipients are chosen for each send | Broadcast to all agents |
 | **Persistence** | In Pi session history | Shared coordination files |
 
-Use pi-messenger for multi-agent swarms working on a shared task. Use pi-intercom when you want to manually coordinate your own sessions or have one agent reach out to another specific session.
+Use pi-messenger for multi-agent swarms working in a shared room. Use pi-intercom when you want to coordinate particular sessions; its machine-wide broadcast is an escape hatch, not the default communication model.
 
 ## File Structure
 

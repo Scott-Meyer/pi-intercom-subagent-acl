@@ -2,7 +2,7 @@ import type { AgentSessionEvent, ExtensionAPI, ExtensionContext } from "@marioze
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@mariozechner/pi-tui";
-import { defineTool, sessionInfoChangesReachExtensions, StringEnum } from "./pi-compat.ts";
+import { defineTool, sessionCompactFailuresReachExtensions, sessionInfoChangesReachExtensions, StringEnum } from "./pi-compat.ts";
 import { IntercomClient, type SendResult } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
@@ -40,6 +40,9 @@ const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
 const INBOUND_MESSAGE_DEDUPE_MAX = 1000;
 const INBOUND_MESSAGE_DEDUPE_RETENTION_MS = 60 * 60 * 1000;
+const MAX_EXPLICIT_SEND_TARGETS = 32;
+const SEND_FANOUT_CONCURRENCY = 8;
+const COMPACTION_STATUS_FAILSAFE_MS = 15 * 60 * 1000;
 const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "session";
 const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
 const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
@@ -76,6 +79,26 @@ interface DeliveryTarget {
 interface OutboxTarget {
   id: string;
   label: string;
+}
+
+interface BatchDeliveryTarget {
+  requested: string;
+  label: string;
+  session?: SessionInfo;
+  resolutionError?: string;
+  resolutionCode?: string;
+}
+
+interface BatchDeliveryOutcome {
+  to: string;
+  targetId?: string;
+  messageId?: string;
+  delivered: boolean;
+  delivery: "socket_delivered" | "queued" | "failed" | "unknown";
+  retryable: boolean;
+  outcomeKnown: boolean;
+  code?: string;
+  reason?: string;
 }
 
 interface OutboxRequestTrace {
@@ -130,6 +153,69 @@ function deliveryDetails(result: SendResult): Record<string, unknown> {
     outcomeKnown: result.outcomeKnown,
     ...(result.code ? { code: result.code } : {}),
     ...(result.reason ? { reason: result.reason } : {}),
+  };
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  mapper: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (nextIndex < values.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(values[index]!, index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function batchSendToolResult(options: {
+  batchId: string;
+  outcomes: BatchDeliveryOutcome[];
+  requestedTargetCount: number;
+  duplicateCount: number;
+  broadcast: boolean;
+}) {
+  const acceptedCount = options.outcomes.filter((outcome) => outcome.delivered).length;
+  const failedCount = options.outcomes.length - acceptedCount;
+  const noun = options.broadcast
+    ? `visible session${options.outcomes.length === 1 ? "" : "s"}`
+    : `target${options.outcomes.length === 1 ? "" : "s"}`;
+  const heading = options.broadcast
+    ? `Broadcast accepted for ${acceptedCount} of ${options.outcomes.length} ${noun}.`
+    : `Message accepted for ${acceptedCount} of ${options.outcomes.length} ${noun}.`;
+  const lines = options.outcomes.map((outcome) => {
+    if (outcome.delivered) {
+      const state = outcome.delivery === "queued" ? "queued for offline delivery (up to 24h while this broker remains running)" : "sent";
+      return `- ✓ ${outcome.to}: ${state}${outcome.messageId ? ` (${outcome.messageId.slice(0, 8)})` : ""}`;
+    }
+    return `- ✗ ${outcome.to}: ${outcome.reason ?? "delivery failed"}`;
+  });
+  if (options.duplicateCount > 0) {
+    lines.push(`- Skipped ${options.duplicateCount} duplicate target${options.duplicateCount === 1 ? "" : "s"}.`);
+  }
+  if (options.broadcast) {
+    lines.push("", "Broadcasts interrupt every visible peer. Prefer `send` with `to` or `targets` when you know who needs the message.");
+  }
+  return {
+    content: [{ type: "text" as const, text: `${heading}\n${lines.join("\n")}` }],
+    details: {
+      ...(acceptedCount === 0 ? { error: true } : {}),
+      batch: true,
+      broadcast: options.broadcast,
+      batchId: options.batchId,
+      requestedTargetCount: options.requestedTargetCount,
+      recipientCount: options.outcomes.length,
+      acceptedCount,
+      failedCount,
+      duplicateCount: options.duplicateCount,
+      allAccepted: failedCount === 0,
+      outcomes: options.outcomes,
+    },
   };
 }
 
@@ -579,6 +665,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: IntercomClient | null = null;
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
+  const compactionPresenceSupported = sessionCompactFailuresReachExtensions();
   const localExtensions = new Map<string, {
     registration: IntercomExtensionRegistration;
     channel: IntercomExtensionChannel;
@@ -607,6 +694,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let runtimeStarted = false;
   let runtimeGeneration = 0;
   let agentRunning = false;
+  let compactionRunning = false;
+  let compactionStatusGeneration = 0;
+  let compactionStatusTimer: NodeJS.Timeout | null = null;
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
 
@@ -729,6 +819,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     clearInterval(sessionNameCompatibilityTimer);
     sessionNameCompatibilityTimer = null;
   }
+  function clearCompactionStatusTimer(): void {
+    if (!compactionStatusTimer) return;
+    clearTimeout(compactionStatusTimer);
+    compactionStatusTimer = null;
+  }
+  function resetCompactionStatus(): void {
+    compactionStatusGeneration += 1;
+    compactionRunning = false;
+    clearCompactionStatusTimer();
+  }
   function startSessionNameCompatibilityTimer(): void {
     clearSessionNameCompatibilityTimer();
     observedSessionName = pi.getSessionName()?.trim() || undefined;
@@ -785,7 +885,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function currentStatus(): string {
     const activeToolName = activeTools.values().next().value;
-    const lifecycleStatus = activeToolName ? `tool:${activeToolName}` : agentRunning ? "thinking" : "idle";
+    const lifecycleStatus = compactionRunning
+      ? "compacting"
+      : activeToolName
+        ? `tool:${activeToolName}`
+        : agentRunning ? "thinking" : "idle";
     return config.status ? `${lifecycleStatus} · ${config.status}` : lifecycleStatus;
   }
   function emitLocalExtensionEvent(namespace: string, event: IntercomExtensionEvent): void {
@@ -958,6 +1062,37 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     // context% rides the status heartbeat so peers see live usage at turn boundaries.
     client.updatePresence({ status: currentStatus(), ...currentContextUsage() });
+  }
+  function finishCompactionStatus(ctx: ExtensionContext, expectedGeneration?: number): void {
+    if (!getLiveContext(ctx)) {
+      return;
+    }
+    if (expectedGeneration !== undefined && expectedGeneration !== compactionStatusGeneration) {
+      return;
+    }
+    resetCompactionStatus();
+    syncPresenceStatus();
+  }
+  function beginCompactionStatus(ctx: ExtensionContext, signal?: AbortSignal): void {
+    if (!compactionPresenceSupported || !getLiveContext(ctx)) {
+      return;
+    }
+    resetCompactionStatus();
+    compactionRunning = true;
+    const generation = compactionStatusGeneration;
+    compactionStatusTimer = setTimeout(() => {
+      if (generation !== compactionStatusGeneration || !compactionRunning) {
+        return;
+      }
+      finishCompactionStatus(ctx, generation);
+    }, COMPACTION_STATUS_FAILSAFE_MS);
+    compactionStatusTimer.unref?.();
+    if (signal?.aborted) {
+      finishCompactionStatus(ctx, generation);
+      return;
+    }
+    signal?.addEventListener("abort", () => finishCompactionStatus(ctx, generation), { once: true });
+    syncPresenceStatus();
   }
   function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: IntercomClient): boolean {
     const targets = new Set<string>();
@@ -1487,11 +1622,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     reconnectPromiseGeneration = generationAtStart;
     return nextReconnectPromise;
   }
-  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
-    const sessions = await activeClient.listSessions();
+  function resolveSessionFromRoster(sessions: SessionInfo[], nameOrId: string): SessionInfo | null {
     const byId = sessions.find(s => s.id === nameOrId);
     if (byId) {
-      return byId.id;
+      return byId;
     }
     const lowerName = nameOrId.toLowerCase();
     const byName = sessions.filter(s => s.name?.toLowerCase() === lowerName);
@@ -1501,17 +1635,20 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       throw new Error(`Multiple sessions named "${nameOrId}" are connected. Address one by the id shown in parentheses by "list" (${ids}).`);
     }
     if (byName.length === 1) {
-      return byName[0]!.id;
+      return byName[0]!;
     }
 
     const byIdPrefix = sessions.filter(s => s.id.startsWith(nameOrId));
     if (byIdPrefix.length === 1) {
-      return byIdPrefix[0]!.id;
+      return byIdPrefix[0]!;
     }
     if (byIdPrefix.length > 1) {
       throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
     }
     return null;
+  }
+  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
+    return resolveSessionFromRoster(await activeClient.listSessions(), nameOrId)?.id ?? null;
   }
   async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
     if (metadata.orchestratorSessionId) {
@@ -1565,6 +1702,109 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       signal: options.signal,
     });
     return { id: session.id, label: session.name || session.id, projectPane };
+  }
+  async function sendBatchMessages(
+    activeClient: IntercomClient,
+    targets: BatchDeliveryTarget[],
+    options: {
+      message: string;
+      attachments?: Attachment[];
+      batchId: string;
+      broadcast: boolean;
+      signal?: AbortSignal;
+      allowRosterMailboxFallback?: boolean;
+    },
+  ): Promise<BatchDeliveryOutcome[]> {
+    return mapWithConcurrency(targets, SEND_FANOUT_CONCURRENCY, async (target) => {
+      if (options.signal?.aborted) {
+        return {
+          to: target.label,
+          ...(target.session ? { targetId: target.session.id } : {}),
+          delivered: false,
+          delivery: "failed",
+          retryable: true,
+          outcomeKnown: true,
+          code: "E_CANCELLED",
+          reason: "Send cancelled before this recipient was attempted",
+        };
+      }
+      if (target.resolutionError) {
+        return {
+          to: target.label,
+          delivered: false,
+          delivery: "failed",
+          retryable: false,
+          outcomeKnown: true,
+          code: target.resolutionCode ?? "E_TARGET_RESOLUTION",
+          reason: target.resolutionError,
+        };
+      }
+      try {
+        const sendOptions = { text: options.message, attachments: options.attachments, signal: options.signal };
+        let result = target.session
+          ? await activeClient.sendToSession(target.session, sendOptions)
+          : await activeClient.send(target.requested, sendOptions);
+        // Exact delivery to a roster peer can lose a disconnect race before the
+        // frame reaches the broker. For an unconfirmed explicit group, retry
+        // that known not-delivered outcome through ordinary ID routing so the
+        // existing disconnected mailbox can accept it. Confirmed sends preserve
+        // their displayed endpoint snapshot; broadcast is live-only. Neither may
+        // turn a departed roster entry into mail for a rebound identity.
+        if (
+          !options.broadcast
+          && options.allowRosterMailboxFallback !== false
+          && target.session
+          && result.code === "E_TARGET_NOT_FOUND"
+        ) {
+          if (options.signal?.aborted) {
+            return {
+              to: target.label,
+              targetId: target.session.id,
+              messageId: result.id,
+              delivered: false,
+              delivery: "failed",
+              retryable: true,
+              outcomeKnown: true,
+              code: "E_CANCELLED",
+              reason: "Send cancelled before offline delivery was attempted",
+            };
+          }
+          result = await activeClient.send(target.session.id, sendOptions);
+        }
+        const outcome: BatchDeliveryOutcome = {
+          to: target.label,
+          ...(target.session ? { targetId: target.session.id } : {}),
+          messageId: result.id,
+          delivered: result.delivered,
+          delivery: result.delivery,
+          retryable: result.retryable,
+          outcomeKnown: result.outcomeKnown,
+          ...(result.code ? { code: result.code } : {}),
+          ...(result.reason ? { reason: result.reason } : {}),
+        };
+        if (result.delivered) {
+          pi.appendEntry("intercom_sent", {
+            to: target.label,
+            message: { text: options.message, attachments: options.attachments },
+            messageId: result.id,
+            batchId: options.batchId,
+            broadcast: options.broadcast,
+            timestamp: Date.now(),
+          });
+        }
+        return outcome;
+      } catch (error) {
+        return {
+          to: target.label,
+          ...(target.session ? { targetId: target.session.id } : {}),
+          delivered: false,
+          delivery: "unknown",
+          retryable: true,
+          outcomeKnown: false,
+          reason: getErrorMessage(error),
+        };
+      }
+    });
   }
   function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): void {
     const liveContext = getLiveContext();
@@ -1621,6 +1861,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     sessionStartedAt = Date.now();
     agentRunning = false;
     activeTools.clear();
+    resetCompactionStatus();
     startSessionNameCompatibilityTimer();
     const startupGeneration = runtimeGeneration;
     startupConnectTimer = setTimeout(() => {
@@ -1758,6 +1999,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     replyTracker.reset();
     agentRunning = false;
     activeTools.clear();
+    resetCompactionStatus();
     if (client) {
       await client.disconnect();
       client = null;
@@ -1780,6 +2022,23 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     observedSessionName = event.name?.trim() || undefined;
     syncPresenceIdentity(currentSessionId);
+  });
+  pi.on("session_before_compact", (event, ctx) => {
+    beginCompactionStatus(ctx, event.signal);
+  });
+  pi.on("session_compact", (_event, ctx) => {
+    finishCompactionStatus(ctx);
+  });
+  // Earendil Pi 0.85+ reports aborts and failures explicitly. Older hosts only
+  // declare before/success, so compaction presence stays disabled there rather
+  // than risking stale status after an ordinary provider failure. Registering
+  // the additional event remains harmless on those hosts.
+  const onSessionCompactFailed = pi.on as unknown as (
+    event: "session_compact_failed",
+    handler: (event: unknown, ctx: ExtensionContext) => void,
+  ) => void;
+  onSessionCompactFailed("session_compact_failed", (_event, ctx) => {
+    finishCompactionStatus(ctx);
   });
   pi.on("turn_end", () => {
     if (!getLiveContext()) {
@@ -2155,7 +2414,9 @@ Usage:
   intercom({ action: "list" })                    → List active sessions
   intercom({ action: "list-cwd" })                → List sessions in the current working directory
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
-  intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
+  intercom({ action: "send", to: "name-or-id", message: "..." })  → Send to one session
+  intercom({ action: "send", targets: ["name-or-id", "other-id"], message: "..." }) → Send independently to several explicit sessions
+  intercom({ action: "broadcast", message: "..." }) → Send to every visible live session on this machine; avoid this when explicit targets are known
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
@@ -2164,17 +2425,25 @@ Usage:
   intercom({ action: "status" })                  → Show connection status
   intercom({ action: "advertise", name: "my-nickname" })  → Subagent-only: self-promote to full main-level visibility under a chosen name`,
     promptSnippet:
-      "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
+      "Use to coordinate with other local pi sessions: list peers, send targeted updates, ask for help, or check intercom connectivity.",
+    promptGuidelines: [
+      "Prefer targeted intercom sends. Machine-wide broadcast interrupts every visible live session and is appropriate only when each one genuinely needs the same information.",
+    ],
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel", "advertise"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', 'cancel', or 'advertise'",
+      action: StringEnum(["list", "list-cwd", "send", "broadcast", "ask", "reply", "pending", "status", "cancel", "advertise"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'broadcast', 'ask', 'reply', 'pending', 'status', 'cancel', or 'advertise'",
       }),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "One target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+      })),
+      targets: Type.Optional(Type.Array(Type.String(), {
+        minItems: 1,
+        maxItems: MAX_EXPLICIT_SEND_TARGETS,
+        description: "For 'send', several explicit target names or IDs. Each receives an independent message and outcome. Cannot be combined with 'to', cwd targeting, replyTo, supersedes, or retryOf.",
       })),
       message: Type.Optional(Type.String({
-        description: "Message to send (for 'send', 'ask', or 'reply' action)",
+        description: "Message to send (for 'send', 'broadcast', 'ask', or 'reply' action)",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
         type: StringEnum(["file", "snippet", "context"] as const),
@@ -2221,7 +2490,14 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, name } = params;
+      const { action, to, targets, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, name } = params;
+
+      if (messageId && action !== "cancel") {
+        return {
+          content: [{ type: "text", text: "messageId is only accepted by the cancel action; sends and asks always create a new message ID." }],
+          details: { error: true },
+        };
+      }
 
       switch (action) {
         case "advertise": {
@@ -2394,7 +2670,223 @@ Usage:
           }
         }
 
+        case "broadcast": {
+          if (!message) {
+            return {
+              content: [{ type: "text", text: "Missing 'message' parameter" }],
+              details: { error: true },
+            };
+          }
+          if (to || targets || cwd || openProjectPaneIfMissing) {
+            return {
+              content: [{ type: "text", text: "broadcast does not accept 'to', 'targets', 'cwd', or openProjectPaneIfMissing; it uses the current visible live-session roster." }],
+              details: { error: true },
+            };
+          }
+          if (replyTo || supersedes || retryOf) {
+            return {
+              content: [{ type: "text", text: "broadcast cannot use replyTo, supersedes, or retryOf because each recipient receives an independent message." }],
+              details: { error: true },
+            };
+          }
+          const activeReplyTarget = replyTracker.getActiveReplyTarget();
+          if (activeReplyTarget) {
+            const senderLabel = activeReplyTarget.from.name || activeReplyTarget.from.id;
+            return {
+              content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Reply to that ask before broadcasting so the answer is not lost in an unrelated machine-wide notice.` }],
+              details: { error: true, replyTo: activeReplyTarget.message.id },
+            };
+          }
+          try {
+            const sessions = await connectedClient.listSessions();
+            const currentSessionId = connectedClient.sessionId;
+            const prefixes = sessionIdPrefixes(sessions);
+            const recipients: BatchDeliveryTarget[] = sessions
+              .filter((session) => session.id !== currentSessionId)
+              .sort((left, right) => left.id.localeCompare(right.id))
+              .map((session) => ({
+                requested: session.id,
+                label: session.name
+                  ? `${session.name} (${prefixes.get(session.id) ?? session.id.slice(0, 8)})`
+                  : prefixes.get(session.id) ?? session.id,
+                session,
+              }));
+            if (recipients.length === 0) {
+              return {
+                content: [{ type: "text", text: "No other visible live sessions are connected; nothing was broadcast." }],
+                details: { error: true, broadcast: true, recipientCount: 0 },
+              };
+            }
+            const attachmentText = attachments?.length ? formatAttachments(attachments) : "";
+            if (config.confirmSend && ctx.hasUI) {
+              const confirmed = await ctx.ui.confirm(
+                "Broadcast message",
+                `Broadcast to ${recipients.length} visible live session${recipients.length === 1 ? "" : "s"}:\n\n${message}${attachmentText}`,
+              );
+              if (!confirmed) {
+                return {
+                  content: [{ type: "text", text: "Broadcast cancelled by user" }],
+                  details: {},
+                };
+              }
+            }
+            const batchId = randomUUID();
+            const outcomes = await sendBatchMessages(connectedClient, recipients, {
+              message,
+              attachments,
+              batchId,
+              broadcast: true,
+              signal: _signal,
+            });
+            return batchSendToolResult({
+              batchId,
+              outcomes,
+              requestedTargetCount: recipients.length,
+              duplicateCount: 0,
+              broadcast: true,
+            });
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: `Failed to broadcast: ${getErrorMessage(error)}` }],
+              details: { error: true },
+            };
+          }
+        }
+
         case "send": {
+          if (to && targets) {
+            return {
+              content: [{ type: "text", text: "Use either 'to' or 'targets' for send, not both." }],
+              details: { error: true },
+            };
+          }
+          if (targets) {
+            if (!message) {
+              return {
+                content: [{ type: "text", text: "Missing 'message' parameter" }],
+                details: { error: true },
+              };
+            }
+            if (cwd || openProjectPaneIfMissing) {
+              return {
+                content: [{ type: "text", text: "Multi-target send does not accept cwd or openProjectPaneIfMissing; identify each live session explicitly." }],
+                details: { error: true },
+              };
+            }
+            if (replyTo || supersedes || retryOf) {
+              return {
+                content: [{ type: "text", text: "Multi-target send cannot use replyTo, supersedes, or retryOf because each recipient receives an independent message." }],
+                details: { error: true },
+              };
+            }
+            if (targets.length === 0 || targets.length > MAX_EXPLICIT_SEND_TARGETS || targets.some((target) => !target.trim())) {
+              return {
+                content: [{ type: "text", text: `targets must contain 1-${MAX_EXPLICIT_SEND_TARGETS} non-empty session names or IDs.` }],
+                details: { error: true },
+              };
+            }
+            const activeReplyTarget = replyTracker.getActiveReplyTarget();
+            if (activeReplyTarget) {
+              const senderLabel = activeReplyTarget.from.name || activeReplyTarget.from.id;
+              return {
+                content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Reply to that ask before sending an unthreaded multi-target message.` }],
+                details: { error: true, replyTo: activeReplyTarget.message.id },
+              };
+            }
+            try {
+              const requestedTargets = targets.map((target) => target.trim());
+              const sessions = await connectedClient.listSessions();
+              const recipients: BatchDeliveryTarget[] = [];
+              const seenSessionIds = new Set<string>();
+              const seenUnresolved = new Set<string>();
+              let duplicateCount = 0;
+              for (const requested of requestedTargets) {
+                try {
+                  const session = resolveSessionFromRoster(sessions, requested);
+                  if (session) {
+                    if (seenSessionIds.has(session.id)) {
+                      duplicateCount += 1;
+                      continue;
+                    }
+                    seenSessionIds.add(session.id);
+                    recipients.push({
+                      requested,
+                      label: requested,
+                      session,
+                      ...(session.id === connectedClient.sessionId
+                        ? { resolutionError: "Cannot message the current session", resolutionCode: "E_SELF_TARGET" }
+                        : {}),
+                    });
+                    continue;
+                  }
+                  if (seenUnresolved.has(requested)) {
+                    duplicateCount += 1;
+                    continue;
+                  }
+                  seenUnresolved.add(requested);
+                  recipients.push({ requested, label: requested });
+                } catch (error) {
+                  recipients.push({
+                    requested,
+                    label: requested,
+                    resolutionError: getErrorMessage(error),
+                    resolutionCode: "E_TARGET_RESOLUTION",
+                  });
+                }
+              }
+
+              let confirmedSnapshot = false;
+              if (config.confirmSend && ctx.hasUI) {
+                const attachmentText = attachments?.length ? formatAttachments(attachments) : "";
+                const recipientLines = recipients.map((recipient) => {
+                  if (recipient.session) {
+                    const name = recipient.session.name ? `${recipient.session.name} ` : "";
+                    return `- ${recipient.requested} → ${name}(${recipient.session.id})`;
+                  }
+                  if (recipient.resolutionError) {
+                    return `- ${recipient.requested} → will fail: ${recipient.resolutionError}`;
+                  }
+                  return `- ${recipient.requested} → not currently live; ordinary offline delivery may apply`;
+                });
+                if (duplicateCount > 0) {
+                  recipientLines.push(`- ${duplicateCount} duplicate target${duplicateCount === 1 ? "" : "s"} omitted`);
+                }
+                const confirmed = await ctx.ui.confirm(
+                  "Send message",
+                  `Send independently to this resolved recipient snapshot:\n${recipientLines.join("\n")}\n\n${message}${attachmentText}`,
+                );
+                if (!confirmed) {
+                  return {
+                    content: [{ type: "text", text: "Message cancelled by user" }],
+                    details: {},
+                  };
+                }
+                confirmedSnapshot = true;
+              }
+
+              const batchId = randomUUID();
+              const outcomes = await sendBatchMessages(connectedClient, recipients, {
+                message,
+                attachments,
+                batchId,
+                broadcast: false,
+                signal: _signal,
+                allowRosterMailboxFallback: !confirmedSnapshot,
+              });
+              return batchSendToolResult({
+                batchId,
+                outcomes,
+                requestedTargetCount: requestedTargets.length,
+                duplicateCount,
+                broadcast: false,
+              });
+            } catch (error) {
+              return {
+                content: [{ type: "text", text: `Failed to send: ${getErrorMessage(error)}` }],
+                details: { error: true },
+              };
+            }
+          }
           if ((!to && !cwd) || !message) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
@@ -2501,6 +2993,12 @@ Usage:
         }
 
         case "ask": {
+          if (targets) {
+            return {
+              content: [{ type: "text", text: "ask accepts one recipient through 'to' or cwd targeting; use separate asks when each recipient needs to reply." }],
+              details: { error: true },
+            };
+          }
           if ((!to && !cwd) || !message) {
             return {
               content: [{ type: "text", text: "Missing 'to' or 'cwd', or missing 'message' parameter" }],
@@ -2632,6 +3130,12 @@ Usage:
         }
 
         case "reply": {
+          if (targets) {
+            return {
+              content: [{ type: "text", text: "reply accepts one pending conversation; 'targets' is only available for send." }],
+              details: { error: true },
+            };
+          }
           if (!message) {
             return {
               content: [{ type: "text", text: "Missing 'message' parameter" }],
@@ -2735,12 +3239,20 @@ Usage:
     renderCall(args, theme) {
       const action = typeof args.action === "string" ? args.action : "intercom";
       const target = typeof args.to === "string" && args.to.trim() ? args.to.trim() : undefined;
+      const targets = Array.isArray(args.targets)
+        ? args.targets.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+        : [];
       const messagePreview = previewText(args.message, 96);
       const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
       let text = theme.fg("toolTitle", theme.bold("intercom "));
-      text += theme.fg(action === "ask" ? "warning" : action === "reply" ? "success" : "accent", action);
+      text += theme.fg(action === "ask" || action === "broadcast" ? "warning" : action === "reply" ? "success" : "accent", action);
       if (target) {
         text += " " + theme.fg("muted", "→") + " " + theme.fg("accent", target);
+      } else if (targets.length > 0) {
+        const targetSummary = targets.length <= 3 ? targets.join(", ") : `${targets.slice(0, 3).join(", ")} +${targets.length - 3}`;
+        text += " " + theme.fg("muted", "→") + " " + theme.fg("accent", targetSummary);
+      } else if (action === "broadcast") {
+        text += " " + theme.fg("muted", "→ all visible live sessions");
       }
       if (attachmentCount > 0) {
         text += " " + theme.fg("dim", `(${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"})`);

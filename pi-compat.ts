@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { readFileSync } from "node:fs";
 import { Type, type TSchema, type TUnsafe } from "typebox";
 
 /**
@@ -38,4 +39,46 @@ export function StringEnum<T extends readonly string[]>(
 export function sessionInfoChangesReachExtensions(hostEntry = process.argv[1] ?? ""): boolean {
   const normalized = hostEntry.replaceAll("\\", "/");
   return normalized.includes("/@earendil-works/pi-coding-agent/");
+}
+
+function versionAtLeast(version: string, minimum: readonly [number, number, number]): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (!match) return false;
+  const actual = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (actual[index]! !== minimum[index]!) return actual[index]! > minimum[index]!;
+  }
+  return true;
+}
+
+function readEarendilHostVersion(hostEntry: string): string | undefined {
+  const normalized = hostEntry.replaceAll("\\", "/");
+  const marker = "/@earendil-works/pi-coding-agent/";
+  const markerIndex = normalized.lastIndexOf(marker);
+  if (markerIndex < 0) return undefined;
+  const packageRoot = normalized.slice(0, markerIndex + marker.length - 1);
+  try {
+    const manifest = JSON.parse(readFileSync(`${packageRoot}/package.json`, "utf8")) as { name?: unknown; version?: unknown };
+    return manifest.name === "@earendil-works/pi-coding-agent" && typeof manifest.version === "string"
+      ? manifest.version
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether the host reports unsuccessful compactions back to extensions.
+ * Earendil added `session_compact_failed` in 0.85.0. Older hosts only expose
+ * before/success, so publishing a temporary status there could remain stale
+ * after an ordinary provider failure.
+ */
+export function sessionCompactFailuresReachExtensions(
+  hostEntry = process.argv[1] ?? "",
+  hostVersion = readEarendilHostVersion(hostEntry),
+): boolean {
+  const normalized = hostEntry.replaceAll("\\", "/");
+  return normalized.includes("/@earendil-works/pi-coding-agent/")
+    && typeof hostVersion === "string"
+    && versionAtLeast(hostVersion, [0, 85, 0]);
 }

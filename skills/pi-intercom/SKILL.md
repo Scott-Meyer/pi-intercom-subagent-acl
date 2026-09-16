@@ -10,7 +10,7 @@ description: |
 # Pi Intercom Skill
 
 Use this skill when you need to coordinate work across multiple pi sessions
-running on the same machine. Pi-intercom enables direct 1:1 messaging between
+running on the same machine. Pi-intercom enables targeted messaging between
 sessions for delegation, context sharing, and collaborative workflows.
 
 When you are supervising `pi-subagents`, delegated child agents can escalate to
@@ -71,7 +71,7 @@ Before sending, verify who's connected:
 
 ```typescript
 intercom({ action: "list" })
-// → Shows all connected sessions with names, cwd, models, and live status (`idle`, `thinking`, `tool:<name>`)
+// → Shows all connected sessions with names, cwd, models, and live status (`idle`, `thinking`, `tool:<name>`, plus `compacting` on supported hosts)
 ```
 
 ### Pattern 3: Reply Naturally
@@ -92,18 +92,25 @@ intercom({ action: "reply", to: "planner", message: "Use exponential backoff sta
 
 `reply` still preserves exact threading under the hood by sending the response with the original `replyTo` value.
 
-### Pattern 4: Broadcast to Multiple Workers
+### Pattern 4: Send to Several Workers
 
-Send to multiple sessions in parallel:
+When a shared update genuinely concerns a known group, name those recipients explicitly. Each worker receives an independent message and delivery outcome:
 
 ```typescript
-const workers = ["worker-1", "worker-2", "worker-3"];
-const task = "Check for null pointer exceptions in your assigned files";
+intercom({
+  action: "send",
+  targets: ["worker-1", "worker-2", "worker-3"],
+  message: "The shared API contract changed; pull the latest types before continuing."
+});
+```
 
-// Fire-and-forget to all workers
-workers.forEach(w => 
-  intercom({ action: "send", to: w, message: task })
-);
+`broadcast` reaches every visible live session on the machine. That interruption is usually broader than the work requires, so prefer explicit `targets`. Broadcast is useful only for a rare machine-wide notice that every visible peer needs:
+
+```typescript
+intercom({
+  action: "broadcast",
+  message: "The shared local test service is restarting now; expect a brief outage."
+});
 ```
 
 ### Pattern 5: Send with Attachments
@@ -231,11 +238,12 @@ new visible project panes should go through the supervisor.
 
 | Action | Behavior | Use When |
 |--------|----------|----------|
-| `send` | Fire-and-forget; infers the sole pending ask as its reply | You don't need a response |
+| `send` | Fire-and-forget to one `to` or several explicit `targets`; singular sends can infer the sole pending ask as a reply | You don't need a response |
+| `broadcast` | Fire-and-forget to every visible live peer; deliberately broad and unthreaded | A rare machine-wide event genuinely affects every peer |
 | `ask` | Blocks until reply (10 min default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`) | You need an answer to continue |
 | `reply` | Responds to the active or pending inbound ask | You were asked something and need to answer naturally |
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
-| `list` | Returns all sessions with live status | You need to discover targets or choose an idle peer |
+| `list` | Returns all sessions with live status, including passive `compacting` presence on hosts that report compaction failures (Earendil Pi 0.85+) | You need to discover targets or understand whether a peer is temporarily compacting |
 | `status` | Returns your connection state | Troubleshooting |
 
 ## Visible Peer Sessions
@@ -266,11 +274,13 @@ if (result.isError && result.content[0].text.includes("Already waiting")) {
 
 ### `send` Behavior
 
-- **No timeout**: Message is delivered or fails immediately
-- **Sole pending ask inference**: If the destination has exactly one pending inbound ask, `send` attaches its `replyTo` and reports `Reply sent to <target> (inferred from pending ask)`
-- **Ambiguity stays unthreaded**: Zero or multiple matching asks leave the send as an ordinary message
-- **Confirmation dialogs**: If `confirmSend: true` in config, interactive sessions confirm ordinary and inferred sends
-- **Explicit replies skip confirmation**: A caller-supplied `replyTo` skips the dialog
+- **Singular or explicit group**: Use `to` for one recipient or `targets` for 1–32 known recipients
+- **Independent outcomes**: A multi-target send uses a distinct message ID and delivery result for every recipient; one failure does not undo successful sends
+- **Duplicate safety**: Different aliases resolving to the same live session deliver only once
+- **Sole pending ask inference**: Singular send attaches `replyTo` when the destination has exactly one pending inbound ask
+- **Group sends stay unthreaded**: Multi-target send and broadcast reject reply, supersede, and retry metadata
+- **Confirmation dialogs**: If `confirmSend: true` in config, interactive sessions resolve and display the exact recipient snapshot, then confirm once before sending the group
+- **Broadcast sparingly**: It interrupts every visible live peer and excludes disconnected sessions, so explicit targets are normally the better fit
 
 ## Best Practices
 

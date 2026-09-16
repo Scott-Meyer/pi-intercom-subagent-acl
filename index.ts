@@ -9,8 +9,8 @@ import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
-import { EXTENSION_BUS_FEATURE } from "./types.ts";
-import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceipt, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
+import { COMPACTION_AWARENESS_FEATURE, EXTENSION_BUS_FEATURE } from "./types.ts";
+import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceipt, MessageReceiptStatus, PeerCompactionNotice, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
   INTERCOM_EXTENSION_REGISTRY_READY_EVENT,
@@ -30,6 +30,7 @@ import { ReplyTracker } from "./reply-tracker.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
+import { formatPeerCompactionNotice } from "./compaction-awareness.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
 
 type SessionInfoChangedEvent = Extract<AgentSessionEvent, { type: "session_info_changed" }>;
@@ -99,6 +100,7 @@ interface BatchDeliveryOutcome {
   outcomeKnown: boolean;
   code?: string;
   reason?: string;
+  peerCompaction?: PeerCompactionNotice;
 }
 
 interface OutboxRequestTrace {
@@ -153,6 +155,7 @@ function deliveryDetails(result: SendResult): Record<string, unknown> {
     outcomeKnown: result.outcomeKnown,
     ...(result.code ? { code: result.code } : {}),
     ...(result.reason ? { reason: result.reason } : {}),
+    ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
   };
 }
 
@@ -191,7 +194,10 @@ function batchSendToolResult(options: {
   const lines = options.outcomes.map((outcome) => {
     if (outcome.delivered) {
       const state = outcome.delivery === "queued" ? "queued for offline delivery (up to 24h while this broker remains running)" : "sent";
-      return `- ✓ ${outcome.to}: ${state}${outcome.messageId ? ` (${outcome.messageId.slice(0, 8)})` : ""}`;
+      const deliveryLine = `- ✓ ${outcome.to}: ${state}${outcome.messageId ? ` (${outcome.messageId.slice(0, 8)})` : ""}`;
+      return outcome.peerCompaction
+        ? `${deliveryLine}\n  ${formatPeerCompactionNotice(outcome.to, outcome.peerCompaction, outcome.targetId)}`
+        : deliveryLine;
     }
     return `- ✗ ${outcome.to}: ${outcome.reason ?? "delivery failed"}`;
   });
@@ -697,6 +703,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let compactionRunning = false;
   let compactionStatusGeneration = 0;
   let compactionStatusTimer: NodeJS.Timeout | null = null;
+  const pendingCompactionReports = new Map<string, number>();
+  const pendingReceiverBaselineTokens = new Set<string>();
+  let compactionReportFlush: Promise<void> | null = null;
+  let compactionReportRetryTimer: NodeJS.Timeout | null = null;
+  let receiverBaselineRetryTimer: NodeJS.Timeout | null = null;
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
 
@@ -1073,6 +1084,101 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     resetCompactionStatus();
     syncPresenceStatus();
   }
+  function clearCompactionReportRetryTimer(): void {
+    if (!compactionReportRetryTimer) return;
+    clearTimeout(compactionReportRetryTimer);
+    compactionReportRetryTimer = null;
+  }
+
+  function scheduleCompactionReportRetry(expectedGeneration: number): void {
+    if (compactionReportRetryTimer || pendingCompactionReports.size === 0) return;
+    compactionReportRetryTimer = setTimeout(() => {
+      compactionReportRetryTimer = null;
+      if (expectedGeneration === runtimeGeneration && getLiveContext()) {
+        flushPendingCompactionReports();
+      }
+    }, 1_000);
+    compactionReportRetryTimer.unref?.();
+  }
+
+  function restorePendingCompactionReports(ctx: ExtensionContext): void {
+    pendingCompactionReports.clear();
+    pendingReceiverBaselineTokens.clear();
+    const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & { getEntries?: () => ReturnType<typeof ctx.sessionManager.getEntries> };
+    const entries = sessionManager.getEntries?.() ?? [];
+    for (const entry of entries) {
+      if (entry.type === "custom_message" && typeof entry.details === "object" && entry.details !== null) {
+        const details = entry.details as { message?: { contactToken?: unknown; contactBaseline?: unknown }; contactToken?: unknown; contactBaseline?: unknown };
+        const delivered = details.message ?? details;
+        if (delivered.contactBaseline === true && typeof delivered.contactToken === "string") {
+          pendingReceiverBaselineTokens.add(delivered.contactToken);
+        }
+        continue;
+      }
+      if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) continue;
+      const data = entry.data as { eventId?: unknown; compactedAt?: unknown; token?: unknown };
+      if (entry.customType === "intercom_receiver_baseline_pending" && typeof data.token === "string") {
+        pendingReceiverBaselineTokens.add(data.token);
+      } else if (
+        (entry.customType === "intercom_receiver_baseline_recorded"
+          || entry.customType === "intercom_receiver_baseline_abandoned")
+        && typeof data.token === "string"
+      ) {
+        pendingReceiverBaselineTokens.delete(data.token);
+      }
+      if (typeof data.eventId !== "string" || data.eventId.length === 0) continue;
+      if (entry.customType === "intercom_compaction_pending") {
+        pendingCompactionReports.set(
+          data.eventId,
+          typeof data.compactedAt === "number" ? data.compactedAt : 0,
+        );
+      } else if (entry.customType === "intercom_compaction_recorded") {
+        pendingCompactionReports.delete(data.eventId);
+      }
+    }
+  }
+
+  function flushPendingCompactionReports(): void {
+    if (compactionReportFlush || pendingCompactionReports.size === 0) return;
+    const activeClient = client;
+    const expectedGeneration = runtimeGeneration;
+    if (!activeClient?.isConnected() || !activeClient.supportsFeature(COMPACTION_AWARENESS_FEATURE)) return;
+
+    clearCompactionReportRetryTimer();
+    compactionReportFlush = (async () => {
+      while (
+        expectedGeneration === runtimeGeneration
+        && activeClient === client
+        && activeClient.isConnected()
+        && pendingCompactionReports.size > 0
+      ) {
+        const next = pendingCompactionReports.entries().next().value as [string, number] | undefined;
+        if (!next) return;
+        const [eventId, compactedAt] = next;
+        try {
+          const recorded = await activeClient.reportCompactionCompleted(eventId);
+          if (expectedGeneration !== runtimeGeneration || activeClient !== client) return;
+          pi.appendEntry("intercom_compaction_recorded", {
+            eventId,
+            compactedAt,
+            generation: recorded.generation,
+            recordedAt: recorded.compactedAt,
+          });
+          pendingCompactionReports.delete(eventId);
+        } catch {
+          scheduleCompactionReportRetry(expectedGeneration);
+          return;
+        }
+      }
+    })().finally(() => {
+      if (expectedGeneration !== runtimeGeneration) return;
+      compactionReportFlush = null;
+      if (pendingCompactionReports.size > 0) {
+        scheduleCompactionReportRetry(expectedGeneration);
+      }
+    });
+  }
+
   function beginCompactionStatus(ctx: ExtensionContext, signal?: AbortSignal): void {
     if (!compactionPresenceSupported || !getLiveContext(ctx)) {
       return;
@@ -1292,6 +1398,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           settleOutboxRequest(request.requestId, "failed", { code: "delivery_failed", messageId: result.id, detail: result.reason ?? "Delivery failed" });
           return;
         }
+        surfaceBackgroundPeerCompaction(activeClient, target.label, result, outboxGeneration, target.id);
         pi.appendEntry("intercom_sent", {
           to: target.label,
           message: { text: request.message },
@@ -1347,6 +1454,59 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     );
   }
 
+  function surfaceBackgroundPeerCompaction(
+    sourceClient: IntercomClient,
+    peerDisplay: string,
+    result: Pick<SendResult, "id" | "peerCompaction" | "contactToken">,
+    generation = runtimeGeneration,
+    expectedPeerSessionId?: string,
+  ): void {
+    if (!result.peerCompaction || (runtimeStarted && !getLiveContext(runtimeContext, generation))) return;
+    const notice = formatPeerCompactionNotice(peerDisplay, result.peerCompaction, expectedPeerSessionId);
+    pi.sendMessage(
+      {
+        customType: "intercom_compaction_awareness",
+        content: `**Intercom compaction awareness**\n\n${notice}`,
+        display: true,
+        details: { messageId: result.id, peerCompaction: result.peerCompaction },
+      },
+      { triggerTurn: false },
+    );
+    sourceClient.acknowledgeSendContact(result);
+  }
+
+  function clearReceiverBaselineRetryTimer(): void {
+    if (!receiverBaselineRetryTimer) return;
+    clearTimeout(receiverBaselineRetryTimer);
+    receiverBaselineRetryTimer = null;
+  }
+
+  function scheduleReceiverBaselineRetry(expectedGeneration = runtimeGeneration): void {
+    if (receiverBaselineRetryTimer || pendingReceiverBaselineTokens.size === 0) return;
+    receiverBaselineRetryTimer = setTimeout(() => {
+      receiverBaselineRetryTimer = null;
+      const activeClient = client;
+      if (expectedGeneration !== runtimeGeneration || !activeClient?.isConnected()) return;
+      for (const token of pendingReceiverBaselineTokens) activeClient.acknowledgeContactToken(token);
+      scheduleReceiverBaselineRetry(expectedGeneration);
+    }, 1_000);
+    receiverBaselineRetryTimer.unref?.();
+  }
+
+  function acknowledgeInboundMessageContact(sourceClient: IntercomClient | null, message: Message): void {
+    if (!message.contactToken || !sourceClient) return;
+    if (message.contactBaseline) {
+      pi.appendEntry("intercom_receiver_baseline_pending", {
+        token: message.contactToken,
+        messageId: message.id,
+        timestamp: Date.now(),
+      });
+      pendingReceiverBaselineTokens.add(message.contactToken);
+      scheduleReceiverBaselineRetry();
+    }
+    sourceClient.acknowledgeMessageContact(message);
+  }
+
   function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       return;
@@ -1361,10 +1521,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const senderDisplay = entry.from.name || entry.from.id.slice(0, 8);
     const replyInstruction = replyCommand ? `\n\nTo reply, use the intercom tool: ${replyCommand}` : "";
     const deliveryMetadata = formatInboundDeliveryMetadata(injectedMessage);
+    const compactionNotice = injectedMessage.peerCompaction
+      ? `\n\n_${formatPeerCompactionNotice(senderDisplay, injectedMessage.peerCompaction, entry.from.id)}_`
+      : "";
     pi.sendMessage(
       {
         customType: "intercom_message",
-        content: `**From ${senderDisplay}** (${entry.from.cwd})${replyInstruction}\n\n_${deliveryMetadata}_\n\n${entry.bodyText}`,
+        content: `**From ${senderDisplay}** (${entry.from.cwd})${replyInstruction}\n\n_${deliveryMetadata}_${compactionNotice}\n\n${entry.bodyText}`,
         display: true,
         details: deliveredEntry,
       },
@@ -1372,6 +1535,21 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         ? { triggerTurn: true }
         : { deliverAs: "steer" }
     );
+    acknowledgeInboundMessageContact(client, injectedMessage);
+  }
+  function surfaceInboundCompactionOnly(from: SessionInfo, message: Message, generation: number): void {
+    if (!message.peerCompaction || !getLiveContext(runtimeContext, generation)) return;
+    const senderDisplay = from.name || from.id.slice(0, 8);
+    pi.sendMessage(
+      {
+        customType: "intercom_compaction_awareness",
+        content: `**Intercom compaction awareness**\n\n${formatPeerCompactionNotice(senderDisplay, message.peerCompaction, from.id)}`,
+        display: true,
+        details: { messageId: message.id, peerCompaction: message.peerCompaction },
+      },
+      { triggerTurn: false },
+    );
+    acknowledgeInboundMessageContact(client, message);
   }
   function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration): void {
     sendIncomingMessage(entry, delivery, generation);
@@ -1384,6 +1562,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     const receiverReceivedAt = Date.now();
     if (hasSeenInboundMessage(from, message, receiverReceivedAt)) {
+      surfaceInboundCompactionOnly(from, message, messageGeneration);
       emitMessageReceipt(message.id, "acknowledged", "duplicate message id suppressed");
       return;
     }
@@ -1417,6 +1596,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
       if (!activeContext.isIdle()) {
         if (!activeContext.hasUI) {
+          surfaceInboundCompactionOnly(from, receivedMessage, messageGeneration);
           const activeClient = client;
           if (!message.replyTo && activeClient?.isConnected()) {
             try {
@@ -1425,6 +1605,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
                 replyTo: message.id,
               });
               if (result.delivered && getLiveContext(liveContext, messageGeneration)) {
+                surfaceBackgroundPeerCompaction(activeClient, from.name || from.id, result, messageGeneration, from.id);
                 dismissIncomingAsk(message.id);
               }
             } catch {
@@ -1453,8 +1634,32 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           for (const namespace of localExtensions.keys()) {
             emitLocalExtensionEvent(namespace, { type: "connection", connected: true, supported });
           }
+          flushPendingCompactionReports();
+          for (const token of pendingReceiverBaselineTokens) {
+            nextClient.acknowledgeContactToken(token);
+          }
+          scheduleReceiverBaselineRetry();
           break;
         }
+        case "direct_contact_recorded":
+          if (pendingReceiverBaselineTokens.delete(message.token)) {
+            if (pendingReceiverBaselineTokens.size === 0) clearReceiverBaselineRetryTimer();
+            pi.appendEntry("intercom_receiver_baseline_recorded", {
+              token: message.token,
+              timestamp: Date.now(),
+            });
+          }
+          break;
+        case "direct_contact_unknown":
+          if (pendingReceiverBaselineTokens.delete(message.token)) {
+            if (pendingReceiverBaselineTokens.size === 0) clearReceiverBaselineRetryTimer();
+            pi.appendEntry("intercom_receiver_baseline_abandoned", {
+              token: message.token,
+              timestamp: Date.now(),
+              reason: "Broker no longer retains the bounded staged baseline token",
+            });
+          }
+          break;
         case "extension_owner": {
           const extension = localExtensions.get(message.namespace);
           if (!extension) break;
@@ -1740,7 +1945,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         };
       }
       try {
-        const sendOptions = { text: options.message, attachments: options.attachments, signal: options.signal };
+        const sendOptions = {
+          text: options.message,
+          attachments: options.attachments,
+          signal: options.signal,
+          contactKind: options.broadcast ? "broadcast" as const : "direct" as const,
+        };
         let result = target.session
           ? await activeClient.sendToSession(target.session, sendOptions)
           : await activeClient.send(target.requested, sendOptions);
@@ -1781,6 +1991,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           outcomeKnown: result.outcomeKnown,
           ...(result.code ? { code: result.code } : {}),
           ...(result.reason ? { reason: result.reason } : {}),
+          ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
         };
         if (result.delivered) {
           pi.appendEntry("intercom_sent", {
@@ -1789,9 +2000,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             messageId: result.id,
             batchId: options.batchId,
             broadcast: options.broadcast,
+            ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
             timestamp: Date.now(),
           });
         }
+        activeClient.acknowledgeSendContact(result);
         return outcome;
       } catch (error) {
         return {
@@ -1843,6 +2056,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     disposed = false;
     runtimeStarted = true;
     runtimeGeneration += 1;
+    compactionReportFlush = null;
+    clearCompactionReportRetryTimer();
+    clearReceiverBaselineRetryTimer();
+    restorePendingCompactionReports(ctx);
     outboxRequestIds.clear();
     reconnectAttempt = 0;
     clearReconnectTimer();
@@ -1937,6 +2154,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           if (options.acknowledge) emitResultDelivery(parsed.requestId, false, error);
           return;
         }
+        surfaceBackgroundPeerCompaction(activeClient, parsed.to, result, relayGeneration, target);
         if (options.acknowledge) emitResultDelivery(parsed.requestId, true);
       } catch (error) {
         if (!relayStillLive()) return;
@@ -1991,6 +2209,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     disposed = true;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session shutting down");
     runtimeGeneration += 1;
+    compactionReportFlush = null;
+    clearCompactionReportRetryTimer();
+    clearReceiverBaselineRetryTimer();
     clearStartupConnectTimer();
     clearReconnectTimer();
     clearSessionNameCompatibilityTimer();
@@ -2028,6 +2249,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   });
   pi.on("session_compact", (_event, ctx) => {
     finishCompactionStatus(ctx);
+    if (getLiveContext(ctx)) {
+      const eventId = randomUUID();
+      const compactedAt = Date.now();
+      pi.appendEntry("intercom_compaction_pending", { eventId, compactedAt });
+      pendingCompactionReports.set(eventId, compactedAt);
+      flushPendingCompactionReports();
+    }
   });
   // Earendil Pi 0.85+ reports aborts and failures explicitly. Older hosts only
   // declare before/success, so compaction presence stays disabled there rather
@@ -2255,9 +2483,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               timestamp: Date.now(),
               subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
             });
+            const awareness = result.peerCompaction
+              ? `\n\n${formatPeerCompactionNotice(metadata.orchestratorTarget, result.peerCompaction, sendTo)}`
+              : "";
+            connectedClient.acknowledgeSendContact(result);
             return {
-              content: [{ type: "text", text: `Progress update sent to supervisor ${metadata.orchestratorTarget}` }],
-              details: { messageId: result.id, delivered: true },
+              content: [{ type: "text", text: `Progress update sent to supervisor ${metadata.orchestratorTarget}${awareness}` }],
+              details: deliveryDetails(result),
             };
           } catch (error) {
             return {
@@ -2277,6 +2509,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         let replyPromise: Promise<Message> | null = null;
         let deliveryState = "created";
         let questionId: string | null = null;
+        let requestSendResult: SendResult | undefined;
         try {
           questionId = randomUUID();
           replyPromise = waitForReply(sendTo, questionId, signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
@@ -2301,6 +2534,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             text: requestText,
             expectsReply: true,
           });
+          requestSendResult = sendResult;
           deliveryState = sendResult.delivered ? "socket_delivered" : "delivery_failed";
           if (!sendResult.delivered) {
             const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
@@ -2328,6 +2562,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             timestamp: Date.now(),
             subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
           });
+          const requestCompaction = sendResult.peerCompaction;
           const replyMessage = await replyPromise;
           const replyText = replyMessage.content.text;
           const replyAttachments = replyMessage.content.attachments?.length
@@ -2341,13 +2576,30 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             timestamp: replyMessage.timestamp,
             subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
           });
+          const awareness = [
+            requestCompaction
+              ? formatPeerCompactionNotice(metadata.orchestratorTarget, requestCompaction, sendTo)
+              : undefined,
+            replyMessage.peerCompaction
+              ? formatPeerCompactionNotice(metadata.orchestratorTarget, replyMessage.peerCompaction, sendTo)
+              : undefined,
+          ].filter((notice): notice is string => Boolean(notice));
+          connectedClient.acknowledgeSendContact(sendResult);
+          acknowledgeInboundMessageContact(connectedClient, replyMessage);
           return {
-            content: [{ type: "text", text: `**Reply from supervisor:**\n${replyText}${replyAttachments}` }],
-            details: structuredReply
-              ? structuredReply.value !== undefined
-                ? { structuredReply: structuredReply.value }
-                : { structuredReplyParseError: structuredReply.error }
-              : {},
+            content: [{
+              type: "text",
+              text: `${awareness.length ? `${awareness.join("\n\n")}\n\n` : ""}**Reply from supervisor:**\n${replyText}${replyAttachments}`,
+            }],
+            details: {
+              ...(structuredReply
+                ? structuredReply.value !== undefined
+                  ? { structuredReply: structuredReply.value }
+                  : { structuredReplyParseError: structuredReply.error }
+                : {}),
+              ...(requestCompaction ? { requestPeerCompaction: requestCompaction } : {}),
+              ...(replyMessage.peerCompaction ? { replyPeerCompaction: replyMessage.peerCompaction } : {}),
+            },
           };
         } catch (error) {
           rejectReplyWaiter(toError(error));
@@ -2358,9 +2610,17 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               // The waiter is cleanup-only on this path. The real failure is the one from the outer catch.
             }
           }
+          const requestAwareness = requestSendResult?.peerCompaction
+            ? `\n\n${formatPeerCompactionNotice(metadata.orchestratorTarget, requestSendResult.peerCompaction, sendTo)}`
+            : "";
+          if (requestSendResult) connectedClient.acknowledgeSendContact(requestSendResult);
           return {
-            content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-            details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
+            content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}${requestAwareness}` }],
+            details: {
+              error: true,
+              ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}),
+              ...(requestSendResult?.peerCompaction ? { peerCompaction: requestSendResult.peerCompaction } : {}),
+            },
           };
         }
       },
@@ -2428,6 +2688,7 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send targeted updates, ask for help, or check intercom connectivity.",
     promptGuidelines: [
       "Prefer targeted intercom sends. Machine-wide broadcast interrupts every visible live session and is appropriate only when each one genuinely needs the same information.",
+      "A compaction notice means the peer now relies on summarized conversational context. Continue normally, but make fragile references concrete with file paths, titled tickets, commits, or explicit decisions.",
     ],
 
     parameters: Type.Object({
@@ -2536,7 +2797,7 @@ Usage:
             try {
               const resolvedSupervisor = await resolveSupervisorTarget(connectedClient, metadata);
               const sendTarget = resolvedSupervisor ?? metadata.orchestratorTarget;
-              await connectedClient.send(sendTarget, {
+              const advertiseNotice = await connectedClient.send(sendTarget, {
                 text: formatChildOrchestratorMessage(
                   "update",
                   metadata,
@@ -2544,6 +2805,9 @@ Usage:
                 ),
                 expectsReply: false,
               });
+              if (advertiseNotice.delivered) {
+                surfaceBackgroundPeerCompaction(connectedClient, metadata.orchestratorTarget, advertiseNotice, runtimeGeneration, sendTarget);
+              }
             } catch {
               // Best-effort only -- a failed notice must never fail the advertise
               // call itself; the promotion already succeeded on the broker.
@@ -2953,6 +3217,8 @@ Usage:
               replyTo: effectiveReplyTo,
               supersedes,
               retryOf,
+              signal: _signal,
+              contactKind: "direct",
             });
             if (!result.delivered) {
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
@@ -2965,6 +3231,7 @@ Usage:
               to: targetDisplay,
               message: { text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf },
               messageId: result.id,
+              ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
               timestamp: Date.now(),
             });
             if (effectiveReplyTo) {
@@ -2973,10 +3240,17 @@ Usage:
             const sentText = target.projectPane
               ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
               : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${targetDisplay}`;
+            const deliveryText = result.delivery === "queued"
+              ? `${sentText}\n\n${queuedDeliveryNote(targetDisplay)}`
+              : sentText;
+            const awarenessText = result.peerCompaction
+              ? `${deliveryText}\n\n${formatPeerCompactionNotice(targetDisplay, result.peerCompaction, sendTo)}`
+              : deliveryText;
+            connectedClient.acknowledgeSendContact(result);
             return {
               content: [{
                 type: "text",
-                text: result.delivery === "queued" ? `${sentText}\n\n${queuedDeliveryNote(targetDisplay)}` : sentText,
+                text: awarenessText,
               }],
               details: {
                 ...deliveryDetails(result),
@@ -3022,6 +3296,10 @@ Usage:
           let replyPromise: Promise<Message> | null = null;
           let deliveryState = "created";
           let questionId: string | null = null;
+          let questionCompaction: PeerCompactionNotice | undefined;
+          let questionSendResult: SendResult | undefined;
+          let questionTargetDisplay = to ?? cwd ?? "peer";
+          let questionTargetId: string | undefined;
 
           try {
             if (openProjectPaneIfMissing && !cwd) {
@@ -3045,6 +3323,8 @@ Usage:
             }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
+            questionTargetDisplay = targetDisplay;
+            questionTargetId = sendTo;
             if (_signal?.aborted) {
               return {
                 content: [{ type: "text", text: "Cancelled" }],
@@ -3074,9 +3354,13 @@ Usage:
               expectsReply: true,
               supersedes,
               retryOf,
+              signal: _signal,
+              contactKind: "direct",
             });
 
+            questionSendResult = sendResult;
             deliveryState = sendResult.delivery;
+            questionCompaction = sendResult.peerCompaction;
             if (!sendResult.delivered) {
               const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
               rejectReplyWaiter(new Error(`Message to "${targetDisplay}" was not delivered: ${errorText}`));
@@ -3096,6 +3380,7 @@ Usage:
               to: targetDisplay,
               message: { text: message, attachments, replyTo, supersedes, retryOf },
               messageId: sendResult.id,
+              ...(sendResult.peerCompaction ? { peerCompaction: sendResult.peerCompaction } : {}),
               timestamp: Date.now(),
             });
             const replyMessage = await replyPromise;
@@ -3107,11 +3392,24 @@ Usage:
               from: targetDisplay,
               message: { text: replyText, attachments: replyMessage.content.attachments },
               messageId: replyMessage.id,
+              ...(replyMessage.peerCompaction ? { peerCompaction: replyMessage.peerCompaction } : {}),
               timestamp: replyMessage.timestamp,
             });
+            const latestCompaction = replyMessage.peerCompaction && (
+              !questionCompaction || replyMessage.peerCompaction.generation > questionCompaction.generation
+            ) ? replyMessage.peerCompaction : questionCompaction;
+            const awarenessText = latestCompaction
+              ? `${formatPeerCompactionNotice(targetDisplay, latestCompaction, sendTo)}\n\n`
+              : "";
+            connectedClient.acknowledgeSendContact(sendResult);
+            acknowledgeInboundMessageContact(connectedClient, replyMessage);
             return {
-              content: [{ type: "text", text: `**Reply from ${targetDisplay}:**\n${replyText}${replyAttachments}` }],
-              details: target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {},
+              content: [{ type: "text", text: `${awarenessText}**Reply from ${targetDisplay}:**\n${replyText}${replyAttachments}` }],
+              details: {
+                ...deliveryDetails(sendResult),
+                ...(latestCompaction ? { peerCompaction: latestCompaction } : {}),
+                ...(target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {}),
+              },
             };
           } catch (error) {
             rejectReplyWaiter(toError(error));
@@ -3122,9 +3420,20 @@ Usage:
                 // The waiter is cleanup-only on this path. The real failure is the one from the outer catch.
               }
             }
+            const failureText = `Failed: ${getErrorMessage(error)}`;
+            if (questionSendResult) connectedClient.acknowledgeSendContact(questionSendResult);
             return {
-              content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
-              details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
+              content: [{
+                type: "text",
+                text: questionCompaction
+                  ? `${failureText}\n\n${formatPeerCompactionNotice(questionTargetDisplay, questionCompaction, questionTargetId)}`
+                  : failureText,
+              }],
+              details: {
+                error: true,
+                ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}),
+                ...(questionCompaction ? { peerCompaction: questionCompaction } : {}),
+              },
             };
           }
         }
@@ -3155,6 +3464,8 @@ Usage:
               text: message,
               attachments,
               replyTo: target.message.id,
+              signal: _signal,
+              contactKind: "direct",
             });
             if (!result.delivered) {
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
@@ -3171,13 +3482,22 @@ Usage:
               to: target.from.name || target.from.id,
               message: { text: message, attachments, replyTo: target.message.id },
               messageId: result.id,
+              ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
               timestamp: Date.now(),
             });
-            const replyText = `Reply sent to ${target.from.name || target.from.id}`;
+            const targetDisplay = target.from.name || target.from.id;
+            const replyText = `Reply sent to ${targetDisplay}`;
+            const deliveryText = result.delivery === "queued"
+              ? `${replyText}\n\n${queuedDeliveryNote(targetDisplay)}`
+              : replyText;
+            const awarenessText = result.peerCompaction
+              ? `${deliveryText}\n\n${formatPeerCompactionNotice(targetDisplay, result.peerCompaction, target.from.id)}`
+              : deliveryText;
+            connectedClient.acknowledgeSendContact(result);
             return {
               content: [{
                 type: "text",
-                text: result.delivery === "queued" ? `${replyText}\n\n${queuedDeliveryNote(target.from.name || target.from.id)}` : replyText,
+                text: awarenessText,
               }],
               details: { ...deliveryDetails(result), replyTo: target.message.id },
             };
@@ -3202,7 +3522,8 @@ Usage:
           const lines = pendingAsks.map(({ from, message, receivedAt }) => {
             const preview = message.content.text.replace(/\s+/g, " ").slice(0, 80);
             const elapsedSeconds = Math.max(0, Math.floor((now - receivedAt) / 1000));
-            return `- ${from.name || from.id} · ${message.id} · ${elapsedSeconds}s ago · ${preview}`;
+            const compactionContext = message.peerCompaction ? " · sender compacted since prior direct contact" : "";
+            return `- ${from.name || from.id} · ${message.id} · ${elapsedSeconds}s ago${compactionContext} · ${preview}`;
           });
           return {
             content: [{ type: "text", text: `**Pending asks:**\n${lines.join("\n")}` }],
@@ -3427,16 +3748,21 @@ Usage:
         to: selectedSession.name || selectedSession.id,
         message: { text: result.text },
         messageId: result.messageId,
+        ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
         timestamp: Date.now(),
       });
+      const deliveryNotice = result.delivery === "queued"
+        ? `Message queued for offline session ${targetLabel} — delivered only if it reconnects within 24h`
+        : `Message sent to ${targetLabel}`;
       notifyIfLive(
         ctx,
-        result.delivery === "queued"
-          ? `Message queued for offline session ${targetLabel} — delivered only if it reconnects within 24h`
-          : `Message sent to ${targetLabel}`,
+        result.peerCompaction
+          ? `${deliveryNotice}\n\n${formatPeerCompactionNotice(targetLabel, result.peerCompaction, selectedSession.id)}`
+          : deliveryNotice,
         "info",
         overlayGeneration,
       );
+      overlayClient.acknowledgeSendContact(result);
     }
   }
 

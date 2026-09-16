@@ -4,6 +4,13 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.13.0-acl.7] - 2026-09-16
+
+### Added
+- Successful compactions now advance a private durable broker-owned generation through idempotent, acknowledged event reports. The next accepted direct unicast, ask, reply, compose-overlay send, or explicit multicast contact reports when that peer compacted since the previous direct contact; incoming notices ride the message already being delivered and never wake a peer on their own.
+- Capability-gated contact tokens keep awareness pending until a compatible client parses and surfaces it, preferring a repeated notice over a lost one across crashes and mixed-version rollout. Receiver first-contact tokens are durably staged and journaled for retry across broker restarts.
+- Directional contact watermarks persist under hashed scope/session identities with per-scope bounded, corruption-tolerant primary/backup storage and an explicit backup-stage/primary-commit protocol. First contact establishes a synchronously durable baseline, delivery rejected before acceptance does not advance it, disconnected snapshots never claim current context usage, and broadcast neither reads nor updates the collaboration graph.
+
 ## [0.13.0-acl.6] - 2026-09-16
 
 ### Added

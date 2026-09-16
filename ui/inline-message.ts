@@ -2,6 +2,7 @@ import type { Component } from "@mariozechner/pi-tui";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent";
 import type { SessionInfo, Message } from "../types.ts";
+import { formatPeerCompactionNotice } from "../compaction-awareness.ts";
 
 export class InlineMessageComponent implements Component {
   private from: SessionInfo;
@@ -69,11 +70,20 @@ export class InlineMessageComponent implements Component {
       }
       if (this.message.provenance?.type === "extension_outbox") meta.push(`Via ${this.message.provenance.extensionName}`);
       if (this.message.replyTo && !this.message.expectsReply) meta.push(`Reply to ${this.message.replyTo.slice(0, 8)}`);
+      if (this.message.peerCompaction) meta.push("Sender compacted since prior direct contact");
       meta.push("Ctrl+O to expand");
 
       lines.push(frameLine(this.theme.fg("dim", ` ${meta.join(" · ")}`)));
       lines.push(this.theme.fg("muted", `╰${borderChar.repeat(bodyWidth)}╯`));
       return lines;
+    }
+
+    if (this.message.peerCompaction) {
+      const notice = formatPeerCompactionNotice(senderName, this.message.peerCompaction, this.from.id);
+      for (const line of wrapTextWithAnsi(this.theme.fg("warning", ` ${notice}`), bodyWidth)) {
+        lines.push(frameLine(line));
+      }
+      lines.push(frameLine(""));
     }
 
     if (this.wrappedBody?.width !== bodyWidth) {

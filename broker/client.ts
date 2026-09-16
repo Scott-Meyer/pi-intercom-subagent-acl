@@ -3,9 +3,9 @@ import net from "net";
 import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
-import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
+import { isMessage, isMessageControl, isMessageReceipt, isPeerCompactionNotice, isSessionInfo } from "./protocol.ts";
 import { getIntercomScopeId } from "../config.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -29,12 +29,20 @@ interface SendOptions {
   provenance?: MessageProvenance;
   /** Stops retries that have not yet been written; it cannot retract an in-flight frame. */
   signal?: AbortSignal;
+  /** Broadcast delivery never reads or advances direct-collaboration watermarks. */
+  contactKind?: "direct" | "broadcast";
 }
 
 export interface SendResult extends DeliveryDetails {
   id: string;
   delivered: boolean;
   reason?: string;
+}
+
+export interface CompactionRecordedResult {
+  eventId: string;
+  generation: number;
+  compactedAt: number;
 }
 
 // ACL fork: result of a self-promotion "advertise" request/response exchange.
@@ -80,6 +88,7 @@ export class IntercomClient extends EventEmitter {
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
   private pendingAdvertise = new Map<string, { resolve: (result: AdvertiseResult) => void; reject: (e: Error) => void }>();
+  private pendingCompactionReports = new Map<string, { resolve: (result: CompactionRecordedResult) => void; reject: (e: Error) => void }>();
   private nextSenderSequence = 1;
   private disconnecting = false;
   private disconnectError: Error | null = null;
@@ -99,6 +108,10 @@ export class IntercomClient extends EventEmitter {
       pending.reject(error);
     }
     this.pendingLists.clear();
+    for (const pending of this.pendingCompactionReports.values()) {
+      pending.reject(error);
+    }
+    this.pendingCompactionReports.clear();
   }
 
   get sessionId(): string | null {
@@ -304,6 +317,7 @@ export class IntercomClient extends EventEmitter {
           session,
           ...(sessionId ? { sessionId } : {}),
           ...(scopeId ? { scopeId } : {}),
+          clientFeatures: [COMPACTION_AWARENESS_FEATURE],
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
         });
       } catch (error) {
@@ -358,6 +372,56 @@ export class IntercomClient extends EventEmitter {
         break;
       }
 
+      case "direct_contact_recorded": {
+        if (typeof brokerMessage.token !== "string") {
+          throw new Error("Invalid direct_contact_recorded message");
+        }
+        this.emit("broker_message", { type: "direct_contact_recorded", token: brokerMessage.token } satisfies BrokerMessage);
+        break;
+      }
+
+      case "direct_contact_unknown": {
+        if (typeof brokerMessage.token !== "string") {
+          throw new Error("Invalid direct_contact_unknown message");
+        }
+        this.emit("broker_message", { type: "direct_contact_unknown", token: brokerMessage.token } satisfies BrokerMessage);
+        break;
+      }
+
+      case "compaction_recorded": {
+        const { eventId, generation, compactedAt } = brokerMessage;
+        if (
+          typeof eventId !== "string"
+          || !Number.isSafeInteger(generation)
+          || (generation as number) < 1
+          || !Number.isSafeInteger(compactedAt)
+          || (compactedAt as number) < 0
+        ) {
+          throw new Error("Invalid compaction_recorded message");
+        }
+        const pending = this.pendingCompactionReports.get(eventId);
+        if (!pending) return;
+        this.pendingCompactionReports.delete(eventId);
+        pending.resolve({
+          eventId,
+          generation: generation as number,
+          compactedAt: compactedAt as number,
+        });
+        break;
+      }
+
+      case "compaction_record_failed": {
+        const { eventId, error } = brokerMessage;
+        if (typeof eventId !== "string" || typeof error !== "string") {
+          throw new Error("Invalid compaction_record_failed message");
+        }
+        const pending = this.pendingCompactionReports.get(eventId);
+        if (!pending) return;
+        this.pendingCompactionReports.delete(eventId);
+        pending.reject(new Error(error));
+        break;
+      }
+
       case "sessions": {
         const { requestId, sessions } = brokerMessage;
         if (typeof requestId !== "string" || !Array.isArray(sessions) || !sessions.every(isSessionInfo)) {
@@ -405,8 +469,8 @@ export class IntercomClient extends EventEmitter {
       }
 
       case "delivered": {
-        const { messageId, delivery, retryable, outcomeKnown } = brokerMessage;
-        if (typeof messageId !== "string" || (delivery !== undefined && delivery !== "socket_delivered" && delivery !== "queued") || (retryable !== undefined && typeof retryable !== "boolean") || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean")) {
+        const { messageId, delivery, retryable, outcomeKnown, peerCompaction, contactToken } = brokerMessage;
+        if (typeof messageId !== "string" || (delivery !== undefined && delivery !== "socket_delivered" && delivery !== "queued") || (retryable !== undefined && typeof retryable !== "boolean") || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean") || (peerCompaction !== undefined && !isPeerCompactionNotice(peerCompaction)) || (contactToken !== undefined && typeof contactToken !== "string")) {
           throw new Error("Invalid delivered message");
         }
 
@@ -417,7 +481,10 @@ export class IntercomClient extends EventEmitter {
         }
 
         this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: true, delivery: delivery as "socket_delivered" | "queued" | undefined ?? "socket_delivered", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
+        if (typeof contactToken === "string" && peerCompaction === undefined) {
+          this.acknowledgeDirectContact(contactToken);
+        }
+        pending.resolve({ id: messageId, delivered: true, delivery: delivery as "socket_delivered" | "queued" | undefined ?? "socket_delivered", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}), ...(peerCompaction !== undefined ? { peerCompaction } : {}), ...(typeof contactToken === "string" ? { contactToken } : {}) });
         break;
       }
 
@@ -767,7 +834,13 @@ export class IntercomClient extends EventEmitter {
       this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
 
       try {
-        writeMessage(socket, { type: "send", to, message, ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}) });
+        writeMessage(socket, {
+          type: "send",
+          to,
+          message,
+          ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}),
+          ...(options.contactKind ? { contactKind: options.contactKind } : {}),
+        });
       } catch (error) {
         clearTimeout(timeout);
         this.pendingSends.delete(messageId);
@@ -865,6 +938,70 @@ export class IntercomClient extends EventEmitter {
     } catch {
       // Cancellation is best-effort; local waiter cleanup must still proceed.
     }
+  }
+
+  acknowledgeSendContact(result: Pick<SendResult, "contactToken">): void {
+    if (result.contactToken) this.acknowledgeDirectContact(result.contactToken);
+  }
+
+  acknowledgeMessageContact(message: Pick<Message, "contactToken">): void {
+    if (message.contactToken) this.acknowledgeDirectContact(message.contactToken);
+  }
+
+  acknowledgeContactToken(token: string): void {
+    if (token) this.acknowledgeDirectContact(token);
+  }
+
+  private acknowledgeDirectContact(token: string): void {
+    if (!this.supportsFeature(COMPACTION_AWARENESS_FEATURE) || this.disconnecting) return;
+    const socket = this.socket;
+    if (!socket || !this._sessionId || socket.destroyed || socket.writableEnded || !socket.writable) return;
+    try {
+      writeMessage(socket, { type: "direct_contact_seen", token });
+    } catch {
+      // The peer notice remains useful. Missing acknowledgment leaves the
+      // broker watermark pending, preferring a repeated notice over a lost one.
+    }
+  }
+
+  async reportCompactionCompleted(eventId: string = randomUUID()): Promise<CompactionRecordedResult> {
+    if (!eventId) throw new Error("Compaction event ID is required");
+    if (!this.supportsFeature(COMPACTION_AWARENESS_FEATURE) || this.disconnecting) {
+      throw new Error("Compaction awareness is unavailable");
+    }
+    const socket = this.requireActiveSocket();
+    if (this.pendingCompactionReports.has(eventId)) {
+      throw new Error(`Compaction event ${eventId} is already pending`);
+    }
+
+    return new Promise<CompactionRecordedResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const pending = this.pendingCompactionReports.get(eventId);
+        if (!pending) return;
+        this.pendingCompactionReports.delete(eventId);
+        pending.reject(new Error("Compaction persistence acknowledgement timed out"));
+      }, 10_000);
+      timeout.unref?.();
+
+      this.pendingCompactionReports.set(eventId, {
+        resolve: (result) => {
+          clearTimeout(timeout);
+          resolve(result);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+      });
+
+      try {
+        writeMessage(socket, { type: "compaction_completed", eventId });
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingCompactionReports.delete(eventId);
+        reject(toError(error));
+      }
+    });
   }
 
   updatePresence(updates: { name?: string; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }): void {

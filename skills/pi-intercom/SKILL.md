@@ -113,6 +113,8 @@ intercom({
 });
 ```
 
+Direct contact may return a notice that the peer compacted since your previous direct contact. That means its active conversational memory now comes from a summary; it does not mean the peer lost files or stopped working. Make any fragile reference concrete—include the file path, titled ticket, commit, or decision you mean—then continue normally. These notices appear in send/ask/reply results and incoming direct messages. First contact establishes a baseline, while broadcast neither displays nor consumes the notice.
+
 ### Pattern 5: Send with Attachments
 
 Share code snippets, files, or context:
@@ -281,6 +283,8 @@ if (result.isError && result.content[0].text.includes("Already waiting")) {
 - **Group sends stay unthreaded**: Multi-target send and broadcast reject reply, supersede, and retry metadata
 - **Confirmation dialogs**: If `confirmSend: true` in config, interactive sessions resolve and display the exact recipient snapshot, then confirm once before sending the group
 - **Broadcast sparingly**: It interrupts every visible live peer and excludes disconnected sessions, so explicit targets are normally the better fit
+- **Compaction notices clarify context**: If a direct-contact receipt says the peer compacted, restate fragile references with concrete paths, titled tickets, commits, or decisions. The notice is generation-based and appears once per peer after the prior direct contact; it is not a reason to wake or resend to anyone else
+- **Broadcast is not collaboration history**: Broadcast never reads or advances direct-contact compaction watermarks
 
 ## Best Practices
 

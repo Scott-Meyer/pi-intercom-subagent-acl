@@ -5,6 +5,7 @@ import type {
   MessageProvenance,
   MessageReceipt,
   MessageReceiptStatus,
+  PeerCompactionNotice,
   SessionInfo,
   SessionRegistration,
 } from "../types.ts";
@@ -80,6 +81,25 @@ function isMessageProvenance(value: unknown): value is MessageProvenance {
     && typeof value.requestId === "string";
 }
 
+export function isPeerCompactionNotice(value: unknown): value is PeerCompactionNotice {
+  if (!isRecord(value)) return false;
+  if (
+    typeof value.peerSessionId !== "string"
+    || (value.peerName !== undefined && typeof value.peerName !== "string")
+    || (value.requestedPeerSessionId !== undefined && typeof value.requestedPeerSessionId !== "string")
+    || !Number.isSafeInteger(value.generation)
+    || (value.generation as number) < 1
+    || !Number.isSafeInteger(value.previousGeneration)
+    || (value.previousGeneration as number) < 0
+    || (value.previousGeneration as number) >= (value.generation as number)
+    || !Number.isSafeInteger(value.compactedAt)
+    || (value.compactedAt as number) < 0
+  ) {
+    return false;
+  }
+  return value.contextPct === undefined || typeof value.contextPct === "number";
+}
+
 export function isMessage(value: unknown): value is Message {
   if (!isRecord(value)) {
     return false;
@@ -112,6 +132,19 @@ export function isMessage(value: unknown): value is Message {
   }
 
   if (value.provenance !== undefined && !isMessageProvenance(value.provenance)) {
+    return false;
+  }
+
+  if (value.peerCompaction !== undefined && !isPeerCompactionNotice(value.peerCompaction)) {
+    return false;
+  }
+  if (value.contactToken !== undefined && typeof value.contactToken !== "string") {
+    return false;
+  }
+  if (value.contactBaseline !== undefined && typeof value.contactBaseline !== "boolean") {
+    return false;
+  }
+  if (value.contactBaseline === true && typeof value.contactToken !== "string") {
     return false;
   }
 
@@ -183,6 +216,13 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   }
 
   return value.trustedLocal === undefined || typeof value.trustedLocal === "boolean";
+}
+
+export function isAuthoredMessage(value: unknown): value is Message {
+  return isMessage(value)
+    && value.peerCompaction === undefined
+    && value.contactToken === undefined
+    && value.contactBaseline === undefined;
 }
 
 export function isSessionId(value: unknown): value is string {

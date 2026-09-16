@@ -1,13 +1,35 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
+export const COMPACTION_AWARENESS_FEATURE = "compaction-awareness-v1";
 
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
+
+export interface PeerCompactionNotice {
+  /** Stable broker session ID of the peer whose context was compacted. */
+  peerSessionId: string;
+  /** Current broker display name, used to disambiguate mailbox identity rebound. */
+  peerName?: string;
+  /** Originally selected stable ID when mailbox delivery rebound to another live identity. */
+  requestedPeerSessionId?: string;
+  /** Current successful-compaction generation for that logical peer. */
+  generation: number;
+  /** Generation this session had observed at its previous direct contact. */
+  previousGeneration: number;
+  /** Informational timestamp only; generation comparison determines the notice. */
+  compactedAt: number;
+  /** Current live context usage when known. */
+  contextPct?: number;
+}
 
 export interface DeliveryDetails {
   delivery: DeliveryState;
   code?: string;
   retryable: boolean;
   outcomeKnown: boolean;
+  /** Present once when the recipient compacted since the prior direct contact. */
+  peerCompaction?: PeerCompactionNotice;
+  /** Opaque broker correlation acknowledged by capable clients; not user-authored. */
+  contactToken?: string;
 }
 
 export interface SessionInfo {
@@ -74,6 +96,12 @@ export interface Message {
   replyTo?: string;
   expectsReply?: boolean;
   provenance?: MessageProvenance;
+  /** Broker-authored notice about the sender, attached only to direct contact. */
+  peerCompaction?: PeerCompactionNotice;
+  /** Opaque broker correlation proving this direct message reached a capable client. */
+  contactToken?: string;
+  /** True when the token stages a first-contact baseline pending receiver ACK. */
+  contactBaseline?: boolean;
   content: {
     text: string;
     attachments?: Attachment[];
@@ -123,12 +151,14 @@ export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "pe
 };
 
 export type ClientMessage =
-  | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string }
+  | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string; clientFeatures?: string[] }
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }
   | { type: "advertise"; requestId: string; name: string }
-  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string }
+  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string; contactKind?: "direct" | "broadcast" }
+  | { type: "compaction_completed"; eventId: string }
+  | { type: "direct_contact_seen"; token: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
   | { type: "cancel_message"; messageId: string }
   | { type: "cancel_ask"; messageId: string }
@@ -151,6 +181,10 @@ export type ClientMessage =
 
 export type BrokerMessage =
   | { type: "registered"; sessionId: string; features?: string[] }
+  | { type: "direct_contact_recorded"; token: string }
+  | { type: "direct_contact_unknown"; token: string }
+  | { type: "compaction_recorded"; eventId: string; generation: number; compactedAt: number }
+  | { type: "compaction_record_failed"; eventId: string; error: string }
   | { type: "sessions"; requestId: string; sessions: SessionInfo[] }
   | { type: "advertise_result"; requestId: string; ok: boolean; name?: string; error?: string; code?: string }
   | { type: "message"; from: SessionInfo; message: Message }

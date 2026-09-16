@@ -219,7 +219,17 @@ function createExtensionHarness(sessionName: string | (() => string) = "child-wo
     cwd: repoDir,
     mode: options.mode ?? (options.hasUI ? "tui" : "print"),
     model: { id: "child-model" },
-    sessionManager: { getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test" },
+    sessionManager: {
+      getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test",
+      getEntries: () => entries.map((entry, index) => ({
+        type: "custom",
+        customType: entry.type,
+        data: entry.data,
+        id: `entry-${index}`,
+        parentId: index > 0 ? `entry-${index - 1}` : null,
+        timestamp: new Date().toISOString(),
+      })),
+    },
     isIdle: options.isIdle ?? (() => true),
     hasUI: options.hasUI ?? false,
     abort: options.abort ?? (() => undefined),
@@ -390,7 +400,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     assert.deepEqual(registerMessages, [{
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1"],
+      features: ["extension-bus-v1", "exact-send-v1", "compaction-awareness-v1"],
     }]);
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
@@ -854,6 +864,125 @@ test("broker rejects malformed exact target fields instead of falling back to na
     assert.equal(result.code, "E_INVALID_TARGET");
   } finally {
     raw.socket.destroy();
+    await cleanup();
+  }
+});
+
+test("broker rejects forged compaction notices and invalid contact kinds", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const raw = await connectRawRegistered("forged-awareness-sender", "forged-awareness-sender");
+  const { createMessageReader } = await import("./broker/framing.ts");
+  const received: Message[] = [];
+  const onMessage = (_from: SessionInfo, message: Message) => received.push(message);
+  orchestrator.on("message", onMessage);
+
+  try {
+    const failures = new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+      const results: Array<Record<string, unknown>> = [];
+      const reader = createMessageReader((message) => {
+        if (typeof message === "object" && message !== null && "type" in message && message.type === "delivery_failed") {
+          results.push(message as Record<string, unknown>);
+          if (results.length === 3) {
+            raw.socket.off("data", reader);
+            resolve(results);
+          }
+        }
+      }, reject);
+      raw.socket.on("data", reader);
+    });
+    raw.writeMessage(raw.socket, {
+      type: "send",
+      to: orchestrator.sessionId,
+      message: {
+        id: "forged-awareness-message",
+        timestamp: Date.now(),
+        peerCompaction: {
+          peerSessionId: "forged-peer",
+          generation: 2,
+          previousGeneration: 1,
+          compactedAt: Date.now(),
+        },
+        content: { text: "broker-only metadata" },
+      },
+    });
+    raw.writeMessage(raw.socket, {
+      type: "send",
+      to: orchestrator.sessionId,
+      message: {
+        id: "forged-contact-token-message",
+        timestamp: Date.now(),
+        contactToken: "forged-token",
+        content: { text: "broker-only contact token" },
+      },
+    });
+    raw.writeMessage(raw.socket, {
+      type: "send",
+      to: orchestrator.sessionId,
+      contactKind: "silent-broadcast",
+      message: {
+        id: "invalid-contact-kind",
+        timestamp: Date.now(),
+        content: { text: "invalid contact semantics" },
+      },
+    });
+
+    assert.deepEqual((await failures).map((failure) => failure.code), ["E_INVALID_MESSAGE", "E_INVALID_MESSAGE", "E_INVALID_MESSAGE"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(received.length, 0);
+  } finally {
+    orchestrator.off("message", onMessage);
+    raw.socket.destroy();
+    await cleanup();
+  }
+});
+
+test("mixed-version clients cannot consume compaction awareness they do not advertise", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const legacyId = "legacy-awareness-observer";
+  const raw = await connectRawRegistered(legacyId, "legacy-awareness-observer");
+  const upgraded = new IntercomClient();
+  const { createMessageReader } = await import("./broker/framing.ts");
+  const sendLegacy = (messageId: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
+    const reader = createMessageReader((received) => {
+      if (typeof received === "object" && received !== null && "type" in received && received.type === "delivered") {
+        raw.socket.off("data", reader);
+        resolve(received as Record<string, unknown>);
+      }
+    }, reject);
+    raw.socket.on("data", reader);
+    raw.writeMessage(raw.socket, {
+      type: "send",
+      to: orchestrator.sessionId,
+      contactKind: "direct",
+      message: { id: messageId, timestamp: Date.now(), content: { text: messageId } },
+    });
+  });
+
+  try {
+    const legacyBaseline = await sendLegacy("legacy-baseline");
+    assert.equal(legacyBaseline.contactToken, undefined);
+    await orchestrator.reportCompactionCompleted();
+    const legacyAfterCompaction = await sendLegacy("legacy-after-compaction");
+    assert.equal(legacyAfterCompaction.peerCompaction, undefined);
+    assert.equal(legacyAfterCompaction.contactToken, undefined);
+
+    await upgraded.connect({
+      name: "upgraded-awareness-observer",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    }, legacyId);
+    const upgradedBaseline = await upgraded.send(orchestrator.sessionId!, { text: "capable baseline", contactKind: "direct" });
+    assert.equal(upgradedBaseline.peerCompaction, undefined, "first capable contact establishes the baseline without a historical claim");
+    const nextCompaction = await orchestrator.reportCompactionCompleted();
+    const noticed = await upgraded.send(orchestrator.sessionId!, { text: "capable notice", contactKind: "direct" });
+    assert.equal(noticed.peerCompaction?.generation, nextCompaction.generation);
+    upgraded.acknowledgeSendContact(noticed);
+  } finally {
+    raw.socket.destroy();
+    await upgraded.disconnect().catch(() => undefined);
     await cleanup();
   }
 });
@@ -1545,6 +1674,282 @@ test("broadcast reaches every visible live session across working directories an
   } finally {
     await harness.emitLifecycle("session_shutdown").catch(() => undefined);
     await otherProject.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("direct contact reports later compactions once while broadcast neither reports nor consumes them", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("awareness-direct-worker", {
+    sessionId: "awareness-direct-worker-id",
+  });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const baseline = await intercomTool.execute("awareness-baseline", {
+      action: "send",
+      to: "planner",
+      message: "Establish direct-contact baseline",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(baseline.details?.peerCompaction, undefined, "first contact establishes a baseline without a historical claim");
+
+    planner.updatePresence({ contextPct: 37 });
+    const firstCompaction = await planner.reportCompactionCompleted();
+    const nextGeneration = firstCompaction.generation;
+
+    const broadcast = await intercomTool.execute("awareness-broadcast", {
+      action: "broadcast",
+      message: "Do not consume direct-contact awareness",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const broadcastOutcomes = broadcast.details?.outcomes as Array<{ to: string; peerCompaction?: unknown }>;
+    assert.equal(broadcastOutcomes.find((outcome) => outcome.to.startsWith("planner "))?.peerCompaction, undefined);
+
+    const noticed = await intercomTool.execute("awareness-noticed", {
+      action: "send",
+      to: "planner",
+      message: "Direct contact after compaction",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const notice = noticed.details?.peerCompaction as { generation: number; previousGeneration: number; contextPct?: number };
+    assert.equal(notice.generation, nextGeneration);
+    assert.equal(notice.previousGeneration, nextGeneration - 1);
+    assert.equal(notice.contextPct, 37);
+    assert.match(noticed.content[0]?.text ?? "", /compacted context since your last direct contact/i);
+    assert.match(noticed.content[0]?.text ?? "", /context usage is 37%/i);
+
+    const repeated = await intercomTool.execute("awareness-repeated", {
+      action: "send",
+      to: "planner",
+      message: "Same generation again",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(repeated.details?.peerCompaction, undefined, "one generation is reported only once per observer/peer watermark");
+
+    await planner.reportCompactionCompleted();
+    const thirdCompaction = await planner.reportCompactionCompleted();
+    assert.equal(thirdCompaction.generation, nextGeneration + 2);
+    const multiple = await intercomTool.execute("awareness-multiple", {
+      action: "send",
+      to: "planner",
+      message: "Two compactions later",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(multiple.content[0]?.text ?? "", /\(2 compactions\)/i);
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("direct compaction notices remain pending until the capable sender acknowledges them", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const received: Message[] = [];
+  const onMessage = (_from: SessionInfo, message: Message) => received.push(message);
+  orchestrator.on("message", onMessage);
+  try {
+    const baseline = await planner.send(orchestrator.sessionId!, { text: "baseline", contactKind: "direct" });
+    assert.equal(baseline.peerCompaction, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const compacted = await orchestrator.reportCompactionCompleted();
+    const first = await planner.send(orchestrator.sessionId!, { text: "first notice", contactKind: "direct" });
+    assert.equal(first.peerCompaction?.generation, compacted.generation);
+
+    const repeated = await planner.send(orchestrator.sessionId!, { text: "repeat before ack", contactKind: "direct" });
+    assert.equal(repeated.peerCompaction?.generation, compacted.generation, "unacknowledged notice must repeat rather than be consumed");
+    planner.acknowledgeSendContact(repeated);
+
+    const afterAck = await planner.send(orchestrator.sessionId!, { text: "after ack", contactKind: "direct" });
+    assert.equal(afterAck.peerCompaction, undefined);
+    assert.equal(received.length, 4);
+  } finally {
+    orchestrator.off("message", onMessage);
+    await cleanup();
+  }
+});
+
+test("queued awareness omits stale context usage from a disconnected peer snapshot", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  try {
+    await planner.send(orchestrator.sessionId!, { text: "baseline", contactKind: "direct" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    orchestrator.updatePresence({ contextPct: 90 });
+    const compacted = await orchestrator.reportCompactionCompleted();
+    const targetId = orchestrator.sessionId!;
+    await orchestrator.disconnect();
+    await waitForNoSessionId(planner, targetId);
+
+    const queued = await planner.send(targetId, { text: "offline notice", contactKind: "direct" });
+    assert.equal(queued.delivery, "queued");
+    assert.equal(queued.peerCompaction?.generation, compacted.generation);
+    assert.equal(queued.peerCompaction?.contextPct, undefined, `disconnected presence is not described as current: ${JSON.stringify(queued)}`);
+    planner.acknowledgeSendContact(queued);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("mailbox rebound awareness names the actual peer and preserves the requested stable ID", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const replacement = new IntercomClient();
+  try {
+    const departedId = orchestrator.sessionId!;
+    await orchestrator.disconnect();
+    await waitForNoSessionId(planner, departedId);
+    await replacement.connect({
+      name: "orchestrator",
+      cwd: repoDir,
+      model: "test-model",
+      pid: process.pid,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+    });
+    const replacementId = replacement.sessionId!;
+    await planner.send(replacementId, { text: "replacement baseline", contactKind: "direct" });
+    const compacted = await replacement.reportCompactionCompleted();
+
+    const rebound = await planner.send(departedId, { text: "exact old mailbox identity", contactKind: "direct" });
+    assert.equal(rebound.delivery, "socket_delivered");
+    assert.equal(rebound.peerCompaction?.generation, compacted.generation);
+    assert.equal(rebound.peerCompaction?.peerSessionId, replacementId);
+    assert.equal(rebound.peerCompaction?.requestedPeerSessionId, departedId);
+    planner.acknowledgeSendContact(rebound);
+  } finally {
+    await replacement.disconnect().catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("explicit multicast tracks each recipient compaction independently", { concurrency: false }, async () => {
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("awareness-multicast-worker", {
+    sessionId: "awareness-multicast-worker-id",
+  });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    await intercomTool.execute("awareness-multicast-baseline", {
+      action: "send",
+      targets: ["planner", "orchestrator"],
+      message: "Establish independent baselines",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    const plannerGeneration = (await planner.reportCompactionCompleted()).generation;
+    const orchestratorGeneration = (await orchestrator.reportCompactionCompleted()).generation;
+
+    const result = await intercomTool.execute("awareness-multicast", {
+      action: "send",
+      targets: ["planner", "orchestrator"],
+      message: "Each recipient has compacted",
+    }, new AbortController().signal, undefined, harness.ctx);
+    const outcomes = result.details?.outcomes as Array<{ to: string; peerCompaction?: { generation: number } }>;
+    assert.equal(outcomes.find((outcome) => outcome.to === "planner")?.peerCompaction?.generation, plannerGeneration);
+    assert.equal(outcomes.find((outcome) => outcome.to === "orchestrator")?.peerCompaction?.generation, orchestratorGeneration);
+    assert.equal((result.content[0]?.text.match(/compacted context since your last direct contact/gi) ?? []).length, 2);
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("incoming direct contact carries compaction awareness without an unsolicited wake", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("awareness-inbound-worker", {
+    sessionId: "awareness-inbound-worker-id",
+  });
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const worker = await waitForSessionByName(planner, "awareness-inbound-worker");
+
+    await planner.send(worker.id, { text: "Establish inbound baseline", contactKind: "direct" });
+    const firstDeadline = Date.now() + 2000;
+    while (harness.sentMessages.length < 1 && Date.now() < firstDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(harness.sentMessages.length, 1);
+    assert.doesNotMatch(harness.sentMessages[0]?.message.content ?? "", /compacted context since your last direct contact/i);
+    const baselineAckDeadline = Date.now() + 2_000;
+    while (!harness.entries.some((entry) => entry.type === "intercom_receiver_baseline_recorded") && Date.now() < baselineAckDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const pendingBaseline = harness.entries.find((entry) => entry.type === "intercom_receiver_baseline_pending");
+    const recordedBaseline = harness.entries.find((entry) => entry.type === "intercom_receiver_baseline_recorded");
+    assert.ok(pendingBaseline, "receiver journals the staged baseline token after surfacing the first message");
+    assert.ok(recordedBaseline, "receiver journals the broker's durable baseline acknowledgement");
+    assert.equal(
+      (pendingBaseline.data as { token: string }).token,
+      (recordedBaseline.data as { token: string }).token,
+    );
+
+    const plannerGeneration = (await planner.reportCompactionCompleted()).generation;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(harness.sentMessages.length, 1, "compaction itself must not inject or wake a collaborator");
+
+    await planner.send(worker.id, { text: "Actual direct contact", expectsReply: true, contactKind: "direct" });
+    const secondDeadline = Date.now() + 2000;
+    while (harness.sentMessages.length < 2 && Date.now() < secondDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(harness.sentMessages.length, 2);
+    assert.match(harness.sentMessages[1]?.message.content ?? "", /planner compacted context since your last direct contact/i);
+    assert.match(harness.sentMessages[1]?.message.content ?? "", /Actual direct contact/);
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const pending = await intercomTool.execute("awareness-pending", {
+      action: "pending",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(pending.content[0]?.text ?? "", /sender compacted since prior direct contact/i);
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("ask retains contact-time compaction awareness in its eventual reply result", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("awareness-ask-worker", {
+    sessionId: "awareness-ask-worker-id",
+  });
+  const replyToAsk = async (from: SessionInfo, message: Message) => {
+    if (!message.expectsReply) return;
+    await planner.send(from.id, {
+      text: "Current answer",
+      replyTo: message.id,
+      contactKind: "direct",
+    });
+  };
+  planner.on("message", replyToAsk);
+
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    await intercomTool.execute("awareness-ask-baseline", {
+      action: "send",
+      to: "planner",
+      message: "Establish ask baseline",
+    }, new AbortController().signal, undefined, harness.ctx);
+
+    const plannerGeneration = (await planner.reportCompactionCompleted()).generation;
+
+    const result = await intercomTool.execute("awareness-ask", {
+      action: "ask",
+      to: "planner",
+      message: "What is current?",
+    }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(result.content[0]?.text ?? "", /compacted context since your last direct contact/i);
+    assert.match(result.content[0]?.text ?? "", /\*\*Reply from planner:\*\*\nCurrent answer/);
+    assert.equal((result.details?.peerCompaction as { generation?: number })?.generation, plannerGeneration);
+  } finally {
+    planner.off("message", replyToAsk);
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
     await cleanup();
   }
 });
@@ -2362,6 +2767,19 @@ test("sessions publish automatic lifecycle status", { concurrency: false }, asyn
     await waitForSessionStatus(planner, "status-worker", "compacting");
     await harness.emitLifecycle("session_compact", { reason: "manual" });
     await waitForSessionStatus(planner, "status-worker", "idle");
+    const reportDeadline = Date.now() + 2_000;
+    while (!harness.entries.some((entry) => entry.type === "intercom_compaction_recorded") && Date.now() < reportDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const pendingReport = harness.entries.find((entry) => entry.type === "intercom_compaction_pending");
+    const recordedReport = harness.entries.find((entry) => entry.type === "intercom_compaction_recorded");
+    assert.ok(pendingReport, "successful compaction is durably queued in the Pi session before reporting");
+    assert.ok(recordedReport, "broker acknowledgement is persisted after durable generation advancement");
+    assert.equal(
+      (pendingReport.data as { eventId: string }).eventId,
+      (recordedReport.data as { eventId: string }).eventId,
+      "the persisted event ID correlates broker retries and acknowledgements",
+    );
 
     const freshEventContext = {
       ...harness.ctx,
@@ -2394,6 +2812,12 @@ test("sessions publish automatic lifecycle status", { concurrency: false }, asyn
 
     await harness.emitLifecycle("tool_execution_end", { toolCallId: "tool-2", toolName: "read" });
     await waitForSessionStatus(planner, "status-worker", "thinking");
+
+    assert.equal(
+      harness.entries.filter((entry) => entry.type === "intercom_compaction_recorded").length,
+      1,
+      "failed and aborted compactions must not advance the durable generation",
+    );
 
     await harness.emitLifecycle("agent_end");
     await waitForSessionStatus(planner, "status-worker", "idle");
@@ -3118,12 +3542,19 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       assert.match(askMessage.content.text, /Child index: 0/);
       assert.match(askMessage.content.text, /Which API should I use\?/);
 
+      const replyCompaction = await orchestrator.reportCompactionCompleted();
       const reply = await orchestrator.send(askFrom.id, { text: "Use the stable API.", replyTo: askMessage.id });
       assert.equal(reply.delivered, true);
       const askResult = await askResultPromise;
       assert.notEqual(askResult.details?.error, true);
       assert.match(askResult.content[0]?.text ?? "", /Use the stable API/);
+      assert.match(askResult.content[0]?.text ?? "", /orchestrator compacted context since your last direct contact/i);
+      assert.equal(
+        (askResult.details?.replyPeerCompaction as { generation?: number } | undefined)?.generation,
+        replyCompaction.generation,
+      );
 
+      const supervisorCompaction = await orchestrator.reportCompactionCompleted();
       const updateReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const updateResult = await supervisorTool.execute("update-1", { reason: "progress_update", message: "Found a schema mismatch." }, new AbortController().signal, undefined, harness.ctx);
       const [_updateFrom, updateMessage] = await updateReceived;
@@ -3133,6 +3564,11 @@ test("child supervisor tool resolves target and includes run metadata", { concur
       assert.match(updateMessage.content.text, /Agent: worker/);
       assert.match(updateMessage.content.text, /Found a schema mismatch/);
       assert.notEqual(updateResult.details?.error, true);
+      assert.match(updateResult.content[0]?.text ?? "", /orchestrator compacted context since your last direct contact/i);
+      assert.equal(
+        (updateResult.details?.peerCompaction as { generation?: number } | undefined)?.generation,
+        supervisorCompaction.generation,
+      );
 
       const interviewReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
       const interview = {
@@ -3570,7 +4006,7 @@ test("failed replies do not clear broker mutual-ask edges", { concurrency: false
 
 test("regular intercom ask timeout reports message id and delivery state", { concurrency: false }, async () => {
   const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
-  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "50";
+  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "500";
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, cleanup } = await setupClients();
   const senderHarness = createExtensionHarness("timeout-worker", { sessionId: "session-timeout-worker" });

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { stripVTControlCharacters } from "node:util";
 
 import { visibleWidth } from "@mariozechner/pi-tui";
+import { formatPeerCompactionNotice } from "../compaction-awareness.ts";
 import { InlineMessageComponent } from "../ui/inline-message.ts";
 import type { Message, SessionInfo } from "../types.ts";
 
@@ -49,6 +50,69 @@ test("expanded inline intercom messages show the full body without collapse cont
   assert.match(rendered, /card/);
   assert.match(rendered, /To reply: intercom/);
   assert.doesNotMatch(rendered, /Ctrl\+O/);
+});
+
+test("inline intercom messages retain compaction awareness in expanded and collapsed rendering", () => {
+  const awareMessage: Message = {
+    ...message,
+    peerCompaction: {
+      peerSessionId: from.id,
+      peerName: from.name,
+      generation: 4,
+      previousGeneration: 2,
+      compactedAt: 1234,
+      contextPct: 38,
+    },
+  };
+
+  const expanded = new InlineMessageComponent(from, awareMessage, theme as any);
+  const expandedText = expanded.render(100).join("\n");
+  assert.match(expandedText, /sender compacted context since your last direct contact \(2 compactions\)/i);
+  assert.match(expandedText, /Current context[\s│]*usage is 38%/i);
+  assert.match(expandedText, /available terminal width/);
+
+  const collapsed = new InlineMessageComponent(from, awareMessage, theme as any, undefined, undefined, true);
+  const collapsedText = collapsed.render(100).join("\n");
+  assert.match(collapsedText, /Sender compacted since prior direct contact/);
+});
+
+test("compaction notices identify the actual peer after mailbox identity rebound", () => {
+  const notice = formatPeerCompactionNotice("departed-worker", {
+    peerSessionId: "replacement-session-id",
+    peerName: "replacement-worker",
+    requestedPeerSessionId: "departed-session-id",
+    generation: 2,
+    previousGeneration: 1,
+    compactedAt: 1234,
+  });
+  assert.match(notice, /replacement-worker \[session replacem\]/);
+  assert.match(notice, /message was requested for departed-worker \[session departed\]/);
+  assert.doesNotMatch(notice, /Notice: departed-worker compacted/);
+});
+
+test("broker-authored rebound ID wins even when it matches the replacement name", () => {
+  const notice = formatPeerCompactionNotice("orchestrator", {
+    peerSessionId: "replacement-session-id",
+    peerName: "orchestrator",
+    requestedPeerSessionId: "orchestrator",
+    generation: 2,
+    previousGeneration: 1,
+    compactedAt: 1234,
+  }, "orchestrator");
+  assert.match(notice, /orchestrator \[session replacem\]/);
+  assert.match(notice, /message was requested for orchestrator \[session orchestr\]/);
+});
+
+test("routing names are not mistaken for stable-ID rebound", () => {
+  const notice = formatPeerCompactionNotice("planner", {
+    peerSessionId: "planner-stable-session",
+    peerName: "planner",
+    generation: 2,
+    previousGeneration: 1,
+    compactedAt: 1234,
+  }, "planner");
+  assert.match(notice, /Notice: planner compacted/);
+  assert.doesNotMatch(notice, /message was requested for/);
 });
 
 test("collapsed inline intercom messages keep preview, reply hint, and expand key visible", () => {

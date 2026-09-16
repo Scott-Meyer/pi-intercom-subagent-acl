@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkS
 import { join } from "path";
 import { createHash, randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
-import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
+import { isAuthoredMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
 import {
   ensureIntercomRuntimeDir,
   getBrokerListenTarget,
@@ -18,10 +18,11 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
-import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
+import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, PeerCompactionNotice } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
+import { CollaborationStateStore } from "./collaboration-state.ts";
 
 const INTERCOM_DIR = getIntercomDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
@@ -34,8 +35,11 @@ const MAX_UNREGISTERED_CONNECTIONS = 32;
 const REGISTRATION_TIMEOUT_MS = 1000;
 const RATE_LIMIT_CAPACITY = 240;
 const RATE_LIMIT_REFILL_PER_SECOND = 120;
+const ACK_RATE_LIMIT_CAPACITY = 1_024;
+const ACK_RATE_LIMIT_REFILL_PER_SECOND = 512;
 const PRESENCE_HEARTBEAT_MS = 1000;
 const MAX_EXTENSIONS_PER_SESSION = 32;
+const MAX_CLIENT_FEATURES_PER_SESSION = 32;
 const MAX_EXTENSION_MESSAGE_BYTES = 16 * 1024;
 const MAX_EXTENSION_STATE_BYTES = 64 * 1024;
 const MESSAGE_RECEIPT_ROUTE_RETENTION_MS = 60 * 60 * 1000;
@@ -48,6 +52,8 @@ const MAX_MAILBOX_MESSAGES = 256;
 const MAILBOX_SWEEP_INTERVAL_MS = 60 * 1000;
 const DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 4096;
+const DIRECT_CONTACT_TOKEN_RETENTION_MS = 60 * 60 * 1000;
+const MAX_PENDING_DIRECT_CONTACTS = 4096;
 
 function serializedPayloadSize(payload: unknown): number | null {
   try {
@@ -66,6 +72,7 @@ interface ConnectedSession {
   lastPresenceBroadcastAt: number;
   ownerOrder: number;
   extensions?: ExtensionCapability[];
+  clientFeatures: Set<string>;
 }
 
 interface DeliveryRecord {
@@ -75,6 +82,9 @@ interface DeliveryRecord {
   code?: string;
   retryable: boolean;
   outcomeKnown: boolean;
+  peerCompaction?: PeerCompactionNotice;
+  contactToken?: string;
+  senderContact?: DirectContactPlan;
   createdAt: number;
 }
 
@@ -91,6 +101,8 @@ interface ConnectionState {
   socket: net.Socket;
   tokens: number;
   lastRefillAt: number;
+  ackTokens: number;
+  lastAckRefillAt: number;
 }
 
 interface AskEdge {
@@ -123,6 +135,21 @@ interface DisconnectedSession {
   disconnectedAt: number;
 }
 
+interface PendingDirectContact {
+  observerKey: string;
+  plan: DirectContactPlan;
+  createdAt: number;
+}
+
+interface DirectContactPlan {
+  scopeId?: string;
+  observerSessionId: string;
+  peerSessionId: string;
+  observedPeerGeneration: number;
+  durableBaseline: boolean;
+  notice?: PeerCompactionNotice;
+}
+
 interface MailboxMessage {
   from: SessionInfo;
   fromKey: string;
@@ -131,6 +158,7 @@ interface MailboxMessage {
   targetKey: string;
   targetScopeId?: string;
   message: Message;
+  contactKind: "direct" | "broadcast";
   queuedAt: number;
 }
 
@@ -240,7 +268,7 @@ function isPendingAskRecord(value: unknown): value is PendingAskRecord {
     && typeof value.question === "string"
     && Number.isSafeInteger(value.createdAt)
     && Number.isSafeInteger(value.expiresAt)
-    && value.expiresAt >= value.createdAt;
+    && (value.expiresAt as number) >= (value.createdAt as number);
 }
 
 function pendingAskRecordPath(messageId: string): string {
@@ -261,6 +289,7 @@ class IntercomBroker {
   private disconnectedSessions = new Map<string, DisconnectedSession>();
   private mailboxMessages: MailboxMessage[] = [];
   private deliveryRecords = new Map<string, DeliveryRecord>();
+  private pendingDirectContacts = new Map<string, PendingDirectContact>();
   private connections = new Set<net.Socket>();
   private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
@@ -270,6 +299,7 @@ class IntercomBroker {
   private namespaceOwners = new Map<string, NamespaceOwner>();
   private nextOwnerOrder = 1;
   private extensionStateManager: ExtensionStateManager;
+  private collaborationState: CollaborationStateStore;
 
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
@@ -277,6 +307,7 @@ class IntercomBroker {
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
+    this.collaborationState = new CollaborationStateStore(INTERCOM_DIR);
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
         unlinkSync(LISTEN_TARGET);
@@ -285,6 +316,143 @@ class IntercomBroker {
       }
     }
     this.server = net.createServer(this.handleConnection.bind(this));
+  }
+
+  private supportsCompactionAwareness(session: ConnectedSession): boolean {
+    return session.clientFeatures.has(COMPACTION_AWARENESS_FEATURE);
+  }
+
+  private directContactPlan(
+    scopeId: string | undefined,
+    observer: SessionInfo,
+    peer: SessionInfo,
+    includePeerContext = true,
+    requestedPeerSessionId?: string,
+  ): DirectContactPlan {
+    const snapshot = this.collaborationState.readContact(scopeId, observer.id, peer.id);
+    const notice = snapshot.compactedSinceLastContact && snapshot.lastContactGeneration !== undefined
+      ? {
+          peerSessionId: peer.id,
+          ...(peer.name ? { peerName: peer.name } : {}),
+          ...(requestedPeerSessionId && requestedPeerSessionId !== peer.id ? { requestedPeerSessionId } : {}),
+          generation: snapshot.peerGeneration,
+          previousGeneration: snapshot.lastContactGeneration,
+          compactedAt: snapshot.peerCompactedAt!,
+          ...(!includePeerContext || peer.contextPct === undefined ? {} : { contextPct: peer.contextPct }),
+        }
+      : undefined;
+    return {
+      ...(scopeId ? { scopeId } : {}),
+      observerSessionId: observer.id,
+      peerSessionId: peer.id,
+      observedPeerGeneration: snapshot.peerGeneration,
+      durableBaseline: snapshot.lastContactGeneration === undefined,
+      ...(notice ? { notice } : {}),
+    };
+  }
+
+  private trackDirectContact(observerKey: string, plan: DirectContactPlan): string {
+    this.prunePendingDirectContacts();
+    while (this.pendingDirectContacts.size >= MAX_PENDING_DIRECT_CONTACTS) {
+      const oldest = this.pendingDirectContacts.keys().next().value;
+      if (oldest === undefined) break;
+      this.pendingDirectContacts.delete(oldest);
+    }
+    const token = randomUUID();
+    if (plan.durableBaseline) {
+      this.collaborationState.stageFirstContactBaseline(
+        plan.scopeId,
+        plan.observerSessionId,
+        plan.peerSessionId,
+        plan.observedPeerGeneration,
+        token,
+      );
+    }
+    this.pendingDirectContacts.set(token, { observerKey, plan, createdAt: Date.now() });
+    return token;
+  }
+
+  private acknowledgeDirectContact(
+    observerKey: string,
+    token: string,
+    scopeId: string | undefined,
+    observerSessionId: string,
+  ): "accepted" | "unknown" | "retry" {
+    const pending = this.pendingDirectContacts.get(token);
+    if (pending && pending.observerKey !== observerKey) return "unknown";
+    try {
+      const accepted = pending?.plan.durableBaseline
+        ? this.collaborationState.acceptStagedFirstContactBaseline(scopeId, observerSessionId, token)
+        : pending
+          ? this.commitDirectContact(pending.plan)
+          : this.collaborationState.acceptStagedFirstContactBaseline(scopeId, observerSessionId, token);
+      if (accepted) {
+        this.pendingDirectContacts.delete(token);
+        return "accepted";
+      }
+      // A known volatile plan failed to commit and should be retried. A token
+      // absent from both memory and durable staged/accepted state is terminal.
+      return pending ? "retry" : "unknown";
+    } catch (error) {
+      console.error("Failed to acknowledge staged collaboration baseline:", error);
+      return "retry";
+    }
+  }
+
+  private prunePendingDirectContacts(now = Date.now()): void {
+    for (const [token, pending] of this.pendingDirectContacts) {
+      if (now - pending.createdAt > DIRECT_CONTACT_TOKEN_RETENTION_MS) {
+        this.pendingDirectContacts.delete(token);
+      }
+    }
+  }
+
+  private commitDirectContact(plan: DirectContactPlan): boolean {
+    try {
+      this.collaborationState.recordAcceptedContact(
+        plan.scopeId,
+        plan.observerSessionId,
+        plan.peerSessionId,
+        plan.observedPeerGeneration,
+        plan.durableBaseline,
+      );
+      return true;
+    } catch (error) {
+      // For an already delivered receiver notice, retaining the token repeats on
+      // retry. Sender baselines call this before delivery and fail closed.
+      console.error("Failed to record direct collaboration contact:", error);
+      return false;
+    }
+  }
+
+  private prepareSenderContact(observerKey: string, plan: DirectContactPlan | undefined): {
+    clientToken?: string;
+    stagedBaselineToken?: string;
+  } {
+    if (!plan) return {};
+    if (!plan.durableBaseline) {
+      return { clientToken: this.trackDirectContact(observerKey, plan) };
+    }
+    const stagedBaselineToken = randomUUID();
+    this.collaborationState.stageFirstContactBaseline(
+      plan.scopeId,
+      plan.observerSessionId,
+      plan.peerSessionId,
+      plan.observedPeerGeneration,
+      stagedBaselineToken,
+    );
+    return { stagedBaselineToken };
+  }
+
+  private finalizeSenderContact(plan: DirectContactPlan | undefined, stagedBaselineToken?: string): void {
+    if (!plan?.durableBaseline || !stagedBaselineToken) return;
+    if (!this.collaborationState.acceptStagedFirstContactBaseline(
+      plan.scopeId,
+      plan.observerSessionId,
+      stagedBaselineToken,
+    )) {
+      throw new Error("Failed to commit first-contact collaboration baseline");
+    }
   }
 
   start(): void {
@@ -320,6 +488,7 @@ class IntercomBroker {
     this.maintenanceTimer = setInterval(() => {
       this.pruneMailboxMessages();
       this.pruneDisconnectedSessions();
+      this.prunePendingDirectContacts();
     }, MAILBOX_SWEEP_INTERVAL_MS);
     this.maintenanceTimer.unref?.();
   }
@@ -354,10 +523,16 @@ class IntercomBroker {
       socket,
       tokens: RATE_LIMIT_CAPACITY,
       lastRefillAt: Date.now(),
+      ackTokens: ACK_RATE_LIMIT_CAPACITY,
+      lastAckRefillAt: Date.now(),
     };
 
     const reader = createMessageReader((msg) => {
-      if (!this.consumeToken(connection)) {
+      const isDirectContactAck = typeof msg === "object"
+        && msg !== null
+        && "type" in msg
+        && msg.type === "direct_contact_seen";
+      if (!(isDirectContactAck ? this.consumeAckToken(connection) : this.consumeToken(connection))) {
         writeMessage(socket, { type: "error", error: "Intercom broker rate limit exceeded" });
         socket.destroy(new Error("Intercom broker rate limit exceeded"));
         return;
@@ -424,6 +599,20 @@ class IntercomBroker {
       return false;
     }
     connection.tokens -= 1;
+    return true;
+  }
+
+  private consumeAckToken(connection: ConnectionState, now = Date.now()): boolean {
+    const elapsedMs = now - connection.lastAckRefillAt;
+    if (elapsedMs > 0) {
+      connection.ackTokens = Math.min(
+        ACK_RATE_LIMIT_CAPACITY,
+        connection.ackTokens + elapsedMs * ACK_RATE_LIMIT_REFILL_PER_SECOND / 1000,
+      );
+      connection.lastAckRefillAt = now;
+    }
+    if (connection.ackTokens < 1) return false;
+    connection.ackTokens -= 1;
     return true;
   }
 
@@ -498,6 +687,18 @@ class IntercomBroker {
         const key = scopedSessionKey(scopeId, id);
         const session = clientMessage.session;
         const extensions = session.extensions;
+        const rawClientFeatures = clientMessage.clientFeatures;
+        if (
+          rawClientFeatures !== undefined
+          && (
+            !Array.isArray(rawClientFeatures)
+            || rawClientFeatures.length > MAX_CLIENT_FEATURES_PER_SESSION
+            || !rawClientFeatures.every((feature) => typeof feature === "string" && feature.length > 0 && feature.length <= 128)
+          )
+        ) {
+          throw new Error("Invalid register clientFeatures");
+        }
+        const clientFeatures = new Set(rawClientFeatures as string[] | undefined ?? []);
         if (extensions !== undefined) {
           if (!Array.isArray(extensions) || extensions.length > MAX_EXTENSIONS_PER_SESSION) {
             throw new Error(`Invalid extensions field (maximum ${MAX_EXTENSIONS_PER_SESSION})`);
@@ -549,6 +750,7 @@ class IntercomBroker {
           lastPresenceBroadcastAt: Date.now(),
           ownerOrder: previous?.ownerOrder ?? this.nextOwnerOrder++,
           extensions,
+          clientFeatures,
         };
         this.sessions.set(key, connectedSession);
         this.disconnectedSessions.delete(key);
@@ -564,7 +766,7 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, COMPACTION_AWARENESS_FEATURE],
         });
         this.broadcastScoped({ type: "session_joined", session: info }, info, key, scopeId);
 
@@ -759,10 +961,15 @@ class IntercomBroker {
           throw new Error("Received send before register");
         }
         const message = clientMessage.message;
-        const messageId = isMessage(message) ? message.id : "unknown";
+        const messageId = isAuthoredMessage(message) ? message.id : "unknown";
 
-        if (typeof clientMessage.to !== "string" || !isMessage(message)) {
+        if (typeof clientMessage.to !== "string" || !isAuthoredMessage(message)) {
           this.writeDeliveryFailure(socket, messageId, "Invalid message format", "E_INVALID_MESSAGE");
+          break;
+        }
+        const contactKind = clientMessage.contactKind ?? "direct";
+        if (contactKind !== "direct" && contactKind !== "broadcast") {
+          this.writeDeliveryFailure(socket, message.id, "Invalid contact kind", "E_INVALID_MESSAGE");
           break;
         }
         const fromSession = this.sessions.get(currentKey);
@@ -789,7 +996,7 @@ class IntercomBroker {
         if (hasTargetId && hasTargetEpoch) {
           const targetId = clientMessage.targetId as string;
           const targetEpoch = clientMessage.targetEpoch as string;
-          const fingerprint = this.deliveryFingerprint(message, targetId);
+          const fingerprint = this.deliveryFingerprint(message, targetId, contactKind);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
           }
@@ -808,14 +1015,14 @@ class IntercomBroker {
           clientMessage.to = targetId;
         }
 
-        const targets = this.findSessions(clientMessage.to, fromSession.scopeId, currentKey);
+        const targets = this.findSessions(clientMessage.to as string, fromSession.scopeId, currentKey);
         if (targets.length === 1) {
           if (message.replyTo && !replyEdge) {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
             break;
           }
           const target = targets[0];
-          const fingerprint = this.deliveryFingerprint(message, target.info.id);
+          const fingerprint = this.deliveryFingerprint(message, target.info.id, contactKind);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
           }
@@ -844,10 +1051,26 @@ class IntercomBroker {
               createdAt: brokerReceivedAt,
             });
           }
+          const senderContact = contactKind === "direct" && this.supportsCompactionAwareness(fromSession)
+            ? this.directContactPlan(fromSession.scopeId, fromSession.info, target.info)
+            : undefined;
+          const receiverContact = contactKind === "direct" && this.supportsCompactionAwareness(target)
+            ? this.directContactPlan(fromSession.scopeId, target.info, fromSession.info)
+            : undefined;
+          const {
+            clientToken: senderContactToken,
+            stagedBaselineToken: senderBaselineToken,
+          } = this.prepareSenderContact(currentKey, senderContact);
+          const receiverContactToken = receiverContact
+            ? this.trackDirectContact(target.key, receiverContact)
+            : undefined;
           const deliveredMessage: Message = {
             ...message,
             brokerReceivedAt,
             brokerDeliveredAt: Date.now(),
+            ...(receiverContact?.notice ? { peerCompaction: receiverContact.notice } : {}),
+            ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
+            ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
           };
           if (message.supersedes) {
             const control: MessageControl = {
@@ -868,13 +1091,35 @@ class IntercomBroker {
             from: fromSession.info,
             message: deliveredMessage,
           });
+          this.finalizeSenderContact(senderContact, senderBaselineToken);
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
             this.removePendingAskRecord(message.replyTo, fromSession.scopeId);
           }
-          this.messageReceiptRoutes.set(message.id, { from: currentKey, to: target.key, createdAt: brokerReceivedAt });
-          this.recordDelivery(currentKey, message.id, fingerprint, "socket_delivered");
-          this.writeDeliverySuccess(socket, message.id, "socket_delivered");
+          this.messageReceiptRoutes.set(message.id, {
+            from: currentKey,
+            to: target.key,
+            createdAt: brokerReceivedAt,
+          });
+          this.recordDelivery(
+            currentKey,
+            message.id,
+            fingerprint,
+            "socket_delivered",
+            undefined,
+            undefined,
+            false,
+            senderContact?.notice,
+            senderContactToken,
+            senderContact,
+          );
+          this.writeDeliverySuccess(
+            socket,
+            message.id,
+            "socket_delivered",
+            senderContact?.notice,
+            senderContactToken,
+          );
           break;
         }
 
@@ -883,15 +1128,19 @@ class IntercomBroker {
           break;
         }
 
-        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to, fromSession.scopeId, currentKey);
+        const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to as string, fromSession.scopeId, currentKey);
         if (disconnectedTargets.length === 1) {
+          if (contactKind === "broadcast") {
+            this.writeDeliveryFailure(socket, message.id, "Broadcast recipients must still be connected", "E_TARGET_NOT_FOUND");
+            break;
+          }
           if (message.replyTo && !replyEdge) {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
             break;
           }
           const disconnectedTarget = disconnectedTargets[0]!;
           const target = disconnectedTarget.info;
-          const fingerprint = this.deliveryFingerprint(message, target.id);
+          const fingerprint = this.deliveryFingerprint(message, target.id, contactKind);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
           }
@@ -908,11 +1157,34 @@ class IntercomBroker {
             break;
           }
           const liveMailboxTarget = this.findUniqueLiveSessionForDisconnectedSession(disconnectedTarget, currentKey);
+          const acceptedTarget = liveMailboxTarget?.info ?? target;
+          const senderContact = this.supportsCompactionAwareness(fromSession)
+            ? this.directContactPlan(
+                fromSession.scopeId,
+                fromSession.info,
+                acceptedTarget,
+                liveMailboxTarget !== null,
+                target.id,
+              )
+            : undefined;
+          const {
+            clientToken: senderContactToken,
+            stagedBaselineToken: senderBaselineToken,
+          } = this.prepareSenderContact(currentKey, senderContact);
           if (liveMailboxTarget) {
+            const receiverContact = this.supportsCompactionAwareness(liveMailboxTarget)
+              ? this.directContactPlan(fromSession.scopeId, liveMailboxTarget.info, fromSession.info)
+              : undefined;
+            const receiverContactToken = receiverContact
+              ? this.trackDirectContact(liveMailboxTarget.key, receiverContact)
+              : undefined;
             const deliveredMessage: Message = {
               ...message,
               brokerReceivedAt,
               brokerDeliveredAt: Date.now(),
+              ...(receiverContact?.notice ? { peerCompaction: receiverContact.notice } : {}),
+              ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
+              ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
             };
             writeMessage(liveMailboxTarget.socket, {
               type: "message",
@@ -921,14 +1193,33 @@ class IntercomBroker {
             });
             this.messageReceiptRoutes.set(message.id, { from: currentKey, to: liveMailboxTarget.key, createdAt: brokerReceivedAt });
           } else {
-            this.queueMailboxMessage(fromSession, disconnectedTarget, message, brokerReceivedAt);
+            this.queueMailboxMessage(fromSession, disconnectedTarget, message, contactKind, brokerReceivedAt);
           }
+          this.finalizeSenderContact(senderContact, senderBaselineToken);
           if (message.replyTo) {
             this.askEdges.delete(message.replyTo);
             this.removePendingAskRecord(message.replyTo, fromSession.scopeId);
           }
-          this.recordDelivery(currentKey, message.id, fingerprint, liveMailboxTarget ? "socket_delivered" : "queued");
-          this.writeDeliverySuccess(socket, message.id, liveMailboxTarget ? "socket_delivered" : "queued");
+          const acceptedDelivery = liveMailboxTarget ? "socket_delivered" : "queued";
+          this.recordDelivery(
+            currentKey,
+            message.id,
+            fingerprint,
+            acceptedDelivery,
+            undefined,
+            undefined,
+            false,
+            senderContact?.notice,
+            senderContactToken,
+            senderContact,
+          );
+          this.writeDeliverySuccess(
+            socket,
+            message.id,
+            acceptedDelivery,
+            senderContact?.notice,
+            senderContactToken,
+          );
           break;
         }
 
@@ -938,6 +1229,78 @@ class IntercomBroker {
         }
 
         this.writeDeliveryFailure(socket, message.id, "Session not found", "E_TARGET_NOT_FOUND");
+        break;
+      }
+
+      case "compaction_completed": {
+        if (!currentKey) {
+          throw new Error("Received compaction_completed before register");
+        }
+        if (
+          typeof clientMessage.eventId !== "string"
+          || clientMessage.eventId.length === 0
+          || clientMessage.eventId.length > 128
+        ) {
+          throw new Error("Invalid compaction event ID");
+        }
+        const session = this.sessions.get(currentKey);
+        if (!session || session.socket !== socket) {
+          throw new Error("Compaction session not found");
+        }
+        try {
+          const compactedAt = Date.now();
+          const state = this.collaborationState.recordSuccessfulCompaction(
+            session.scopeId,
+            session.info.id,
+            clientMessage.eventId,
+            compactedAt,
+          );
+          session.info.lastActivity = compactedAt;
+          session.lastPresenceBroadcastAt = compactedAt;
+          this.broadcastScoped(
+            { type: "presence_update", session: session.info },
+            session.info,
+            currentKey,
+            session.scopeId,
+          );
+          writeMessage(socket, {
+            type: "compaction_recorded",
+            eventId: clientMessage.eventId,
+            generation: state.generation,
+            compactedAt: state.compactedAt,
+          });
+        } catch (error) {
+          console.error("Failed to record successful compaction:", error);
+          writeMessage(socket, {
+            type: "compaction_record_failed",
+            eventId: clientMessage.eventId,
+            error: "Failed to persist compaction awareness",
+          });
+        }
+        break;
+      }
+
+      case "direct_contact_seen": {
+        if (!currentKey) {
+          throw new Error("Received direct_contact_seen before register");
+        }
+        if (typeof clientMessage.token !== "string" || clientMessage.token.length === 0) {
+          throw new Error("Invalid direct_contact_seen token");
+        }
+        const observer = this.sessions.get(currentKey);
+        if (observer?.socket === socket) {
+          const outcome = this.acknowledgeDirectContact(
+            currentKey,
+            clientMessage.token,
+            observer.scopeId,
+            observer.info.id,
+          );
+          if (outcome === "accepted") {
+            writeMessage(socket, { type: "direct_contact_recorded", token: clientMessage.token });
+          } else if (outcome === "unknown") {
+            writeMessage(socket, { type: "direct_contact_unknown", token: clientMessage.token });
+          }
+        }
         break;
       }
 
@@ -1203,7 +1566,13 @@ class IntercomBroker {
     }
   }
 
-  private queueMailboxMessage(from: ConnectedSession, target: DisconnectedSession, message: Message, brokerReceivedAt: number): void {
+  private queueMailboxMessage(
+    from: ConnectedSession,
+    target: DisconnectedSession,
+    message: Message,
+    contactKind: "direct" | "broadcast",
+    brokerReceivedAt: number,
+  ): void {
     this.pruneMailboxMessages(brokerReceivedAt);
     while (this.mailboxMessages.length >= MAX_MAILBOX_MESSAGES) {
       const evicted = this.mailboxMessages.shift();
@@ -1224,21 +1593,37 @@ class IntercomBroker {
       targetKey: target.key,
       ...(target.scopeId ? { targetScopeId: target.scopeId } : {}),
       message: { ...message, brokerReceivedAt },
+      contactKind,
       queuedAt: brokerReceivedAt,
     });
   }
 
-  private writeDeliverySuccess(socket: net.Socket, messageId: string, delivery: "socket_delivered" | "queued"): void {
-    writeMessage(socket, { type: "delivered", messageId, delivery, retryable: false, outcomeKnown: true });
+  private writeDeliverySuccess(
+    socket: net.Socket,
+    messageId: string,
+    delivery: "socket_delivered" | "queued",
+    peerCompaction?: PeerCompactionNotice,
+    contactToken?: string,
+  ): void {
+    writeMessage(socket, {
+      type: "delivered",
+      messageId,
+      delivery,
+      retryable: false,
+      outcomeKnown: true,
+      ...(peerCompaction ? { peerCompaction } : {}),
+      ...(contactToken ? { contactToken } : {}),
+    });
   }
 
   private writeDeliveryFailure(socket: net.Socket, messageId: string, reason: string, code: string, retryable = false): void {
     writeMessage(socket, { type: "delivery_failed", messageId, reason, delivery: "failed", code, retryable, outcomeKnown: true });
   }
 
-  private deliveryFingerprint(message: Message, targetId: string): string {
+  private deliveryFingerprint(message: Message, targetId: string, contactKind: "direct" | "broadcast"): string {
     return JSON.stringify({
       targetId,
+      contactKind,
       text: message.content.text,
       attachments: message.content.attachments,
       replyTo: message.replyTo,
@@ -1265,14 +1650,28 @@ class IntercomBroker {
       return false;
     }
     if (record.state === "socket_delivered" || record.state === "queued") {
-      this.writeDeliverySuccess(socket, messageId, record.state);
+      if (record.senderContact && !record.senderContact.durableBaseline && (!record.contactToken || !this.pendingDirectContacts.has(record.contactToken))) {
+        record.contactToken = this.trackDirectContact(fromSessionId, record.senderContact);
+      }
+      this.writeDeliverySuccess(socket, messageId, record.state, record.peerCompaction, record.contactToken);
     } else {
       this.writeDeliveryFailure(socket, messageId, record.reason ?? "Previous delivery failed", record.code ?? "E_DELIVERY_FAILED", record.retryable);
     }
     return true;
   }
 
-  private recordDelivery(fromSessionId: string, messageId: string, fingerprint: string, state: DeliveryState, reason?: string, code?: string, retryable = false): void {
+  private recordDelivery(
+    fromSessionId: string,
+    messageId: string,
+    fingerprint: string,
+    state: DeliveryState,
+    reason?: string,
+    code?: string,
+    retryable = false,
+    peerCompaction?: PeerCompactionNotice,
+    contactToken?: string,
+    senderContact?: DirectContactPlan,
+  ): void {
     this.pruneDeliveryRecords();
     while (this.deliveryRecords.size >= MAX_DELIVERY_RECORDS) {
       const oldest = this.deliveryRecords.keys().next().value;
@@ -1286,6 +1685,9 @@ class IntercomBroker {
       ...(code ? { code } : {}),
       retryable,
       outcomeKnown: true,
+      ...(peerCompaction ? { peerCompaction } : {}),
+      ...(contactToken ? { contactToken } : {}),
+      ...(senderContact ? { senderContact } : {}),
       createdAt: Date.now(),
     });
   }
@@ -1336,20 +1738,35 @@ class IntercomBroker {
         continue;
       }
 
-      this.mailboxMessages.splice(index, 1);
-      const edge = this.askEdges.get(entry.message.id);
-      if (edge?.to === entry.targetKey) {
-        edge.to = session.key;
-      }
+      const liveSender = this.sessions.get(entry.fromKey);
+      const receiverContact = entry.contactKind === "direct" && this.supportsCompactionAwareness(session)
+        ? this.directContactPlan(
+            session.scopeId,
+            session.info,
+            liveSender?.info ?? entry.from,
+            liveSender !== undefined,
+          )
+        : undefined;
+      const receiverContactToken = receiverContact
+        ? this.trackDirectContact(session.key, receiverContact)
+        : undefined;
       const deliveredMessage: Message = {
         ...entry.message,
         brokerDeliveredAt: Date.now(),
+        ...(receiverContact?.notice ? { peerCompaction: receiverContact.notice } : {}),
+        ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
+        ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
       };
       writeMessage(session.socket, {
         type: "message",
         from: entry.from,
         message: deliveredMessage,
       });
+      this.mailboxMessages.splice(index, 1);
+      const edge = this.askEdges.get(entry.message.id);
+      if (edge?.to === entry.targetKey) {
+        edge.to = session.key;
+      }
       this.messageReceiptRoutes.set(entry.message.id, {
         from: entry.fromKey,
         to: session.key,
@@ -1964,8 +2381,14 @@ class IntercomBroker {
     this.sessions.clear();
     this.askEdges.clear();
     this.messageReceiptRoutes.clear();
+    this.pendingDirectContacts.clear();
     this.disconnectedSessions.clear();
     this.mailboxMessages.length = 0;
+    try {
+      this.collaborationState.close();
+    } catch (error) {
+      console.error("Failed to flush collaboration state during shutdown:", error);
+    }
     if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
       try {
         unlinkSync(LISTEN_TARGET);

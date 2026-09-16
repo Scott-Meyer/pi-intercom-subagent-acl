@@ -59,6 +59,22 @@ test("malformed extension broker messages are rejected", () => {
     () => (client as any).handleBrokerMessage({ type: "extension_state_result", namespace: "test/v1", committed: "yes", revision: 1 }),
     /Invalid extension_state_result/,
   );
+  assert.throws(
+    () => (client as any).handleBrokerMessage({
+      type: "delivered",
+      messageId: "message-1",
+      delivery: "socket_delivered",
+      retryable: false,
+      outcomeKnown: true,
+      peerCompaction: {
+        peerSessionId: "peer-1",
+        generation: 1,
+        previousGeneration: 1,
+        compactedAt: 1,
+      },
+    }),
+    /Invalid delivered message/,
+  );
   assert.doesNotThrow(() => (client as any).handleBrokerMessage({
     type: "extension_message",
     namespace: "test/v1",

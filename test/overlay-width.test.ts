@@ -57,6 +57,40 @@ test("compose overlay renders lines at the declared overlay width", () => {
   }
 });
 
+test("compose overlay returns the contact token without acknowledging before the caller surfaces it", async () => {
+  let acknowledged = 0;
+  let completed: unknown;
+  const overlay = new ComposeOverlay(
+    { requestRender() {} } as any,
+    theme as any,
+    keybindings as any,
+    session,
+    "session-019ecaf6",
+    {
+      send: async () => ({
+        delivered: true,
+        id: "message-1",
+        delivery: "socket_delivered",
+        contactToken: "contact-token",
+        peerCompaction: {
+          peerSessionId: session.id,
+          peerName: session.name,
+          generation: 2,
+          previousGeneration: 1,
+          compactedAt: 123,
+        },
+      }),
+      acknowledgeSendContact: () => { acknowledged += 1; },
+    } as any,
+    (result) => { completed = result; },
+  );
+  (overlay as any).inputBuffer = "hello";
+  await (overlay as any).sendMessage();
+
+  assert.equal(acknowledged, 0);
+  assert.equal((completed as { contactToken?: string }).contactToken, "contact-token");
+});
+
 test("session list overlay renders lines at the declared overlay width", () => {
   const overlay = new SessionListOverlay(theme as any, keybindings as any, session, [session], () => {});
 

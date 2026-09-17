@@ -31,6 +31,13 @@ const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
 process.env.HOME = sharedHomeDir;
 process.env.USERPROFILE = sharedHomeDir;
+// Inherited overrides leak past the HOME pin: getAgentDirPath() gives
+// PI_CODING_AGENT_DIR precedence, and inherited PI_INTERCOM_* / PI_SUBAGENT_*
+// vars would change routing and ACL behavior inside these tests.
+delete process.env.PI_CODING_AGENT_DIR;
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_INTERCOM_")) delete process.env[key];
+}
 const { IntercomClient } = await import("./broker/client.ts");
 const { getTsxCliPath } = await import("./broker/spawn.ts");
 const { getAskTimeoutMs, getConfigPath } = await import("./config.ts");
@@ -1329,7 +1336,7 @@ test("broker resolves unique short IDs and rejects ambiguous prefixes", { concur
   }
 });
 
-test("intercom tool prefers exact names over ID prefixes", { concurrency: false }, async () => {
+test("parley tool prefers exact names over ID prefixes", { concurrency: false }, async () => {
   const { orchestrator, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const evilPrefix = new IntercomClient();
@@ -1340,7 +1347,7 @@ test("intercom tool prefers exact names over ID prefixes", { concurrency: false 
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const exactNameReceived = Promise.race([
       once(orchestrator, "message") as Promise<[SessionInfo, Message]>,
       new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
@@ -1376,7 +1383,7 @@ test("send accepts multiple explicit targets, reports partial failure, and deliv
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("send-many", {
       action: "send",
       targets: ["planner", orchestrator.sessionId!, "missing-peer", planner.sessionId!],
@@ -1452,7 +1459,7 @@ test("confirmed multi-target sends preserve the resolved recipient snapshot", { 
       await original.connect(registration, originalId);
       piIntercomExtension(harness.pi as never);
       await harness.emitLifecycle("session_start");
-      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+      const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
       const result = await intercomTool.execute("confirmed-snapshot", {
         action: "send",
         targets: ["confirmed-target"],
@@ -1499,7 +1506,7 @@ test("multi-target send preserves ordinary queued-mail delivery for a disconnect
     await harness.emitLifecycle("session_start");
 
     const plannerReceived = once(planner, "message") as Promise<[SessionInfo, Message]>;
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("send-many-mailbox", {
       action: "send",
       targets: ["planner", disconnectedId],
@@ -1549,7 +1556,7 @@ test("multi-target send keeps case-sensitive disconnected IDs distinct", { concu
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("case-sensitive-targets", {
       action: "send",
       targets: ["Worker-A", "worker-a"],
@@ -1602,7 +1609,7 @@ test("broadcast reaches visible local sessions across working directories and re
     const plannerReceived = once(planner, "message") as Promise<[SessionInfo, Message]>;
     const orchestratorReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
     const otherProjectReceived = once(otherProject, "message") as Promise<[SessionInfo, Message]>;
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("broadcast", {
       action: "broadcast",
       message: "Machine-wide maintenance notice",
@@ -1645,7 +1652,7 @@ test("direct contact reports later compactions once while broadcast neither repo
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
 
     const baseline = await intercomTool.execute("awareness-baseline", {
       action: "send",
@@ -1788,7 +1795,7 @@ test("explicit multicast tracks each recipient compaction independently", { conc
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     await intercomTool.execute("awareness-multicast-baseline", {
       action: "send",
       targets: ["planner", "orchestrator"],
@@ -1857,7 +1864,7 @@ test("incoming direct contact carries compaction awareness without an unsolicite
     assert.equal(harness.sentMessages.length, 2);
     assert.match(harness.sentMessages[1]?.message.content ?? "", /planner compacted context since your last direct contact/i);
     assert.match(harness.sentMessages[1]?.message.content ?? "", /Actual direct contact/);
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const pending = await intercomTool.execute("awareness-pending", {
       action: "pending",
     }, new AbortController().signal, undefined, harness.ctx);
@@ -1887,7 +1894,7 @@ test("ask retains contact-time compaction awareness in its eventual reply result
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     await intercomTool.execute("awareness-ask-baseline", {
       action: "send",
       to: "planner",
@@ -1933,7 +1940,7 @@ test("broadcast preserves subagent visibility instead of disclosing or messaging
         piIntercomExtension(harness.pi as never);
         await harness.emitLifecycle("session_start");
         const supervisorReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
-        const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+        const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
         const result = await intercomTool.execute("broadcast-acl", {
           action: "broadcast",
           message: "Visible collaborators only",
@@ -1967,7 +1974,7 @@ test("multi-target and broadcast sends reject ambiguous targeting and conversati
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const toolSchema = intercomTool.parameters as {
       required?: string[];
       properties?: { profile?: { required?: string[] } };
@@ -2125,7 +2132,7 @@ test("extension can pin a restart-stable intercom session id", { concurrency: fa
   }
 });
 
-test("intercom-id inserts a stable handoff snippet into the editor", { concurrency: false }, async () => {
+test("parley-id inserts a stable handoff snippet into the editor", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   let editorText = "Existing note";
@@ -2142,12 +2149,14 @@ test("intercom-id inserts a stable handoff snippet into the editor", { concurren
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    await harness.commands.get("intercom-id")!("", harness.ctx);
-    assert.match(editorText, /Existing note\n\nPi intercom target: session-child-test/);
+    await harness.commands.get("parley-id")!("", harness.ctx);
+    assert.match(editorText, /Existing note\n\nPi parley target: session-child-test/);
     assert.doesNotMatch(editorText, /action:/, "the handoff supplies an address without choosing a communication action");
-    assert.match(notifications.at(-1) ?? "", /Inserted intercom contact target: session-child-test/);
-    await harness.emitLifecycle("session_shutdown");
+    assert.match(notifications.at(-1) ?? "", /Inserted parley contact target: session-child-test/);
   } finally {
+    // Shutdown must run even when an assertion fails: otherwise the extension's
+    // reconnect timer outlives the broker and can attach to later tests.
+    await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
 });
@@ -2191,7 +2200,7 @@ test("alias names the current session, opens the local input menu, and appears i
         ["Set session alias", "Current alias: menu-worker"],
       ]);
 
-      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+      const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
       const listed = await intercomTool.execute("alias-list", { action: "list" }, new AbortController().signal, undefined, harness.ctx);
       assert.match(listed.content[0]?.text ?? "", /no-arg-worker/);
 
@@ -2267,7 +2276,7 @@ test("alias reports no-UI usage and current alias without hanging", { concurrenc
   }
 });
 
-test("intercom tool auto-suffixes colliding names so by-name targets stay unambiguous", { concurrency: false }, async () => {
+test("parley tool auto-suffixes colliding names so by-name targets stay unambiguous", { concurrency: false }, async () => {
   const { cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const twinA = new IntercomClient();
@@ -2280,7 +2289,7 @@ test("intercom tool auto-suffixes colliding names so by-name targets stay unambi
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const listed = await intercomTool.execute("list-twin", { action: "list" }, new AbortController().signal, undefined, harness.ctx);
     const listText = listed.content.map((part) => (part as { text?: string }).text ?? "").join("");
     // Fork: a colliding registration name is auto-suffixed instead of left
@@ -2551,12 +2560,12 @@ test("extension outbox settles pending confirmation on session shutdown", async 
   });
 });
 
-test("intercom tool renders compact call and result rows", async () => {
+test("parley tool renders compact call and result rows", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness();
 
   piIntercomExtension(harness.pi as never);
-  const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+  const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
 
   assert.ok(intercomTool.renderCall);
   assert.ok(intercomTool.renderResult);
@@ -2565,16 +2574,16 @@ test("intercom tool renders compact call and result rows", async () => {
     to: "planner",
     message: "Need a decision before I continue with this implementation.",
     attachments: [{ type: "snippet", name: "note.ts", content: "const ok = true;" }],
-  }, renderTheme, {})), /intercom ask → planner \(1 attachment\)\n {2}Need a decision/);
+  }, renderTheme, {})), /parley ask → planner \(1 attachment\)\n {2}Need a decision/);
   assert.match(renderToText(intercomTool.renderCall({
     action: "send",
     targets: ["planner", "reviewer", "worker"],
     message: "Shared update",
-  }, renderTheme, {})), /intercom send → planner, reviewer, worker\n {2}Shared update/);
+  }, renderTheme, {})), /parley send → planner, reviewer, worker\n {2}Shared update/);
   assert.match(renderToText(intercomTool.renderCall({
     action: "broadcast",
     message: "Machine-wide notice",
-  }, renderTheme, {})), /intercom broadcast → visible local sessions\n {2}Machine-wide notice/);
+  }, renderTheme, {})), /parley broadcast → visible local sessions\n {2}Machine-wide notice/);
 
   const resultText = renderToText(intercomTool.renderResult({
     content: [{ type: "text", text: "Message sent to planner" }],
@@ -2590,13 +2599,13 @@ test("intercom tool renders compact call and result rows", async () => {
   assert.match(errorText, /Reason: Missing target/);
 });
 
-test("intercom tool result hook marks failed details as errors", async () => {
+test("parley tool result hook marks failed details as errors", async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness();
   piIntercomExtension(harness.pi as never);
 
   const errorResults = await harness.emitLifecycleResults("tool_result", {
-    toolName: "intercom",
+    toolName: "parley",
     details: { error: true },
   });
   assert.deepEqual(errorResults.filter(Boolean), [{ isError: true }]);
@@ -2608,13 +2617,13 @@ test("intercom tool result hook marks failed details as errors", async () => {
   assert.deepEqual(deliveryResults.filter(Boolean), [{ isError: true }]);
 
   const okResults = await harness.emitLifecycleResults("tool_result", {
-    toolName: "intercom",
+    toolName: "parley",
     details: { delivered: true },
   });
   assert.deepEqual(okResults.filter(Boolean), []);
 });
 
-test("obsolete toolVisibility config never hides or reveals the intercom tool", { concurrency: false }, async () => {
+test("obsolete toolVisibility config never hides or reveals the parley tool", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
 
   await withIntercomConfig({ toolVisibility: "after-first-use" }, async () => {
@@ -2644,8 +2653,8 @@ test("obsolete toolVisibility config never hides or reveals the intercom tool", 
       piIntercomExtension(inboundHarness.pi as never);
       await overlayHarness.emitLifecycle("session_start");
       await inboundHarness.emitLifecycle("session_start");
-      assert.equal(overlayHarness.getActiveTools().includes("intercom"), true);
-      assert.equal(inboundHarness.getActiveTools().includes("intercom"), true);
+      assert.equal(overlayHarness.getActiveTools().includes("parley"), true);
+      assert.equal(inboundHarness.getActiveTools().includes("parley"), true);
 
       selectedSession = await waitForSessionByName(planner, "planner");
       const inboundSession = await waitForSessionByName(planner, "lazy-inbound-worker");
@@ -2658,18 +2667,18 @@ test("obsolete toolVisibility config never hides or reveals the intercom tool", 
       while (inboundHarness.sentMessages.length === 0 && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
       }
-      assert.equal(inboundHarness.sentMessages[0]?.activeTools.includes("intercom"), true);
+      assert.equal(inboundHarness.sentMessages[0]?.activeTools.includes("parley"), true);
 
       await inboundHarness.emitLifecycle("tool_result", {
         toolName: "read",
-        input: { path: path.join(repoDir, "skills", "pi-intercom", "SKILL.md") },
+        input: { path: path.join(repoDir, "skills", "pi-parley", "SKILL.md") },
         isError: false,
       });
-      assert.equal(inboundHarness.getActiveTools().includes("intercom"), true);
+      assert.equal(inboundHarness.getActiveTools().includes("parley"), true);
 
-      await overlayHarness.commands.get("intercom")!("", overlayHarness.ctx);
+      await overlayHarness.commands.get("parley")!("", overlayHarness.ctx);
       assert.equal(overlayStep, 2);
-      assert.equal(overlayHarness.getActiveTools().includes("intercom"), true);
+      assert.equal(overlayHarness.getActiveTools().includes("parley"), true);
     } finally {
       await overlayHarness.emitLifecycle("session_shutdown");
       await inboundHarness.emitLifecycle("session_shutdown");
@@ -2867,7 +2876,7 @@ test("any intercom call can publish a durable short self description and returns
     const { default: piIntercomExtension } = await import("./index.ts");
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley");
     assert.ok(intercomTool);
 
     const result = await intercomTool.execute("profile-status", {
@@ -2921,8 +2930,8 @@ test("profile names fill unnamed sessions but never replace an explicit Pi name"
     await explicit.emitLifecycle("session_start");
     await unnamed.emitLifecycle("session_start");
     await waitForSessionByName(planner, "FlightDeck Owner");
-    const explicitTool = explicit.tools.find((tool) => tool.name === "intercom");
-    const unnamedTool = unnamed.tools.find((tool) => tool.name === "intercom");
+    const explicitTool = explicit.tools.find((tool) => tool.name === "parley");
+    const unnamedTool = unnamed.tools.find((tool) => tool.name === "parley");
     assert.ok(explicitTool);
     assert.ok(unnamedTool);
 
@@ -3009,7 +3018,7 @@ test("profile naming cannot diverge an advertised subagent from its broker ident
       const { default: piIntercomExtension } = await import("./index.ts");
       piIntercomExtension(harness.pi as never);
       await harness.emitLifecycle("session_start");
-      const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+      const intercomTool = harness.tools.find((tool) => tool.name === "parley");
       assert.ok(intercomTool);
 
       const advertised = await intercomTool.execute("profile-advertise", {
@@ -3049,7 +3058,7 @@ test("profile persistence failures stay retryable without publishing an undurabl
     const { default: piIntercomExtension } = await import("./index.ts");
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley");
     assert.ok(intercomTool);
 
     const failed = await intercomTool.execute("profile-persist-failed", {
@@ -3101,7 +3110,7 @@ test("durable pending profiles recover name ownership after a commit append fail
     const { default: piIntercomExtension } = await import("./index.ts");
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley");
     assert.ok(intercomTool);
 
     const staged = await intercomTool.execute("profile-staged", {
@@ -3146,7 +3155,7 @@ test("older brokers are reported as local-only instead of falsely claiming descr
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
     await waitForSessionByName(planner, "mixed-version-profile");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley");
     assert.ok(intercomTool);
 
     const result = await intercomTool.execute("profile-old-broker", {
@@ -3172,7 +3181,7 @@ test("profile descriptions enforce concise 5-9 word display metadata", { concurr
     const { default: piIntercomExtension } = await import("./index.ts");
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom");
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley");
     assert.ok(intercomTool);
 
     const tooShort = await intercomTool.execute("profile-short", {
@@ -3512,7 +3521,7 @@ test("explicit cancel acknowledges that a steered inbound message may already be
   }
 });
 
-test("intercom cancel action requests cancellation for a sent message", { concurrency: false }, async () => {
+test("parley cancel action requests cancellation for a sent message", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { planner, cleanup } = await setupClients();
   let idle = false;
@@ -3529,7 +3538,7 @@ test("intercom cancel action requests cancellation for a sent message", { concur
     await senderHarness.emitLifecycle("session_start");
     await receiverHarness.emitLifecycle("session_start");
     await waitForSessionByName(planner, "cancel-tool-worker");
-    const intercomTool = senderHarness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = senderHarness.tools.find((tool) => tool.name === "parley")!;
 
     const sendResult = await intercomTool.execute("send-before-cancel", { action: "send", to: "cancel-tool-worker", message: "Cancel this through the tool" }, new AbortController().signal, undefined, senderHarness.ctx);
     const messageId = String(sendResult.details?.messageId);
@@ -3666,7 +3675,7 @@ test("replied steered asks are not injected again after the current turn", { con
     assert.equal(harness.sentMessages.length, 1);
     assert.equal(harness.sentMessages[0]?.options?.deliverAs, "steer");
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("reply-while-busy", {
       action: "reply",
       message: "Answered during the current turn.",
@@ -3727,7 +3736,7 @@ test("stale overlay work stops after same-session restart", { concurrency: false
     await harness.emitLifecycle("session_start");
     await waitForSessionByName(planner, "overlay-worker");
 
-    const overlayPromise = Promise.resolve(harness.commands.get("intercom")!("", harness.ctx));
+    const overlayPromise = Promise.resolve(harness.commands.get("parley")!("", harness.ctx));
     const deadline = Date.now() + 2000;
     while (!resolveFirstCustom && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -3832,7 +3841,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   await withChildOrchestratorEnv({}, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["parley"]);
   });
 
   await withChildOrchestratorEnv({
@@ -3844,7 +3853,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   }, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "intercom"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["contact_supervisor", "parley"]);
     const supervisorTool = harness.tools.find((tool) => tool.name === "contact_supervisor");
     assert.match(JSON.stringify(supervisorTool?.parameters), /interview_request/);
     assert.match(JSON.stringify(supervisorTool?.parameters), /questions/);
@@ -3859,7 +3868,7 @@ test("supervisor tool registers only when child metadata is present", async () =
   }, () => {
     const harness = createExtensionHarness();
     piIntercomExtension(harness.pi as never);
-    assert.deepEqual(harness.tools.map((tool) => tool.name), ["intercom"]);
+    assert.deepEqual(harness.tools.map((tool) => tool.name), ["parley"]);
   });
 });
 
@@ -4095,7 +4104,7 @@ test("child supervisor blocking requests fail fast when the supervisor is discon
   }
 });
 
-test("regular intercom asks fail safely when started concurrently", { concurrency: false }, async () => {
+test("regular parley asks fail safely when started concurrently", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
 
@@ -4104,7 +4113,7 @@ test("regular intercom asks fail safely when started concurrently", { concurrenc
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
     await waitForSessionByName(orchestrator, "regular-ask-worker");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
 
     const firstMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
     const firstAsk = intercomTool.execute("ask-1", { action: "ask", to: "orchestrator", message: "First?" }, new AbortController().signal, undefined, harness.ctx);
@@ -4279,7 +4288,7 @@ test("reverse and clarification asks leave earlier requests open until explicitl
   }
 });
 
-test("regular intercom ask timeout reports message id and delivery state", { concurrency: false }, async () => {
+test("regular parley ask timeout reports message id and delivery state", { concurrency: false }, async () => {
   const previousTimeout = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
   process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "500";
   const { default: piIntercomExtension } = await import("./index.ts");
@@ -4293,7 +4302,7 @@ test("regular intercom ask timeout reports message id and delivery state", { con
     await senderHarness.emitLifecycle("session_start");
     await receiverHarness.emitLifecycle("session_start");
     await waitForSessionByName(planner, "timeout-target");
-    const intercomTool = senderHarness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = senderHarness.tools.find((tool) => tool.name === "parley")!;
 
     const result = await intercomTool.execute("ask-timeout", { action: "ask", to: "timeout-target", message: "Will this time out?" }, new AbortController().signal, undefined, senderHarness.ctx);
 
@@ -4315,7 +4324,7 @@ test("regular intercom ask timeout reports message id and delivery state", { con
   }
 });
 
-test("regular intercom ask cancellation withdraws the request without preventing reverse collaboration", { concurrency: false }, async () => {
+test("regular parley ask cancellation withdraws the request without preventing reverse collaboration", { concurrency: false }, async () => {
   const { default: piIntercomExtension } = await import("./index.ts");
   const { orchestrator, cleanup } = await setupClients();
 
@@ -4324,7 +4333,7 @@ test("regular intercom ask cancellation withdraws the request without preventing
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
     const worker = await waitForSessionByName(orchestrator, "cancel-cleanup-worker");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
 
     const controller = new AbortController();
     const cancelledMessage = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
@@ -4397,7 +4406,7 @@ test("non-blocking asks return immediately, surface outstanding state, and resol
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
 
     const askDelivered = once(planner, "message") as Promise<[SessionInfo, Message]>;
     const askResult = await intercomTool.execute("nonblocking-ask-1", {
@@ -4488,7 +4497,7 @@ test("an independent non-blocking ask failure cannot terminate a blocking reques
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const tool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const tool = harness.tools.find((tool) => tool.name === "parley")!;
     const call = (params: Record<string, unknown>) => tool.execute("parallel-ask", params, controller.signal, undefined, harness.ctx);
     let blockingSettled = false;
     const blockingReceived = once(planner, "message") as Promise<[SessionInfo, Message]>;
@@ -4532,7 +4541,7 @@ test("rename sets the canonical session name and receipts carry the send-time id
   try {
     piIntercomExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    const intercomToolFixture = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomToolFixture = harness.tools.find((tool) => tool.name === "parley")!;
 
     const firstDelivered = once(planner, "message") as Promise<[SessionInfo, Message]>;
     const firstSend = await intercomToolFixture.execute("identity-send-1", {
@@ -4653,7 +4662,7 @@ test("pending and read recover complete questions, and reply receipts keep anoth
     })).delivered, true);
     assert.equal((await orchestrator.send(worker.id, { messageId: "reply-target-docs-question-long-id", text: "Are the docs ready?", expectsReply: true })).delivered, true);
     await waitForVisibleText(harness, "Are the docs ready?");
-    const tool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const tool = harness.tools.find((tool) => tool.name === "parley")!;
     const call = (params: Record<string, unknown>) => tool.execute("answer-selected", params, new AbortController().signal, undefined, harness.ctx);
 
     const pending = modelText(await call({ action: "pending" }));
@@ -4687,7 +4696,7 @@ test("pending and read recover complete questions, and reply receipts keep anoth
   }
 });
 
-test("intercom reply sends attachments", { concurrency: false }, async () => {
+test("parley reply sends attachments", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness("reply-attachment-worker");
@@ -4701,7 +4710,7 @@ test("intercom reply sends attachments", { concurrency: false }, async () => {
     assert.equal((await planner.send(worker.id, { messageId: askId, text: "Send details?", expectsReply: true })).delivered, true);
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const attachments = [{ type: "snippet" as const, name: "details.md", content: "attached details", language: "md" }];
     const replyReceived = waitForReply(planner, askId);
     const result = await intercomTool.execute("reply-with-attachment", {
@@ -4737,7 +4746,7 @@ test("an active inbound ask still allows consulting and notifying other colleagu
     const inbound = await waitForVisibleText(harness, "Is the migration safe?");
     const originalId = visibleMessageId(inbound);
     await harness.emitLifecycle("turn_start");
-    const tool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const tool = harness.tools.find((tool) => tool.name === "parley")!;
     const call = (params: Record<string, unknown>) => tool.execute("collaboration", params, new AbortController().signal, undefined, harness.ctx);
 
     const consultationReceived = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
@@ -4772,7 +4781,7 @@ test("an active inbound ask still allows consulting and notifying other colleagu
   }
 });
 
-test("intercom reply targets one of multiple pending asks by short session ID", { concurrency: false }, async () => {
+test("parley reply targets one of multiple pending asks by short session ID", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness("reply-short-id-worker");
@@ -4786,7 +4795,7 @@ test("intercom reply targets one of multiple pending asks by short session ID", 
     assert.equal((await orchestrator.send(worker.id, { messageId: "reply-short-id-2", text: "Second?", expectsReply: true })).delivered, true);
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const replyReceived = waitForReply(planner, "reply-short-id-1");
     const result = await intercomTool.execute("reply-short-id", {
       action: "reply",
@@ -4818,8 +4827,8 @@ test("a short-ID reply unblocks the original ask when another ask is pending", {
     await replierHarness.emitLifecycle("session_start");
     const asker = await waitForSessionByName(planner, "short-id-asker");
     const replier = await waitForSessionByName(planner, "short-id-replier");
-    const askerTool = askerHarness.tools.find((tool) => tool.name === "intercom")!;
-    const replierTool = replierHarness.tools.find((tool) => tool.name === "intercom")!;
+    const askerTool = askerHarness.tools.find((tool) => tool.name === "parley")!;
+    const replierTool = replierHarness.tools.find((tool) => tool.name === "parley")!;
 
     const originalAsk = askerTool.execute("ask-for-work", {
       action: "ask",
@@ -5278,7 +5287,7 @@ test("broker does not reroute an id-addressed message to a same-name session in 
   }
 });
 
-test("intercom reply queues mail for a disconnected named sender", { concurrency: false }, async () => {
+test("parley reply queues mail for a disconnected named sender", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness("stale-reply-worker");
@@ -5292,7 +5301,7 @@ test("intercom reply queues mail for a disconnected named sender", { concurrency
     await new Promise((resolve) => setTimeout(resolve, 50));
     await planner.disconnect();
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("reply-stale", {
       action: "reply",
       message: "No sender remains.",
@@ -5479,8 +5488,8 @@ test("an ordinary notification can be replied to using only its visible conversa
     await recipient.emitLifecycle("session_start");
     await waitForSessionByName(planner, "docs-author");
     await waitForSessionByName(planner, "docs-reviewer");
-    const senderTool = sender.tools.find((tool) => tool.name === "intercom")!;
-    const recipientTool = recipient.tools.find((tool) => tool.name === "intercom")!;
+    const senderTool = sender.tools.find((tool) => tool.name === "parley")!;
+    const recipientTool = recipient.tools.find((tool) => tool.name === "parley")!;
     const sent = await senderTool.execute("notify-docs", { action: "send", to: "docs-reviewer", message: "The migration docs are published." }, new AbortController().signal, undefined, sender.ctx);
     assert.match(modelText(sent), /Message sent as docs-author to docs-reviewer/);
     const noticeId = visibleMessageId(modelText(sent));
@@ -5519,8 +5528,8 @@ test("notifications, threaded progress, and clarification questions do not compl
     await reviewer.emitLifecycle("session_start");
     await waitForSessionByName(planner, "release-planner");
     await waitForSessionByName(planner, "release-reviewer");
-    const askerTool = asker.tools.find((tool) => tool.name === "intercom")!;
-    const reviewerTool = reviewer.tools.find((tool) => tool.name === "intercom")!;
+    const askerTool = asker.tools.find((tool) => tool.name === "parley")!;
+    const reviewerTool = reviewer.tools.find((tool) => tool.name === "parley")!;
     const call = (params: Record<string, unknown>) => reviewerTool.execute("review", params, controller.signal, undefined, reviewer.ctx);
     let completed = false;
     const approval = askerTool.execute("approval", { action: "ask", to: "release-reviewer", message: "May I release build 42?" }, controller.signal, undefined, asker.ctx)
@@ -5596,7 +5605,7 @@ test("confirmSend gates an ordinary notification; declining preserves the pendin
       assert.equal((await planner.send(worker.id, { messageId: askId, text: "Ready?", expectsReply: true })).delivered, true);
       await new Promise((resolve) => setTimeout(resolve, 50));
 
-      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+      const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
       const result = await intercomTool.execute("confirm-reply", {
         action: "send",
         to: "planner",
@@ -5644,7 +5653,7 @@ test("contact_supervisor progress_update leaves a pending ask open for an explic
       assert.notEqual(updateResult.details?.error, true);
       assert.equal(updateMessage.replyTo, undefined);
 
-      const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+      const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
       const pendingAfterUpdate = await intercomTool.execute("pending-after-update", { action: "pending" }, new AbortController().signal, undefined, harness.ctx);
       assert.match(pendingAfterUpdate.content[0]?.text ?? "", /boundary-ask-1/);
 
@@ -5662,7 +5671,7 @@ test("contact_supervisor progress_update leaves a pending ask open for an explic
   }
 });
 
-test("intercom ask fails fast when the target is not currently connected", { concurrency: false }, async () => {
+test("parley ask fails fast when the target is not currently connected", { concurrency: false }, async () => {
   const { planner, orchestrator, cleanup } = await setupClients();
   const { default: piIntercomExtension } = await import("./index.ts");
   const harness = createExtensionHarness("offline-ask-worker");
@@ -5676,7 +5685,7 @@ test("intercom ask fails fast when the target is not currently connected", { con
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 250);
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("ask-offline", {
       action: "ask",
       to: disconnectedId,
@@ -5708,7 +5717,7 @@ test("offline send receipts allow cancellation by full ID and queued notificatio
     await new Promise((resolve) => setTimeout(resolve, 50));
     await planner.disconnect();
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
 
     const prefixResult = await intercomTool.execute("send-prefix", {
       action: "send",
@@ -5771,7 +5780,7 @@ test("known failed notification delivery preserves the pending ask", { concurren
     await impostor.connect({ name: "planner", cwd: repoDir, model: "test-model", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
     await impostor.disconnect();
 
-    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const intercomTool = harness.tools.find((tool) => tool.name === "parley")!;
     const result = await intercomTool.execute("send-ambiguous-disconnected", {
       action: "send",
       to: "planner",

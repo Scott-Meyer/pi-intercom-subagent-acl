@@ -46,7 +46,7 @@ import { isValidSessionDescription, isValidSessionName, normalizeSelfProfileUpda
 
 type SessionInfoChangedEvent = Extract<AgentSessionEvent, { type: "session_info_changed" }>;
 
-const INTERCOM_TOOL_NAME = "intercom";
+const PARLEY_TOOL_NAME = "parley";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
@@ -299,7 +299,7 @@ function formatChildOrchestratorMessage(kind: "ask" | "update" | "interview", me
     `Run: ${metadata.runId}`,
     `Agent: ${metadata.agent}`,
     `Child index: ${metadata.index}`,
-    metadata.sessionName ? `Child intercom target: ${metadata.sessionName}` : undefined,
+    metadata.sessionName ? `Child parley target: ${metadata.sessionName}` : undefined,
     "",
     message,
   ].filter((line): line is string => line !== undefined).join("\n");
@@ -655,7 +655,7 @@ function currentTmuxPane(): string | undefined {
   return pane ? pane : undefined;
 }
 function formatIntercomContactSnippet(sessionId: string): string {
-  return `Pi intercom target: ${sessionId}`;
+  return `Pi parley target: ${sessionId}`;
 }
 function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): string {
   if (!session.name) {
@@ -761,7 +761,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       pi.appendEntry(type, data);
     } catch (error) {
       // History is recovery support, not the acceptance boundary for live conversation.
-      conversationPersistenceWarning = `Intercom history was not fully persisted (${type}: ${previewText(getErrorMessage(error), 160) ?? "history write failed"}). Messages and conversation updates remain available in this running session, but recovery after restart may be incomplete.`;
+      conversationPersistenceWarning = `Parley history was not fully persisted (${type}: ${previewText(getErrorMessage(error), 160) ?? "history write failed"}). Messages and conversation updates remain available in this running session, but recovery after restart may be incomplete.`;
     }
   }
 
@@ -816,8 +816,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const original = replyTracker.getMessage(control.messageId);
     const topic = original ? `\nOriginal message: ${JSON.stringify(previewText(original.message.content.text, 180))}` : "";
     const content = control.action === "cancel"
-      ? `**Intercom withdrawal from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was withdrawn by its sender.${topic}\nThe sender no longer requests this work. Earlier delivery or work may already have happened; withdrawal does not undo it.`
-      : `**Intercom update from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was superseded${control.supersededBy ? ` by ${control.supersededBy}` : ""}.${topic}\nThe earlier message is no longer the current request; prior work is not undone.`;
+      ? `**Parley withdrawal from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was withdrawn by its sender.${topic}\nThe sender no longer requests this work. Earlier delivery or work may already have happened; withdrawal does not undo it.`
+      : `**Parley update from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was superseded${control.supersededBy ? ` by ${control.supersededBy}` : ""}.${topic}\nThe earlier message is no longer the current request; prior work is not undone.`;
     const key = messageControlKey(control);
     deferredInboundControls.set(key, { from, control, content });
     flushInboundControl(key);
@@ -1092,7 +1092,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       },
       publish(payload, options = {}) {
         const activeClient = client;
-        if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
+        if (!activeClient?.isConnected()) throw new Error("Parley is not connected");
         const extension = localExtensions.get(namespace);
         const ownerOnly = options.ownerOnly ?? false;
         const ownerEpoch = ownerOnly ? extension?.owner?.epoch : undefined;
@@ -1107,7 +1107,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       },
       commitState(payload, expectedRevision) {
         const activeClient = client;
-        if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
+        if (!activeClient?.isConnected()) throw new Error("Parley is not connected");
         const extension = localExtensions.get(namespace);
         const ownerEpoch = extension?.owner?.epoch;
         if (!ownerEpoch || extension.owner?.sessionId !== activeClient.sessionId) {
@@ -1123,7 +1123,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       },
       async listSessions() {
         const activeClient = client;
-        if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
+        if (!activeClient?.isConnected()) throw new Error("Parley is not connected");
         return activeClient.listSessions();
       },
     };
@@ -1136,7 +1136,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function registerLocalExtension(registration: IntercomExtensionRegistration): void {
     if (!/^[a-z0-9][a-z0-9._/-]{0,63}$/.test(registration.namespace)) {
-      throw new Error(`Invalid intercom extension namespace: ${registration.namespace}`);
+      throw new Error(`Invalid parley extension namespace: ${registration.namespace}`);
     }
     if (localExtensions.has(registration.namespace)) {
       throw new Error(`Intercom extension namespace already registered: ${registration.namespace}`);
@@ -1601,7 +1601,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         const currentClientSessionId = activeClient.sessionId;
         const sessions = await activeClient.listSessions();
         if (!currentClientSessionId) {
-          settleOutboxRequest(request.requestId, "failed", { code: "session_unavailable", detail: "Current session is not registered with intercom" });
+          settleOutboxRequest(request.requestId, "failed", { code: "session_unavailable", detail: "Current session is not registered with parley" });
           return;
         }
         const resolved = resolveOutboxTarget(sessions, currentClientSessionId, request.to);
@@ -1876,7 +1876,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       : "";
     const bodyText = `${receivedMessage.content.text}${attachmentText}`;
     const replyCommand = config.replyHint && receivedMessage.expectsReply
-      ? `intercom({ action: "reply", message: "..." })`
+      ? `parley({ action: "reply", message: "..." })`
       : undefined;
     emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
     const entry = { from, message: receivedMessage, replyCommand, bodyText };
@@ -2148,11 +2148,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const sessions = await activeClient.listSessions();
     const currentSessionId = activeClient.sessionId;
     if (!currentSessionId) {
-      throw new Error("Current session is not registered with intercom.");
+      throw new Error("Current session is not registered with parley.");
     }
     const currentSession = sessions.find((session) => session.id === currentSessionId);
     if (!currentSession) {
-      throw new Error("Current session is missing from intercom session list.");
+      throw new Error("Current session is missing from parley session list.");
     }
 
     const targetCwd = options.cwd && options.cwd !== "."
@@ -2168,7 +2168,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
     }
     if (!options.openProjectPaneIfMissing) {
-      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} No session was launched and no message was sent.`);
+      throw new Error(`${existing.reason ?? `No parley session is connected in ${targetCwd}.`} No session was launched and no message was sent.`);
     }
 
     const beforeSessionIds = new Set(sessions.map((session) => session.id));
@@ -2708,7 +2708,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event) => {
-    if (event.toolName !== "intercom" && event.toolName !== "contact_supervisor") {
+    if (event.toolName !== PARLEY_TOOL_NAME && event.toolName !== "contact_supervisor") {
       return;
     }
     if (!event.details || typeof event.details !== "object") {
@@ -3069,7 +3069,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         nameChanges
         && (currentAdvertisedName !== undefined || effectiveSession?.advertised === true)
       ) {
-        return `profile.name cannot rename an advertised subagent (current intercom name: "${currentAdvertisedName ?? effectiveSession?.name ?? currentName ?? "unknown"}").`;
+        return `profile.name cannot rename an advertised subagent (current parley name: "${currentAdvertisedName ?? effectiveSession?.name ?? currentName ?? "unknown"}").`;
       }
       if (currentName && nameChanges && currentName !== profileManagedName) {
         return `profile.name cannot replace the explicit session name "${currentName}". Omit it and update only the description.`;
@@ -3183,7 +3183,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ? ` (intercom: ${profile.intercomName})`
       : profile.intercomName
         ? ""
-        : " (intercom name awaiting broker confirmation)";
+        : " (parley name awaiting broker confirmation)";
     const publication = profile.description && !profile.descriptionPublished
       ? " [description local only: broker upgrade required]"
       : "";
@@ -3210,8 +3210,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
 
   pi.registerTool(defineTool({
-    name: "intercom",
-    label: "Intercom",
+    name: PARLEY_TOOL_NAME,
+    label: "Parley",
     description: `Conversation with other Pi sessions visible in the current scope.
 
 • list / list-cwd: Connected peers, their identity, focus, location, and activity.
@@ -3433,7 +3433,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
                 text: formatChildOrchestratorMessage(
                   "update",
                   metadata,
-                  `This subagent has advertised itself as "${result.name}" and is now fully visible to and reachable by every session on the intercom mesh, not just you.`,
+                  `This subagent has advertised itself as "${result.name}" and is now fully visible to and reachable by every session on the parley mesh, not just you.`,
                 ),
                 expectsReply: false,
               });
@@ -3461,7 +3461,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
 
             if (!currentSession) {
               return {
-                content: [{ type: "text", text: "Current session is missing from intercom session list." }],
+                content: [{ type: "text", text: "Current session is missing from parley session list." }],
                 details: { error: true },
               };
             }
@@ -3492,7 +3492,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
 
             if (!currentSession) {
               return {
-                content: [{ type: "text", text: "Current session is missing from intercom session list." }],
+                content: [{ type: "text", text: "Current session is missing from parley session list." }],
                 details: { error: true },
               };
             }
@@ -4283,14 +4283,14 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
       return attachSelfProfile(toolResult, normalizeToolProfilePlaceholders(params.profile) !== undefined);
     },
     renderCall(args, theme, context) {
-      const action = typeof args.action === "string" ? args.action : "intercom";
+      const action = typeof args.action === "string" ? args.action : PARLEY_TOOL_NAME;
       const target = typeof args.to === "string" && args.to.trim() ? args.to.trim() : undefined;
       const targets = Array.isArray(args.targets)
         ? args.targets.filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
         : [];
       const messagePreview = previewText(args.message, 96);
       const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
-      let text = theme.fg("toolTitle", theme.bold("intercom "));
+      let text = theme.fg("toolTitle", theme.bold("parley "));
       text += theme.fg(action === "ask" || action === "broadcast" ? "warning" : action === "reply" ? "success" : "accent", action);
       const senderIdentity = (context?.state as { senderIdentity?: string } | undefined)?.senderIdentity;
       if (senderIdentity && ["send", "ask", "reply", "broadcast"].includes(action)) {
@@ -4356,17 +4356,17 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     try {
       contactClient = await ensureConnected("tool");
     } catch (error) {
-      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", commandGeneration);
+      notifyIfLive(ctx, `Parley unavailable: ${getErrorMessage(error)}`, "error", commandGeneration);
       return;
     }
     const sessionId = contactClient.sessionId;
     if (!sessionId || !getLiveContext(liveContext, commandGeneration)) return;
     const snippet = formatIntercomContactSnippet(sessionId);
     if (insertIntoEditor(liveContext, snippet)) {
-      notifyIfLive(liveContext, `Inserted intercom contact target: ${sessionId}`, "info", commandGeneration);
+      notifyIfLive(liveContext, `Inserted parley contact target: ${sessionId}`, "info", commandGeneration);
       return;
     }
-    notifyIfLive(liveContext, `Intercom contact target: ${sessionId}`, "info", commandGeneration);
+    notifyIfLive(liveContext, `Parley contact target: ${sessionId}`, "info", commandGeneration);
   }
 
   async function setIntercomAlias(args: string, ctx: ExtensionContext): Promise<void> {
@@ -4432,7 +4432,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     try {
       overlayClient = await ensureConnected("overlay");
     } catch (error) {
-      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", overlayGeneration);
+      notifyIfLive(ctx, `Parley unavailable: ${getErrorMessage(error)}`, "error", overlayGeneration);
       return;
     }
     if (!getLiveContext(ctx, overlayGeneration)) return;
@@ -4448,7 +4448,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
       if (!getLiveContext(ctx, overlayGeneration)) return;
       const foundCurrentSession = allSessions.find(s => s.id === mySessionId);
       if (!foundCurrentSession) {
-        notifyIfLive(ctx, "Current session is missing from intercom session list", "error", overlayGeneration);
+        notifyIfLive(ctx, "Current session is missing from parley session list", "error", overlayGeneration);
         return;
       }
       currentSession = foundCurrentSession;
@@ -4469,7 +4469,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     try {
       overlayClient = await ensureConnected("overlay");
     } catch (error) {
-      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", overlayGeneration);
+      notifyIfLive(ctx, `Parley unavailable: ${getErrorMessage(error)}`, "error", overlayGeneration);
       return;
     }
     if (!getLiveContext(ctx, overlayGeneration)) return;
@@ -4506,13 +4506,13 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     }
   }
 
-  pi.registerCommand("intercom", {
-    description: "Open session intercom overlay to browse active sessions and send messages",
+  pi.registerCommand("parley", {
+    description: "Open session parley overlay to browse active sessions and send messages",
     handler: async (_args, ctx) => openIntercomOverlay(ctx),
   });
 
-  pi.registerCommand("intercom-id", {
-    description: "Insert a stable pi-intercom contact target snippet for this session into the editor",
+  pi.registerCommand("parley-id", {
+    description: "Insert a stable parley contact target snippet for this session into the editor",
     handler: async (_args, ctx) => insertIntercomId(ctx),
   });
 
@@ -4522,7 +4522,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
   });
 
   pi.registerShortcut("alt+m", {
-    description: "Open session intercom",
+    description: "Open session parley",
     handler: async (ctx) => openIntercomOverlay(ctx),
   });
 }

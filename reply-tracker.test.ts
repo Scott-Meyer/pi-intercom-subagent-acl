@@ -121,7 +121,7 @@ test("replyTo resolves the exact pending ask", () => {
 test("reply errors when no context and no pending asks", () => {
   const tracker = new ReplyTracker();
 
-  assert.throws(() => tracker.resolveReplyTarget({}, 1000), /No active intercom context to reply to/);
+  assert.throws(() => tracker.resolveReplyTarget({}, 1000), /No active parley context to reply to/);
 });
 
 test("reply errors when multiple pending asks and no to", () => {
@@ -173,7 +173,7 @@ test("dismissing a pending ask removes its active reply context", () => {
 
   tracker.dismissPendingAsk("ask-1");
 
-  assert.throws(() => tracker.resolveReplyTarget({}, 1002), /No active intercom context to reply to/);
+  assert.throws(() => tracker.resolveReplyTarget({}, 1002), /No active parley context to reply to/);
 });
 
 test("findUniquePendingAskFrom returns the sole match by exact sender ID", () => {

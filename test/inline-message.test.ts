@@ -31,7 +31,7 @@ const message: Message = {
   },
 };
 
-test("inline intercom messages render at the available terminal width", () => {
+test("inline parley messages render at the available terminal width", () => {
   const component = new InlineMessageComponent(from, message, theme as any);
 
   const lines = component.render(120);
@@ -40,19 +40,19 @@ test("inline intercom messages render at the available terminal width", () => {
   for (const line of lines) assert.equal(visibleWidth(line), 120);
 });
 
-test("expanded inline intercom messages show the full body without collapse controls", () => {
-  const component = new InlineMessageComponent(from, message, theme as any, "intercom({ action: \"reply\", message: \"...\" })");
+test("expanded inline parley messages show the full body without collapse controls", () => {
+  const component = new InlineMessageComponent(from, message, theme as any, "parley({ action: \"reply\", message: \"...\" })");
 
   const rendered = component.render(100).join("\n");
 
   assert.match(rendered, /available terminal width/);
   assert.match(rendered, /narrow fixed/);
   assert.match(rendered, /card/);
-  assert.match(rendered, /To reply: intercom/);
+  assert.match(rendered, /To reply: parley/);
   assert.doesNotMatch(rendered, /Ctrl\+O/);
 });
 
-test("inline intercom messages retain compaction awareness in expanded and collapsed rendering", () => {
+test("inline parley messages retain compaction awareness in expanded and collapsed rendering", () => {
   const awareMessage: Message = {
     ...message,
     peerCompaction: {
@@ -115,7 +115,7 @@ test("routing names are not mistaken for stable-ID rebound", () => {
   assert.doesNotMatch(notice, /message was requested for/);
 });
 
-test("collapsed inline intercom messages keep preview, reply hint, and expand key visible", () => {
+test("collapsed inline parley messages keep preview, reply hint, and expand key visible", () => {
   const component = new InlineMessageComponent(
     from,
     {
@@ -126,7 +126,7 @@ test("collapsed inline intercom messages keep preview, reply hint, and expand ke
       },
     },
     theme as any,
-    "intercom({ action: \"reply\", message: \"...\" })",
+    "parley({ action: \"reply\", message: \"...\" })",
     undefined,
     true,
   );
@@ -138,7 +138,7 @@ test("collapsed inline intercom messages keep preview, reply hint, and expand ke
   for (const line of lines) assert.equal(visibleWidth(line), 120);
   assert.match(rendered, /Alpha beta gamma/);
   assert.doesNotMatch(rendered, /intentionally brief/);
-  assert.match(rendered, /To reply: intercom/);
+  assert.match(rendered, /To reply: parley/);
   assert.match(rendered, /Ctrl\+O/);
   assert.match(rendered, /1 attachment/);
 });
@@ -173,7 +173,7 @@ test("inline message colors follow the tool-title, text, muted-border, and dim-m
       },
     },
     styledTheme(calls) as any,
-    "intercom reply",
+    "parley reply",
   );
 
   const lines = component.render(72);
@@ -181,7 +181,7 @@ test("inline message colors follow the tool-title, text, muted-border, and dim-m
 
   assert.match(lines[0], /^\u001b\[34m╭\u001b\[0m\u001b\[32m From:/);
   assert.match(rendered, /\u001b\[34m│\u001b\[0m\u001b\[33mBody copy\u001b\[0m/);
-  assert.match(rendered, /\u001b\[35m To reply: intercom reply\u001b\[0m/);
+  assert.match(rendered, /\u001b\[35m To reply: parley reply\u001b\[0m/);
   assert.match(rendered, /\u001b\[35m Attachment: note\.txt\u001b\[0m/);
   assert.match(rendered, /\u001b\[35m Reply to parent-m\u001b\[0m/);
   assert.match(lines.at(-1)!, /^\u001b\[34m╰─+╯\u001b\[0m$/);
@@ -194,7 +194,7 @@ test("inline message colors follow the tool-title, text, muted-border, and dim-m
 
 test("collapsed inline messages preserve the same hierarchy without accent", () => {
   const calls: string[] = [];
-  const component = new InlineMessageComponent(from, message, styledTheme(calls) as any, "intercom reply", undefined, true);
+  const component = new InlineMessageComponent(from, message, styledTheme(calls) as any, "parley reply", undefined, true);
 
   const rendered = component.render(72).join("\n");
 

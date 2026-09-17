@@ -66,7 +66,7 @@ test("resolveTargetInCwd fails when a cwd has multiple possible peers and no tar
       currentSessionId: "self",
       targetCwd: "/repo-b",
     }),
-    /Multiple intercom sessions are connected in \/repo-b/,
+    /Multiple parley sessions are connected in \/repo-b/,
   );
 });
 
@@ -340,7 +340,7 @@ test("a missing named target can launch a generically named local session withou
   try {
     const missing = resolveTargetInCwd({ sessions: roster, currentSessionId: "self", targetCwd: root, to: "worker" });
     assert.equal(missing.kind, "missing", "a remote cwd is not the requested local project");
-    assert.match(missing.reason!, /No local intercom session[\s\S]*visible/);
+    assert.match(missing.reason!, /No local parley session[\s\S]*visible/);
     assert.doesNotMatch(missing.reason!, /launch|terminal|tmux/);
     assert.equal(resolveTargetInCwd({ sessions: [remote], currentSessionId: "self", targetCwd: root }).kind, "missing");
 

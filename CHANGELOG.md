@@ -1,8 +1,15 @@
 # Changelog
 
-All notable changes to the `pi-intercom` extension will be documented in this file.
+All notable changes to the `pi-parley` extension will be documented in this file.
 
-## [Unreleased]
+## [1.0.0] - 2026-09-17
+
+### Renamed
+
+The ACL fork of `pi-intercom` is now its own extension: **pi-parley** (repo `Scott-Meyer/pi-parley`, install `pi install git:github.com/Scott-Meyer/pi-parley@v1.0.0`).
+
+- Agent tool `intercom` → `parley`; commands `/intercom` → `/parley` and `/intercom-id` → `/parley-id`; skill `pi-intercom` → `pi-parley`. `/alias` and Alt+M are unchanged.
+- Deliberately unchanged for compatibility: the broker wire protocol (`pi-intercom` v1, `pi-intercom-peer`), runtime dir `~/.pi/agent/intercom/` (config, sockets, queued mail, federation state), persisted session-history entry types (`intercom_*`), extension-API event names (`intercom:*`), the `pi-intercom/project-launch-v1` capability namespace, and `PI_INTERCOM_*` env vars. Existing deployments upgrade in place; remove any earlier intercom extension first so Pi does not load both copies.
 
 ### Added
 - Non-blocking asks (`blocking: false`) return an initial delivery outcome and receive the answer later in the conversation, including while a headless caller works. Outstanding questions and received-but-not-yet-persisted conversation content have journaled reload/resume recovery.

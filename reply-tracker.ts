@@ -131,7 +131,7 @@ export class ReplyTracker {
       return pending[0]!;
     }
     if (pending.length === 0) {
-      throw new Error("No active intercom context to reply to");
+      throw new Error("No active parley context to reply to");
     }
 
     throw new Error(`Multiple pending asks — specify \`to\` or \`replyTo\`.\n${this.formatConversationContext({ now })}`);

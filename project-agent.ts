@@ -254,9 +254,9 @@ export function resolveTargetInCwd(input: {
       return { kind: "found", session: candidates[0], targetCwd: input.targetCwd };
     }
     if (candidates.length === 0) {
-      return { kind: "missing", targetCwd: input.targetCwd, reason: `No other local intercom sessions are visible in ${input.targetCwd}.` };
+      return { kind: "missing", targetCwd: input.targetCwd, reason: `No other local parley sessions are visible in ${input.targetCwd}.` };
     }
-    throw new Error(`Multiple intercom sessions are connected in ${input.targetCwd}: ${formatSessionRefs(candidates)}. Specify 'to'.`);
+    throw new Error(`Multiple parley sessions are connected in ${input.targetCwd}: ${formatSessionRefs(candidates)}. Specify 'to'.`);
   }
 
   const byId = inCwd.find((session) => session.id === target);
@@ -266,16 +266,16 @@ export function resolveTargetInCwd(input: {
   const byName = inCwd.filter((session) => session.name?.toLowerCase() === lowerName);
   if (byName.length === 1) return { kind: "found", session: byName[0], targetCwd: input.targetCwd };
   if (byName.length > 1) {
-    throw new Error(`Multiple intercom sessions named "${target}" are connected in ${input.targetCwd}: ${formatSessionRefs(byName)}. Address one by session ID.`);
+    throw new Error(`Multiple parley sessions named "${target}" are connected in ${input.targetCwd}: ${formatSessionRefs(byName)}. Address one by session ID.`);
   }
 
   const byIdPrefix = inCwd.filter((session) => session.id.startsWith(target));
   if (byIdPrefix.length === 1) return { kind: "found", session: byIdPrefix[0], targetCwd: input.targetCwd };
   if (byIdPrefix.length > 1) {
-    throw new Error(`Multiple intercom sessions in ${input.targetCwd} match ID prefix "${target}". Use a longer session ID prefix.`);
+    throw new Error(`Multiple parley sessions in ${input.targetCwd} match ID prefix "${target}". Use a longer session ID prefix.`);
   }
 
-  return { kind: "missing", targetCwd: input.targetCwd, reason: `No local intercom session matching "${target}" is visible in ${input.targetCwd}.` };
+  return { kind: "missing", targetCwd: input.targetCwd, reason: `No local parley session matching "${target}" is visible in ${input.targetCwd}.` };
 }
 
 /**
@@ -409,13 +409,13 @@ export async function waitForProjectSession(client: ListSessionsClient, input: {
       );
       if (newInProject.length === 1) return newInProject[0]!;
       if (newInProject.length > 1) {
-        throw new Error(`Multiple new local intercom sessions are visible in ${input.projectRoot}: ${formatSessionRefs(newInProject)}. Their relationship to the launch is unknown.`);
+        throw new Error(`Multiple new local parley sessions are visible in ${input.projectRoot}: ${formatSessionRefs(newInProject)}. Their relationship to the launch is unknown.`);
       }
 
       await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())), input.signal);
     }
 
-    throw new Error(`Timed out waiting for a local Pi intercom session to register in ${input.projectRoot}. The project launcher may still be starting, or pi-intercom may not be loaded there.`);
+    throw new Error(`Timed out waiting for a local Pi parley session to register in ${input.projectRoot}. The project launcher may still be starting, or parley may not be loaded there.`);
   } catch (cause) {
     throw new ProjectLaunchError(
       errorText(cause) + (input.launch ? " The launch attempt has not been undone; another launch could create a duplicate." : ""),

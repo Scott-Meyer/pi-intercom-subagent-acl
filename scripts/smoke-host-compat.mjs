@@ -95,12 +95,12 @@ try {
     if (!existsSync(hostPackage)) throw new Error(`${host.label}: expected host package is missing`);
     for (const forbiddenPackagePath of host.forbiddenPackagePaths) {
       if (existsSync(join(project, "node_modules", forbiddenPackagePath))) {
-        throw new Error(`${host.label}: installing pi-intercom pulled in ${forbiddenPackagePath}`);
+        throw new Error(`${host.label}: installing pi-parley pulled in ${forbiddenPackagePath}`);
       }
     }
 
     const hostManifest = JSON.parse(readFileSync(join(hostPackage, "package.json"), "utf8"));
-    const extensionRoot = join(project, "node_modules", "pi-intercom");
+    const extensionRoot = join(project, "node_modules", "pi-parley");
     const extensionManifest = JSON.parse(readFileSync(join(extensionRoot, "package.json"), "utf8"));
     assert.deepEqual(extensionManifest.dependencies, { tsx: "^4.23.13" });
     const extensionPath = join(extensionRoot, "index.ts");
@@ -137,8 +137,8 @@ try {
       (record) => record.type === "session_info_changed" && record.name === `${host.label}-compatible`,
     );
     const availableCommands = commands?.data?.commands ?? commands?.data ?? [];
-    if (!commands?.success || !availableCommands.some((command) => command.name === "intercom")) {
-      throw new Error(`${host.label}: pi-intercom commands were not loaded`);
+    if (!commands?.success || !availableCommands.some((command) => command.name === "parley")) {
+      throw new Error(`${host.label}: pi-parley commands were not loaded`);
     }
     if (!alias?.success || !nameEvent || !state?.success || state.data?.sessionName !== `${host.label}-compatible`) {
       throw new Error(`${host.label}: extension command or host session-name event failed`);

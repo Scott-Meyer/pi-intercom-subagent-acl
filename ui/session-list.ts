@@ -131,7 +131,7 @@ export class SessionListOverlay implements Component {
     lines.push(row());
 
     if (this.sessions.length === 0) {
-      lines.push(row(this.theme.fg("dim", " No other intercom-connected sessions")));
+      lines.push(row(this.theme.fg("dim", " No other parley-connected sessions")));
     } else {
       const startIndex = Math.max(
         0,

@@ -51,7 +51,7 @@ async function start(harness: ReturnType<typeof createExtensionHarness>, peer: I
   return target!;
 }
 function call(harness: ReturnType<typeof createExtensionHarness>, params: Record<string, unknown>) {
-  return harness.tools.find((tool) => tool.name === "intercom")!.execute("scenario", params, AbortSignal.timeout(8_000), undefined, harness.ctx);
+  return harness.tools.find((tool) => tool.name === "parley")!.execute("scenario", params, AbortSignal.timeout(8_000), undefined, harness.ctx);
 }
 function text(result: { content: { text: string }[] }) { return result.content.map((item) => item.text).join("\n"); }
 async function modelContext(harness: ReturnType<typeof createExtensionHarness>, messages: unknown[] = []) {
@@ -218,7 +218,7 @@ test("implicit replies survive inspection without guessing between fresh convers
     await harness.emitLifecycle("agent_start");
     await harness.emitLifecycle("turn_start");
     await modelContext(harness, nextHistory);
-    assert.match(text(await call(harness, { action: "reply", message: "No current colleague" })), /No active intercom context/);
+    assert.match(text(await call(harness, { action: "reply", message: "No current colleague" })), /No active parley context/);
     assert.equal(betaReplies.length, 0);
 
     const update = await alpha.send(target.id, { text: "The schema note has an addendum" });

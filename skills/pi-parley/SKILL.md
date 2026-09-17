@@ -1,13 +1,13 @@
 ---
-name: pi-intercom
+name: pi-parley
 description: |
   Conversation with other Pi sessions: exchange findings, ask questions,
   and discuss work across projects.
 ---
 
-# Pi Intercom
+# Pi Parley
 
-Intercom connects Pi sessions so they can work together like colleagues. Each has its own conversation and working context; messages carry the information they share, not everything the sender knows.
+Parley connects Pi sessions so they can work together like colleagues. Each has its own conversation and working context; messages carry the information they share, not everything the sender knows.
 
 `send` shares information. `ask` requests an answer and can wait for it or receive it later while work continues. `reply` communicates back to the colleague and answers a question when applicable. An update can remain an update even while a question is outstanding.
 

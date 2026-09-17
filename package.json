@@ -1,6 +1,6 @@
 {
-  "name": "pi-intercom",
-  "version": "0.13.0-acl.11",
+  "name": "pi-parley",
+  "version": "1.0.0",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
@@ -39,7 +39,7 @@
     "skills/**/*"
   ],
   "scripts": {
-    "test": "tsx --test broker/federation-protocol.test.ts broker/federation-roster.test.ts broker/federation-send.test.ts broker/federation-origin.test.ts broker/peer-link.test.ts broker/federation.integration.test.ts broker/client.test.ts broker/client-liveness.test.ts broker/collaboration-state.test.ts broker/extension.test.ts broker/framing.test.ts broker/paths.test.ts broker/runtime-claim.test.ts broker/spawn.test.ts broker/subagent-acl.test.ts broker/delivery-feedback.test.ts config.test.ts cwd.test.ts format-context.test.ts pi-compat.test.ts session-profile.test.ts project-agent.test.ts reply-tracker.test.ts intercom.integration.test.ts test/inline-message.test.ts test/overlay-width.test.ts test/session-id-prefixes.test.ts recipient-context.integration.test.ts",
+    "test": "tsx --test broker/federation-protocol.test.ts broker/federation-roster.test.ts broker/federation-send.test.ts broker/federation-origin.test.ts broker/peer-link.test.ts broker/federation.integration.test.ts broker/client.test.ts broker/client-liveness.test.ts broker/collaboration-state.test.ts broker/extension.test.ts broker/framing.test.ts broker/paths.test.ts broker/runtime-claim.test.ts broker/spawn.test.ts broker/subagent-acl.test.ts broker/delivery-feedback.test.ts config.test.ts cwd.test.ts format-context.test.ts pi-compat.test.ts session-profile.test.ts project-agent.test.ts reply-tracker.test.ts parley.integration.test.ts test/inline-message.test.ts test/overlay-width.test.ts test/session-id-prefixes.test.ts recipient-context.integration.test.ts",
     "test:host-compat": "node scripts/smoke-host-compat.mjs",
     "typecheck": "tsc --noEmit --module nodenext --moduleResolution nodenext --target es2022 --strict --skipLibCheck --allowImportingTsExtensions --types node index.ts pi-compat.ts compaction-awareness.ts session-profile.ts broker/federation-types.ts broker/federation-protocol.ts broker/federation-roster.ts broker/federation-send.ts broker/federation-origin.ts broker/peer-link.ts broker/broker.ts broker/collaboration-state.ts ui/*.ts"
   },

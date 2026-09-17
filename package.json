@@ -1,6 +1,10 @@
 {
   "name": "pi-parley",
-  "version": "1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Scott-Meyer/pi-parley.git"
+  },
+  "version": "1.0.1",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",

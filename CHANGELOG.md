@@ -2,6 +2,12 @@
 
 All notable changes to the `pi-parley` extension will be documented in this file.
 
+## [1.0.1] - 2026-09-17
+
+### Fixed
+
+- Package metadata: repository link for GitHub — npm provenance verification and the npm page now point at the parley repo.
+
 ## [1.0.0] - 2026-09-17
 
 ### Renamed

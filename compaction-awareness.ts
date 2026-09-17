@@ -32,5 +32,5 @@ export function formatPeerCompactionNotice(
       : peerName
         ? `${peerName} (requested as ${requested})`
         : `${requested} [peer session ${shortPeerId}]`;
-  return `Notice: ${identifiedPeer} compacted context since your last direct contact${countText}.${contextText} Their active turn memory is summary-based; include explicit file paths or ticket IDs when referring to earlier details.`;
+  return `Notice: ${identifiedPeer} compacted context since your last direct contact${countText}.${contextText} Older conversational details may now be summarized; their files and ongoing work are unchanged.`;
 }

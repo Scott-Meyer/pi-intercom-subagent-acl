@@ -26,13 +26,16 @@ import {
   type IntercomOutboxResultStatus,
   type IntercomOutboxResultV1,
 } from "./extension-api.ts";
-import { ReplyTracker } from "./reply-tracker.ts";
+import { ReplyTracker, type IntercomContext } from "./reply-tracker.ts";
+import { restoreConversationHistory, messageControlKey, type OutstandingAsk } from "./conversation-history.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { formatPeerCompactionNotice } from "./compaction-awareness.ts";
+import { formatCancellationResult, formatDeliveryResult } from "./message-results.ts";
 import {
   openProjectPane,
+  ProjectLaunchError,
   projectLaunchRequestText,
   resolveProjectLauncherCommand,
   resolveTargetInCwd,
@@ -83,6 +86,7 @@ interface DeliveryTarget {
   id: string;
   label: string;
   projectPane?: ProjectPaneLaunch;
+  session?: SessionInfo;
 }
 
 interface OutboxTarget {
@@ -144,6 +148,12 @@ interface SupervisorInterviewReply {
 }
 
 function getErrorMessage(error: unknown): string {
+  if (error instanceof ProjectLaunchError) {
+    const launch = error.launch;
+    const receipt = launch ? `\nLaunch in ${launch.projectRoot}: ${launch.outcome}${launch.requestMessageId ? ` (request ${launch.requestMessageId})` : ""}.` : "";
+    const observed = error.session ? `\nObserved session: ${error.session.name || error.session.id} (${error.session.id}).` : "";
+    return `${error.message}\nStopped at ${error.stage}.${receipt}${observed}`;
+  }
   return error instanceof Error ? error.message : String(error);
 }
 
@@ -151,7 +161,7 @@ function getErrorMessage(error: unknown): string {
 // "Message sent", which reads as live delivery. Make the mailbox state explicit
 // so senders immediately know the target is offline and may never return.
 function queuedDeliveryNote(targetDisplay: string): string {
-  return `Queued for offline session "${targetDisplay}": it is not currently connected, so this message will be delivered only if it reconnects within 24h. If the session has ended, check intercom({ action: "list" }) and resend to its new address.`;
+  return `Queued for offline session "${targetDisplay}" for up to 24h while this broker remains running. The peer has not received it; this mailbox is not a durable handoff.`;
 }
 
 function deliveryDetails(result: SendResult): Record<string, unknown> {
@@ -164,6 +174,8 @@ function deliveryDetails(result: SendResult): Record<string, unknown> {
     ...(result.code ? { code: result.code } : {}),
     ...(result.reason ? { reason: result.reason } : {}),
     ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
+    ...(result.recipient ? { recipient: result.recipient } : {}),
+    ...(result.cancellation ? { cancellation: result.cancellation } : {}),
   };
 }
 
@@ -190,9 +202,12 @@ function batchSendToolResult(options: {
   requestedTargetCount: number;
   duplicateCount: number;
   broadcast: boolean;
+  sender: string;
+  excludedRemoteCount?: number;
 }) {
   const acceptedCount = options.outcomes.filter((outcome) => outcome.delivered).length;
-  const failedCount = options.outcomes.length - acceptedCount;
+  const unknownCount = options.outcomes.filter((outcome) => !outcome.outcomeKnown || outcome.delivery === "unknown").length;
+  const failedCount = options.outcomes.length - acceptedCount - unknownCount;
   const noun = options.broadcast
     ? `visible session${options.outcomes.length === 1 ? "" : "s"}`
     : `target${options.outcomes.length === 1 ? "" : "s"}`;
@@ -202,21 +217,22 @@ function batchSendToolResult(options: {
   const lines = options.outcomes.map((outcome) => {
     if (outcome.delivered) {
       const state = outcome.delivery === "queued" ? "queued for offline delivery (up to 24h while this broker remains running)" : "sent";
-      const deliveryLine = `- ✓ ${outcome.to}: ${state}${outcome.messageId ? ` (${outcome.messageId.slice(0, 8)})` : ""}`;
+      const deliveryLine = `- ✓ ${outcome.to}: ${state}${outcome.messageId ? ` (${outcome.messageId})` : ""}`;
       return outcome.peerCompaction
         ? `${deliveryLine}\n  ${formatPeerCompactionNotice(outcome.to, outcome.peerCompaction, outcome.targetId)}`
         : deliveryLine;
     }
-    return `- ✗ ${outcome.to}: ${outcome.reason ?? "delivery failed"}`;
+    const unknown = !outcome.outcomeKnown || outcome.delivery === "unknown";
+    return `- ${unknown ? "?" : "✗"} ${outcome.to}: ${unknown ? "outcome unknown; repeating may duplicate delivery — " : ""}${outcome.reason ?? "delivery failed"}${outcome.messageId ? ` (messageId ${outcome.messageId})` : " (no message created)"}`;
   });
   if (options.duplicateCount > 0) {
     lines.push(`- Skipped ${options.duplicateCount} duplicate target${options.duplicateCount === 1 ? "" : "s"}.`);
   }
   if (options.broadcast) {
-    lines.push("", "Broadcasts interrupt every visible peer. Prefer `send` with `to` or `targets` when you know who needs the message.");
+    lines.push("", `Host-local broadcast; ${options.excludedRemoteCount ?? 0} visible remote peer(s) were not included.`);
   }
   return {
-    content: [{ type: "text" as const, text: `${heading}\n${lines.join("\n")}` }],
+    content: [{ type: "text" as const, text: `${heading} Sent as ${options.sender}.\n${lines.join("\n")}` }],
     details: {
       ...(acceptedCount === 0 ? { error: true } : {}),
       batch: true,
@@ -226,8 +242,9 @@ function batchSendToolResult(options: {
       recipientCount: options.outcomes.length,
       acceptedCount,
       failedCount,
+      unknownCount,
       duplicateCount: options.duplicateCount,
-      allAccepted: failedCount === 0,
+      allAccepted: acceptedCount === options.outcomes.length,
       outcomes: options.outcomes,
     },
   };
@@ -240,10 +257,13 @@ function toError(error: unknown): Error {
 function formatAttachments(attachments: Attachment[]): string {
   let text = "";
   for (const att of attachments) {
+    const label = `Attachment snapshot: ${att.name} (${att.type})`;
     if (att.language) {
-      text += `\n\n---\nAttachment: ${att.name}\n~~~${att.language}\n${att.content}\n~~~`;
+      const runs = att.content.match(/~+/g) ?? [];
+      const fence = "~".repeat(Math.max(3, ...runs.map((run) => run.length + 1)));
+      text += `\n\n---\n${label}\n${fence}${att.language}\n${att.content}\n${fence}`;
     } else {
-      text += `\n\n---\nAttachment: ${att.name}\n${att.content}`;
+      text += `\n\n---\n${label}\n${att.content}`;
     }
   }
   return text;
@@ -383,10 +403,10 @@ function interviewOptionLabel(option: unknown): string {
 
 function interviewExampleValue(question: SupervisorInterviewQuestion): unknown {
   if (question.type === "multi") {
-    return question.options?.slice(0, 2).map(interviewOptionLabel) ?? [];
+    return ["<selected option label>"];
   }
   if (question.type === "single") {
-    return question.options?.[0] !== undefined ? interviewOptionLabel(question.options[0]) : "option label";
+    return "<selected option label>";
   }
   if (question.type === "image") {
     return "image/file reference or description";
@@ -429,8 +449,8 @@ function formatSupervisorInterviewRequest(interview: SupervisorInterviewRequest,
 
   lines.push(
     "",
-    "Supervisor reply instructions:",
-    "Reply with plain JSON or a fenced ```json block using this stable shape. Use the question ids exactly. Info questions are context-only and do not need responses. For single questions, value is one option label. For multi questions, value is an array of option labels. For text/image questions, value is a string unless the question asks otherwise.",
+    "Answer format:",
+    "Answers are parsed by question id: one option label for single, a list of labels for multi, and text for text/image. Info entries are context only.",
     "",
     "```json",
     JSON.stringify(responseExample, null, 2),
@@ -635,7 +655,7 @@ function currentTmuxPane(): string | undefined {
   return pane ? pane : undefined;
 }
 function formatIntercomContactSnippet(sessionId: string): string {
-  return `Use pi-intercom: intercom({ action: "send", to: "${sessionId}", message: "..." })`;
+  return `Pi intercom target: ${sessionId}`;
 }
 function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): string {
   if (!session.name) {
@@ -648,7 +668,7 @@ function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): stri
 function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: boolean, idPrefix: string): string {
   const name = session.name || "Unnamed session";
   const remote = session.federation
-    ? `remote:${session.federation.originLabel ?? session.federation.originId}`
+    ? `remote:${session.federation.originLabel ?? session.federation.originId}; text sends only when supported, no asks/replies/attachments`
     : undefined;
   const tags = [isSelf ? "self" : session.cwd === currentCwd ? "same cwd" : undefined, remote, session.status]
     .filter((tag): tag is string => Boolean(tag));
@@ -674,19 +694,16 @@ function formatMessageTimestamp(timestamp: number | undefined): string | undefin
   return typeof timestamp === "number" && Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : undefined;
 }
 function formatInboundDeliveryMetadata(message: Message): string {
-  const parts = [`id ${message.id}`];
-  if (typeof message.senderSequence === "number") parts.push(`seq ${message.senderSequence}`);
-  if (message.supersedes) parts.push(`supersedes ${message.supersedes}`);
-  if (message.retryOf) parts.push(`retry of ${message.retryOf}`);
-  const sentAt = formatMessageTimestamp(message.timestamp);
-  if (sentAt) parts.push(`sent ${sentAt}`);
-  const brokerDeliveredAt = formatMessageTimestamp(message.brokerDeliveredAt);
-  if (brokerDeliveredAt) parts.push(`broker delivered ${brokerDeliveredAt}`);
-  const receiverReceivedAt = formatMessageTimestamp(message.receiverReceivedAt);
-  if (receiverReceivedAt) parts.push(`receiver received ${receiverReceivedAt}`);
-  const injectedAt = formatMessageTimestamp(message.injectedAt);
-  if (injectedAt) parts.push(`injected ${injectedAt}`);
-  return parts.join(" · ");
+  const parts = [`Message: ${message.id}`];
+  if (message.replyTo) parts.push(`Reply to: ${message.replyTo}`);
+  if (message.supersedes) parts.push(`Supersedes: ${message.supersedes}`);
+  if (message.retryOf) parts.push(`Retry of: ${message.retryOf}`);
+  if (message.provenance) {
+    parts.push(`Via extension ${message.provenance.extensionName} (${message.provenance.extensionId}); request ${message.provenance.requestId}`);
+  }
+  // Transport timestamps remain in details. A long mailbox delay changes the meaning of the text.
+  if (Date.now() - message.timestamp > 60_000) parts.push(`Originally sent: ${formatMessageTimestamp(message.timestamp)}`);
+  return parts.join("\n");
 }
 export default function piIntercomExtension(pi: ExtensionAPI) {
   let client: IntercomClient | null = null;
@@ -737,6 +754,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let receiverBaselineRetryTimer: NodeJS.Timeout | null = null;
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
+  let conversationPersistenceWarning: string | undefined;
+
+  function recordConversationEntry(type: string, data: unknown): void {
+    try {
+      pi.appendEntry(type, data);
+    } catch (error) {
+      // History is recovery support, not the acceptance boundary for live conversation.
+      conversationPersistenceWarning = `Intercom history was not fully persisted (${type}: ${previewText(getErrorMessage(error), 160) ?? "history write failed"}). Messages and conversation updates remain available in this running session, but recovery after restart may be incomplete.`;
+    }
+  }
 
   const seenInboundMessages = new Map<string, number>();
   const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; detail?: string }>();
@@ -744,6 +771,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const pendingOutboxRequests = new Map<string, PendingOutboxRequest>();
   function dismissIncomingAsk(messageId: string): void {
     replyTracker.dismissPendingAsk(messageId);
+    recordConversationEntry("intercom_inbound_settled", { messageId, timestamp: Date.now() });
   }
   function hasSeenInboundMessage(from: SessionInfo, message: Message, now = Date.now()): boolean {
     for (const [key, seenAt] of seenInboundMessages) {
@@ -775,13 +803,38 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       // Receipts are diagnostics; message handling should not fail when the sender disconnects.
     }
   }
-  function handleMessageControl(control: MessageControl): void {
-    replyTracker.dismissPendingAsk(control.messageId);
-    if (control.action === "cancel") {
-      emitMessageReceipt(control.messageId, "cancellation_requested", "message may already be injected or processed");
-      return;
+  function handleMessageControl(from: SessionInfo, control: MessageControl, restored = false): void {
+    if (!restored) recordConversationEntry("intercom_inbound_control", { from, control });
+    replyTracker.setDisposition(control.messageId, {
+      state: control.action === "cancel" ? "withdrawn" : "superseded",
+      ...(control.supersededBy ? { replacementId: control.supersededBy } : {}),
+    });
+    deferredInboundMessages.delete(control.messageId);
+    pendingHostEnvelopes.delete(`message:${control.messageId}`);
+    contextFallbackEnvelopes.delete(`message:${control.messageId}`);
+    freshModelContexts.delete(control.messageId);
+    const original = replyTracker.getMessage(control.messageId);
+    const topic = original ? `\nOriginal message: ${JSON.stringify(previewText(original.message.content.text, 180))}` : "";
+    const content = control.action === "cancel"
+      ? `**Intercom withdrawal from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was withdrawn by its sender.${topic}\nThe sender no longer requests this work. Earlier delivery or work may already have happened; withdrawal does not undo it.`
+      : `**Intercom update from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was superseded${control.supersededBy ? ` by ${control.supersededBy}` : ""}.${topic}\nThe earlier message is no longer the current request; prior work is not undone.`;
+    const key = messageControlKey(control);
+    deferredInboundControls.set(key, { from, control, content });
+    flushInboundControl(key);
+  }
+  function flushInboundControl(key: string): void {
+    const entry = deferredInboundControls.get(key);
+    const ctx = getLiveContext();
+    if (!entry || !ctx) return;
+    const envelope = { customType: "intercom_message_control", content: entry.content, display: true, details: { from: entry.from, control: entry.control } };
+    pendingHostEnvelopes.set(`control:${key}`, envelope);
+    try {
+      pi.sendMessage(envelope, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
+    } catch {
+      // The control remains pending in memory; context injection and idle retry share this queue.
     }
-    emitMessageReceipt(control.messageId, "superseded", control.supersededBy ? `superseded by ${control.supersededBy}` : undefined);
+    confirmPersistedInbound();
+    scheduleInboundRetry();
   }
   function latestDeliveryState(messageId: string | null, fallback: string): string {
     if (!messageId) {
@@ -796,6 +849,91 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     resolve: (message: Message) => void;
     reject: (error: Error) => void;
   } | null = null;
+  /** Non-blocking asks awaiting replies. Resolved by replyTo correlation on
+   * inbound messages, by cancellation, or surfaced with age by 'status'; the
+   * broker's own ask-edge timeout keeps the authoritative lifecycle bounded. */
+  const outstandingAsks = new Map<string, OutstandingAsk>();
+  const deferredInboundMessages = new Map<string, InboundMessageEntry>();
+  const deferredInboundControls = new Map<string, { from: SessionInfo; control: MessageControl; content: string }>();
+  let inboundRetryTimer: NodeJS.Timeout | null = null;
+  const pendingHostEnvelopes = new Map<string, { customType: string; content: string; display: boolean; details: unknown }>();
+  const contextFallbackEnvelopes = new Map<string, { customType: string; content: string; display: boolean; details: unknown }>();
+  const freshModelContexts = new Map<string, IntercomContext>();
+
+  function scheduleInboundRetry(): void {
+    if (inboundRetryTimer || (!deferredInboundMessages.size && !deferredInboundControls.size)) return;
+    const generation = runtimeGeneration;
+    inboundRetryTimer = setTimeout(() => {
+      inboundRetryTimer = null;
+      const ctx = getLiveContext(runtimeContext, generation);
+      if (!ctx) return;
+      confirmPersistedInbound();
+      // Busy queues are recovered by the context event, not repeated steering copies.
+      if (ctx.isIdle()) {
+        for (const entry of deferredInboundMessages.values()) sendIncomingMessage(entry, "trigger", generation);
+        for (const key of deferredInboundControls.keys()) flushInboundControl(key);
+      }
+      scheduleInboundRetry();
+    }, 1_000);
+    inboundRetryTimer.unref?.();
+  }
+
+  function confirmPersistedInbound(): void {
+    const ctx = getLiveContext();
+    if (!ctx || (pendingHostEnvelopes.size === 0 && contextFallbackEnvelopes.size === 0)) return;
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type !== "custom_message") continue;
+      const key = inboundEnvelopeKey(entry);
+      if (key) {
+        contextFallbackEnvelopes.delete(key);
+        confirmInboundEnvelope(key);
+      }
+    }
+  }
+
+  function inboundEnvelopeKey(value: { customType?: string; details?: unknown }): string | undefined {
+    const details = value.details as { message?: Message; control?: MessageControl } | undefined;
+    if (value.customType === "intercom_message" && details?.message?.id) return `message:${details.message.id}`;
+    if (value.customType === "intercom_message_control" && details?.control?.messageId) return `control:${messageControlKey(details.control)}`;
+    return undefined;
+  }
+
+  function confirmInboundEnvelope(key: string): void {
+    if (!pendingHostEnvelopes.delete(key)) return;
+    if (key.startsWith("message:")) {
+      const id = key.slice("message:".length);
+      const entry = deferredInboundMessages.get(id);
+      if (!entry) return;
+      recordConversationEntry("intercom_inbound_visible", { messageId: id, timestamp: Date.now() });
+      deferredInboundMessages.delete(id);
+      freshModelContexts.set(id, { from: entry.from, message: entry.message, receivedAt: entry.message.receiverReceivedAt ?? Date.now() });
+      emitMessageReceipt(id, "injected", "observed in host conversation/model context; not proof of processing");
+      settleOutgoingReply(entry.from, entry.message);
+      acknowledgeInboundMessageContact(client, entry.message);
+    } else {
+      const controlId = key.slice("control:".length);
+      const entry = deferredInboundControls.get(controlId);
+      if (!entry) return;
+      recordConversationEntry("intercom_control_visible", { key: controlId, timestamp: Date.now() });
+      deferredInboundControls.delete(controlId);
+      emitMessageReceipt(entry.control.messageId, entry.control.action === "cancel" ? "cancellation_requested" : "superseded", "withdrawal/update observed in host conversation/model context; earlier work may have happened");
+    }
+  }
+
+  function settleOutgoingReply(from: SessionInfo, message: Message): void {
+    if (!message.replyTo || message.completesAsk === false || message.expectsReply) return;
+    const ask = outstandingAsks.get(message.replyTo);
+    if (!ask || ask.to !== from.id) return;
+    recordConversationEntry("intercom_ask_settled", { messageId: message.replyTo, reason: "reply accepted by host", timestamp: Date.now() });
+    outstandingAsks.delete(message.replyTo);
+  }
+  /** The effective intercom identity for an outgoing message: the broker's
+   * collision-resolved projection of this session when available, else the
+   * canonical Pi name. Captured at send time so receipts keep the identity
+   * actually used, even after a later rename. */
+  function currentSendIdentity(client: IntercomClient): string {
+    return client.getSelfSession()?.name?.trim() || pi.getSessionName()?.trim() || "unnamed session";
+  }
   function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
     if (replyWaiter) {
       return Promise.reject(new Error("Already waiting for a reply"));
@@ -834,6 +972,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         },
       };
     });
+  }
+  function rejectOwnedReplyWaiter(messageId: string | null, error: Error): void {
+    if (messageId && replyWaiter?.replyTo === messageId) rejectReplyWaiter(error);
   }
   function rejectReplyWaiter(error: Error): void {
     replyWaiter?.reject(error);
@@ -1355,7 +1496,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     };
   }
   function emitOutboxResult(result: IntercomOutboxResultV1, request: OutboxRequestTrace): void {
-    pi.appendEntry("intercom_outbox_result", {
+    recordConversationEntry("intercom_outbox_result", {
       ...result,
       ...(request.to ? { to: request.to } : {}),
       ...(request.message ? { message: { text: request.message } } : {}),
@@ -1523,8 +1664,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           return;
         }
         surfaceBackgroundPeerCompaction(activeClient, target.label, result, outboxGeneration, target.id);
-        pi.appendEntry("intercom_sent", {
+        recordConversationEntry("intercom_sent", {
           to: target.label,
+          targetId: result.recipient?.id ?? target.id,
           message: { text: request.message },
           messageId: result.id,
           timestamp: Date.now(),
@@ -1561,6 +1703,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     const targetDisplay = from.name || from.id.slice(0, 8);
+    const original = findOutgoingTopic(receipt.messageId);
+    const topic = original ? `\nOriginal message: ${JSON.stringify(previewText(original.message?.text ?? original.preview, 240))}` : "";
     pi.appendEntry("intercom_delivery_failed", {
       to: targetDisplay,
       messageId: receipt.messageId,
@@ -1570,7 +1714,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     pi.sendMessage(
       {
         customType: "intercom_delivery_notice",
-        content: `**Intercom delivery failed:** message ${receipt.messageId} to "${targetDisplay}" (${from.cwd}) was never delivered — ${receipt.detail ?? "the mailbox entry expired"}. If this still matters, run intercom({ action: "list" }) and resend to the session's current address.`,
+        content: `**Intercom delivery failed:** queued message to ${targetDisplay} (${from.cwd}) expired before delivery.\nMessage ID: ${receipt.messageId}${topic}\nReason: ${receipt.detail ?? "mailbox entry expired"}.`,
         display: true,
         details: { to: targetDisplay, messageId: receipt.messageId, expired: true, ...(receipt.detail ? { detail: receipt.detail } : {}) },
       },
@@ -1620,7 +1764,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   function acknowledgeInboundMessageContact(sourceClient: IntercomClient | null, message: Message): void {
     if (!message.contactToken || !sourceClient) return;
     if (message.contactBaseline) {
-      pi.appendEntry("intercom_receiver_baseline_pending", {
+      recordConversationEntry("intercom_receiver_baseline_pending", {
         token: message.contactToken,
         messageId: message.id,
         timestamp: Date.now(),
@@ -1631,35 +1775,57 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     sourceClient.acknowledgeMessageContact(message);
   }
 
-  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
-    if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
-      return;
+  function findOutgoingTopic(messageId: string): { to: string; preview: string; message?: Message["content"] } | undefined {
+    const entries = getLiveContext()?.sessionManager.getEntries() ?? [];
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index];
+      if (entry?.type !== "custom" || (entry.customType !== "intercom_ask_pending" && entry.customType !== "intercom_sent")) continue;
+      const data = entry.data as { messageId?: string; to?: string; targetId?: string; message?: Message["content"] } | undefined;
+      const recipient = data?.targetId ?? data?.to;
+      if (data?.messageId === messageId && recipient && data.message) return { to: recipient, preview: data.message.text, message: data.message };
     }
+    return undefined;
+  }
+  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
+    if (runtimeStarted && !getLiveContext(runtimeContext, generation)) return;
     const injectedMessage = { ...entry.message, injectedAt: Date.now() };
-    emitMessageReceipt(injectedMessage.id, "injected");
-    const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
-      ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
-      : entry.replyCommand;
-    const deliveredEntry = { ...entry, message: injectedMessage, replyCommand };
-    replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
-    const senderDisplay = entry.from.name || entry.from.id.slice(0, 8);
-    const replyInstruction = replyCommand ? `\n\nTo reply, use the intercom tool: ${replyCommand}` : "";
-    const deliveryMetadata = formatInboundDeliveryMetadata(injectedMessage);
-    const compactionNotice = injectedMessage.peerCompaction
-      ? `\n\n_${formatPeerCompactionNotice(senderDisplay, injectedMessage.peerCompaction, entry.from.id)}_`
+    const deliveredEntry = { ...entry, message: injectedMessage };
+    const senderDisplay = entry.from.name || entry.from.id;
+    const focus = entry.from.description ? ` — ${entry.from.description}` : "";
+    const origin = entry.from.federation
+      ? `\nRemote origin: ${entry.from.federation.originLabel || entry.from.federation.originId}; scope ${entry.from.federation.remoteScopeAlias}`
       : "";
-    pi.sendMessage(
-      {
-        customType: "intercom_message",
-        content: `**From ${senderDisplay}** (${entry.from.cwd})${replyInstruction}\n\n_${deliveryMetadata}_${compactionNotice}\n\n${entry.bodyText}`,
-        display: true,
-        details: deliveredEntry,
-      },
-      delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
-        ? { triggerTurn: true }
-        : { deliverAs: "steer" }
-    );
-    acknowledgeInboundMessageContact(client, injectedMessage);
+    const outgoing = injectedMessage.replyTo ? outstandingAsks.get(injectedMessage.replyTo) ?? findOutgoingTopic(injectedMessage.replyTo) : undefined;
+    const topic = outgoing && outgoing.to === entry.from.id
+      ? `\nReply to your message: ${JSON.stringify(previewText(outgoing.message?.text ?? outgoing.preview, 240))}`
+      : "";
+    const elapsed = injectedMessage.replyDeadline !== undefined && injectedMessage.replyDeadline < Date.now();
+    const waiting = injectedMessage.senderWaitMode === "blocking" ? " · blocking ask"
+      : injectedMessage.senderWaitMode === "nonblocking" ? " · async ask" : "";
+    const request = injectedMessage.expectsReply
+      ? `\nReply requested${waiting}.${elapsed ? " The original wait window has elapsed." : ""}`
+      : "";
+    const compactionNotice = injectedMessage.peerCompaction
+      ? `\n\n${formatPeerCompactionNotice(senderDisplay, injectedMessage.peerCompaction, entry.from.id)}`
+      : "";
+    const envelope = {
+      customType: "intercom_message",
+      content: `**From ${senderDisplay}**${focus}${request}${topic}\n\n${entry.bodyText}\n\n${formatInboundDeliveryMetadata(injectedMessage)}\nSession: ${entry.from.id} · ${entry.from.cwd}${origin}${compactionNotice}`,
+      display: true,
+      details: deliveredEntry,
+    };
+    deferredInboundMessages.set(entry.message.id, entry);
+    pendingHostEnvelopes.set(`message:${entry.message.id}`, envelope);
+    try {
+      pi.sendMessage(envelope,
+        delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger || Boolean(outgoing && outgoing.to === entry.from.id))
+          ? { triggerTurn: true } : { deliverAs: "steer" });
+    } catch {
+      emitMessageReceipt(entry.message.id, "queued", "retained locally; host injection will be retried");
+    }
+    // sendMessage is fire-and-forget on supported hosts. Returning void is not delivery confirmation.
+    confirmPersistedInbound();
+    scheduleInboundRetry();
   }
   function surfaceInboundCompactionOnly(from: SessionInfo, message: Message, generation: number): void {
     if (!message.peerCompaction || !getLiveContext(runtimeContext, generation)) return;
@@ -1692,16 +1858,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     const receivedMessage = { ...message, receiverReceivedAt };
     emitMessageReceipt(receivedMessage.id, "receiver_received");
-    if (replyWaiter) {
-      const senderTarget = from.name || from.id;
-      const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase()
-        || from.id === replyWaiter.from;
-      const replyMatches = receivedMessage.replyTo === replyWaiter.replyTo;
-      if (fromMatches && replyMatches) {
-        emitMessageReceipt(receivedMessage.id, "acknowledged", "matched reply waiter");
-        replyWaiter.resolve(receivedMessage);
-        return;
-      }
+    const waiter = replyWaiter;
+    const fromMatches = waiter && ((from.name || from.id).toLowerCase() === waiter.from.toLowerCase() || from.id === waiter.from);
+    const matchedWaiter = fromMatches && receivedMessage.replyTo === waiter.replyTo && receivedMessage.completesAsk !== false && !receivedMessage.expectsReply;
+    replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
+    recordConversationEntry("intercom_inbound_received", {
+      from, message: receivedMessage, receivedAt: receiverReceivedAt,
+      ...(matchedWaiter ? { delivery: "tool_result" } : {}),
+    });
+    if (matchedWaiter) {
+      emitMessageReceipt(receivedMessage.id, "acknowledged", "matched reply waiter");
+      waiter.resolve(receivedMessage);
+      return;
     }
     const attachmentText = receivedMessage.content.attachments?.length
       ? formatAttachments(receivedMessage.content.attachments)
@@ -1710,7 +1878,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const replyCommand = config.replyHint && receivedMessage.expectsReply
       ? `intercom({ action: "reply", message: "..." })`
       : undefined;
-    replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
     emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
     const entry = { from, message: receivedMessage, replyCommand, bodyText };
     void (async () => {
@@ -1719,25 +1886,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       if (!activeContext.isIdle()) {
-        if (!activeContext.hasUI) {
-          surfaceInboundCompactionOnly(from, receivedMessage, messageGeneration);
-          const activeClient = client;
-          if (!message.replyTo && activeClient?.isConnected()) {
-            try {
-              const result = await activeClient.send(from.id, {
-                text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
-                replyTo: message.id,
-              });
-              if (result.delivered && getLiveContext(liveContext, messageGeneration)) {
-                surfaceBackgroundPeerCompaction(activeClient, from.name || from.id, result, messageGeneration, from.id);
-                dismissIncomingAsk(message.id);
-              }
-            } catch {
-              // Best-effort reply; keep the busy non-interactive session running either way.
-            }
-          }
-          return;
-        }
         sendIncomingBrokerMessage(entry, "steer");
         return;
       }
@@ -1768,7 +1916,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         case "direct_contact_recorded":
           if (pendingReceiverBaselineTokens.delete(message.token)) {
             if (pendingReceiverBaselineTokens.size === 0) clearReceiverBaselineRetryTimer();
-            pi.appendEntry("intercom_receiver_baseline_recorded", {
+            recordConversationEntry("intercom_receiver_baseline_recorded", {
               token: message.token,
               timestamp: Date.now(),
             });
@@ -1777,7 +1925,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         case "direct_contact_unknown":
           if (pendingReceiverBaselineTokens.delete(message.token)) {
             if (pendingReceiverBaselineTokens.size === 0) clearReceiverBaselineRetryTimer();
-            pi.appendEntry("intercom_receiver_baseline_abandoned", {
+            recordConversationEntry("intercom_receiver_baseline_abandoned", {
               token: message.token,
               timestamp: Date.now(),
               reason: "Broker no longer retains the bounded staged baseline token",
@@ -1832,7 +1980,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           }
           break;
         case "message_control":
-          handleMessageControl(message.control);
+          handleMessageControl(message.from, message.control);
           break;
         case "session_joined":
           for (const namespace of localExtensions.keys()) {
@@ -2020,7 +2168,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
     }
     if (!options.openProjectPaneIfMissing) {
-      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} Pass openProjectPaneIfMissing: true to launch Pi there through a registered project launcher.`);
+      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} No session was launched and no message was sent.`);
     }
 
     const beforeSessionIds = new Set(sessions.map((session) => session.id));
@@ -2033,18 +2181,24 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       sendRequest: (provider, request) => activeClient.send(provider.id, {
         text: projectLaunchRequestText(request),
         signal: options.signal,
-      }).then((result) => ({ delivered: result.delivered, ...(result.reason ? { reason: result.reason } : {}) })),
+      }).then((result) => ({ delivered: result.delivered, id: result.id, outcomeKnown: result.outcomeKnown, ...(result.reason ? { reason: result.reason } : {}) })),
       signal: options.signal,
     });
     const session = await waitForProjectSession(activeClient, {
       projectRoot: projectPane.projectRoot,
       currentSessionId,
       beforeSessionIds,
-      ...(options.to ? { to: options.to } : {}),
+      launch: projectPane,
       signal: options.signal,
     });
-    return { id: session.id, label: session.name || session.id, projectPane };
+    return { id: session.id, label: session.name || session.id, projectPane, session };
   }
+  function projectObservation(target: DeliveryTarget): string {
+    if (!target.projectPane) return "";
+    const launch = target.projectPane;
+    return `\nProject launch: ${launch.outcome} in ${launch.projectRoot}${launch.requestMessageId ? ` (request ${launch.requestMessageId})` : ""}.\nObserved local session: ${target.label} (${target.id}). Registration does not prove which launch created it.`;
+  }
+
   async function sendBatchMessages(
     activeClient: IntercomClient,
     targets: BatchDeliveryTarget[],
@@ -2119,8 +2273,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           result = await activeClient.send(target.session.id, sendOptions);
         }
         const outcome: BatchDeliveryOutcome = {
-          to: target.label,
-          ...(target.session ? { targetId: target.session.id } : {}),
+          to: result.recipient?.name || target.label,
+          ...(result.recipient ? { targetId: result.recipient.id } : target.session ? { targetId: target.session.id } : {}),
           messageId: result.id,
           delivered: result.delivered,
           delivery: result.delivery,
@@ -2131,8 +2285,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
         };
         if (result.delivered) {
-          pi.appendEntry("intercom_sent", {
+          recordConversationEntry("intercom_sent", {
             to: target.label,
+            targetId: result.recipient?.id ?? target.session?.id,
             message: { text: options.message, attachments: options.attachments },
             messageId: result.id,
             batchId: options.batchId,
@@ -2186,6 +2341,42 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       timestamp: Date.now(),
     });
   }
+  function restoreConversations(ctx: ExtensionContext): void {
+    if (inboundRetryTimer) clearTimeout(inboundRetryTimer);
+    inboundRetryTimer = null;
+    deferredInboundMessages.clear();
+    deferredInboundControls.clear();
+    pendingHostEnvelopes.clear();
+    contextFallbackEnvelopes.clear();
+    freshModelContexts.clear();
+    outstandingAsks.clear();
+    seenInboundMessages.clear();
+    latestOutboundReceipts.clear();
+    conversationPersistenceWarning = undefined;
+    const history = restoreConversationHistory(ctx.sessionManager.getEntries());
+    for (const [id, ask] of history.outgoing) outstandingAsks.set(id, ask);
+    for (const context of history.incoming.values()) {
+      replyTracker.recordIncomingMessage(context.from, context.message, context.receivedAt);
+      hasSeenInboundMessage(context.from, context.message);
+      if (history.settledIncoming.has(context.message.id)) {
+        replyTracker.dismissPendingAsk(context.message.id);
+      } else if (!history.persistedIncoming.has(context.message.id)) {
+        deferredInboundMessages.set(context.message.id, {
+          from: context.from, message: context.message,
+          bodyText: context.message.content.text + (context.message.content.attachments?.length ? formatAttachments(context.message.content.attachments) : ""),
+        });
+      }
+    }
+    for (const [key, value] of history.controls) {
+      replyTracker.setDisposition(value.control.messageId, {
+        state: value.control.action === "cancel" ? "withdrawn" : "superseded",
+        ...(value.control.supersededBy ? { replacementId: value.control.supersededBy } : {}),
+      });
+      if (!history.persistedControls.has(key)) handleMessageControl(value.from, value.control, true);
+    }
+    for (const entry of deferredInboundMessages.values()) sendIncomingMessage(entry, ctx.isIdle() ? "trigger" : "steer");
+    if (deferredInboundMessages.size || deferredInboundControls.size) scheduleInboundRetry();
+  }
   function startSessionRuntime(ctx: ExtensionContext): void {
     const previousClient = client;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session replaced");
@@ -2213,6 +2404,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     publishIntercomSessionId(currentIntercomSessionId);
     currentModel = ctx.model?.id ?? "unknown";
     sessionStartedAt = Date.now();
+    restoreConversations(ctx);
     agentRunning = false;
     activeTools.clear();
     resetCompactionStatus();
@@ -2355,6 +2547,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     restoreIntercomSessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
+    outstandingAsks.clear();
+    deferredInboundMessages.clear();
+    deferredInboundControls.clear();
+    pendingHostEnvelopes.clear();
+    contextFallbackEnvelopes.clear();
+    freshModelContexts.clear();
+    if (inboundRetryTimer) clearTimeout(inboundRetryTimer);
+    inboundRetryTimer = null;
     agentRunning = false;
     activeTools.clear();
     resetCompactionStatus();
@@ -2411,11 +2611,34 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   onSessionCompactFailed("session_compact_failed", (_event, ctx) => {
     finishCompactionStatus(ctx);
   });
-  pi.on("turn_end", () => {
-    if (!getLiveContext()) {
-      return;
+  pi.on("context", (event) => {
+    if (!getLiveContext()) return;
+    // This is the actual model boundary, including hosts whose asynchronous sendMessage failed.
+    // Duplicate host retries are collapsed by actionable message ID, not by identical body text.
+    const seen = new Set<string>();
+    const messages = event.messages.filter((message) => {
+      if (message.role !== "custom") return true;
+      if (message.customType === "intercom_persistence_notice") return !conversationPersistenceWarning;
+      const key = inboundEnvelopeKey(message);
+      if (!key) return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    for (const [key, envelope] of pendingHostEnvelopes) {
+      if (!seen.has(key)) contextFallbackEnvelopes.set(key, envelope);
+      confirmInboundEnvelope(key);
     }
-    replyTracker.endTurn();
+    for (const [key, envelope] of contextFallbackEnvelopes) {
+      if (!seen.has(key)) messages.push({ role: "custom", ...envelope, timestamp: Date.now() });
+      else contextFallbackEnvelopes.delete(key);
+    }
+    if (conversationPersistenceWarning) messages.push({
+      role: "custom", customType: "intercom_persistence_notice", content: conversationPersistenceWarning, display: true, timestamp: Date.now(),
+    });
+    replyTracker.activateContexts([...freshModelContexts.values()]);
+    freshModelContexts.clear();
+    return { messages };
   });
   pi.on("agent_start", () => {
     if (!getLiveContext()) {
@@ -2443,6 +2666,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!getLiveContext()) {
       return;
     }
+    // A turn is only one model/tool iteration. End the implicit conversation
+    // with the run, so inspecting state does not discard the reply target.
+    replyTracker.clearActiveContexts();
     agentRunning = false;
     activeTools.clear();
     syncPresenceStatus();
@@ -2454,14 +2680,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       startSessionRuntime(ctx);
-      replyTracker.beginTurn();
       return;
     }
     if (!getLiveContext(ctx)) {
       return;
     }
     syncPresenceIdentity(sessionId);
-    replyTracker.beginTurn();
   });
   pi.on("model_select", (event, ctx) => {
     if (!getLiveContext(ctx)) {
@@ -2503,14 +2727,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     pi.registerTool(defineTool({
       name: "contact_supervisor",
       label: "Contact Supervisor",
-      description: "Subagent-only tool for contacting the supervisor agent that delegated this task. Use need_decision when blocked, uncertain, needing approval, or facing a product/API/scope decision before continuing; this waits for the supervisor's reply. Use interview_request when multiple structured questions need supervisor answers; this also waits for a reply. Use progress_update only for meaningful progress or unexpected discoveries that change the plan; this does not wait for a reply. Do not use for routine completion handoffs.",
-      promptSnippet: "Subagent-only: contact the supervisor for decisions, structured interviews, or meaningful plan-changing updates. Do not use for routine completion handoffs.",
-      promptGuidelines: [
-        "Use contact_supervisor with reason='need_decision' when a subagent is blocked, uncertain, needs approval, or faces a product/API/scope decision before continuing.",
-        "Use contact_supervisor with reason='interview_request' when the child needs multiple structured answers from the supervisor in one blocking exchange.",
-        "Use contact_supervisor with reason='progress_update' only for meaningful progress or unexpected discoveries that change the plan.",
-        "Do not use contact_supervisor for routine completion handoffs; return the final subagent result normally.",
-      ],
+      description: "Conversation with the supervisor who delegated this task. need_decision waits for a reply; interview_request waits for structured answers; progress_update returns a delivery receipt without waiting. Task completion has its own return channel.",
+      promptSnippet: "Conversation with the delegating supervisor.",
       parameters: Type.Object({
         reason: StringEnum(["need_decision", "progress_update", "interview_request"] as const, {
           description: "Contact reason: 'need_decision' waits for a reply; 'interview_request' sends structured questions and waits for a reply; 'progress_update' sends a non-blocking update",
@@ -2533,6 +2751,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }, { description: "Structured interview request for reason='interview_request'" })),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const historyWarnings: string[] = [];
+        const recordActionEntry = (type: string, data: unknown): void => {
+          try { pi.appendEntry(type, data); }
+          catch (error) { historyWarnings.push(getErrorMessage(error)); }
+        };
+        const historyNote = () => historyWarnings.length ? `\nLocal history was not fully persisted; recovery may be incomplete. ${historyWarnings.join("; ")}` : "";
         const reason = params.reason as ContactSupervisorReason;
         if (reason !== "need_decision" && reason !== "progress_update" && reason !== "interview_request") {
           return {
@@ -2588,11 +2812,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         if (!resolvedSupervisor && reason !== "progress_update") {
           return {
-            content: [{ type: "text", text: `Supervisor "${metadata.orchestratorTarget}" is not currently connected. Blocking requests are not queued; use a progress update or retry after the supervisor reconnects.` }],
+            content: [{ type: "text", text: `Supervisor "${metadata.orchestratorTarget}" is not connected. No question was sent.` }],
             details: { error: true },
           };
         }
         const sendTo = resolvedSupervisor ?? metadata.orchestratorTarget;
+        const senderIdentity = currentSendIdentity(connectedClient);
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Cancelled" }],
@@ -2611,17 +2836,20 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           try {
             const result = await connectedClient.send(sendTo, {
               text: formatChildOrchestratorMessage("update", metadata, message),
+              completesAsk: false,
             });
             if (!result.delivered) {
               const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
-                content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
+                content: [{ type: "text", text: formatDeliveryResult(result, { kind: "Progress update", sender: senderIdentity, target: metadata.orchestratorTarget }) }],
                 details: deliveryDetails(result),
               };
             }
-            pi.appendEntry("intercom_sent", {
+            recordActionEntry("intercom_sent", {
               to: metadata.orchestratorTarget,
-              message: { text: message, reason },
+              targetId: result.recipient?.id ?? sendTo,
+              as: senderIdentity,
+              message: { text: message, reason, completesAsk: false },
               messageId: result.id,
               timestamp: Date.now(),
               subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
@@ -2631,7 +2859,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               : "";
             connectedClient.acknowledgeSendContact(result);
             return {
-              content: [{ type: "text", text: `Progress update sent to supervisor ${metadata.orchestratorTarget}${awareness}` }],
+              content: [{ type: "text", text: formatDeliveryResult(result, { kind: "Progress update", sender: senderIdentity, target: metadata.orchestratorTarget }) + historyNote() + (replyTracker.formatConversationContext() ? `\n\n${replyTracker.formatConversationContext()}` : "") }],
               details: deliveryDetails(result),
             };
           } catch (error) {
@@ -2676,12 +2904,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             messageId: questionId,
             text: requestText,
             expectsReply: true,
+            completesAsk: false,
+            senderWaitMode: "blocking",
           });
           requestSendResult = sendResult;
-          deliveryState = sendResult.delivered ? "socket_delivered" : "delivery_failed";
+          deliveryState = sendResult.delivery;
           if (!sendResult.delivered) {
             const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
-            rejectReplyWaiter(new Error(`Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}`));
+            rejectOwnedReplyWaiter(questionId, new Error(`Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}`));
             if (replyPromise) {
               try {
                 await replyPromise;
@@ -2690,12 +2920,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               }
             }
             return {
-              content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
-              details: { error: true },
+              content: [{ type: "text", text: formatDeliveryResult(sendResult, { kind: "Ask", sender: senderIdentity, target: metadata.orchestratorTarget }) }],
+              details: { error: true, ...deliveryDetails(sendResult) },
             };
           }
-          pi.appendEntry("intercom_sent", {
+          recordActionEntry("intercom_sent", {
             to: metadata.orchestratorTarget,
+            targetId: sendResult.recipient?.id ?? sendTo,
+            as: senderIdentity,
             message: {
               text: reason === "interview_request" ? requestText : params.message,
               reason,
@@ -2712,7 +2944,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             ? formatAttachments(replyMessage.content.attachments)
             : "";
           const structuredReply = reason === "interview_request" ? parseStructuredSupervisorReply(replyText, supervisorInterview!) : undefined;
-          pi.appendEntry("intercom_received", {
+          recordActionEntry("intercom_received", {
             from: metadata.orchestratorTarget,
             message: { text: replyText, attachments: replyMessage.content.attachments },
             messageId: replyMessage.id,
@@ -2732,20 +2964,21 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           return {
             content: [{
               type: "text",
-              text: `${awareness.length ? `${awareness.join("\n\n")}\n\n` : ""}**Reply from supervisor:**\n${replyText}${replyAttachments}`,
+              text: `${awareness.length ? `${awareness.join("\n\n")}\n\n` : ""}**Reply from supervisor:**\nQuestion message ID: ${questionId}\nReply message ID: ${replyMessage.id}\n\n${replyText}${replyAttachments}${historyNote()}${structuredReply?.error ? `\n\nThe structured answer could not be validated: ${structuredReply.error}` : ""}`,
             }],
             details: {
+              replyMessageId: replyMessage.id,
               ...(structuredReply
                 ? structuredReply.value !== undefined
                   ? { structuredReply: structuredReply.value }
-                  : { structuredReplyParseError: structuredReply.error }
+                  : { error: true, structuredReplyParseError: structuredReply.error }
                 : {}),
               ...(requestCompaction ? { requestPeerCompaction: requestCompaction } : {}),
               ...(replyMessage.peerCompaction ? { replyPeerCompaction: replyMessage.peerCompaction } : {}),
             },
           };
         } catch (error) {
-          rejectReplyWaiter(toError(error));
+          rejectOwnedReplyWaiter(questionId, toError(error));
           if (replyPromise) {
             try {
               await replyPromise;
@@ -2938,8 +3171,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     };
   }
 
-  function attachSelfProfile(result: AgentToolResult<unknown>): AgentToolResult<unknown> {
+  function attachSelfProfile(result: AgentToolResult<unknown>, profileUpdated = false): AgentToolResult<unknown> {
     const profile = currentSelfProfile();
+    const existingDetails = typeof result.details === "object" && result.details !== null && !Array.isArray(result.details)
+      ? result.details as Record<string, unknown>
+      : {};
+    const identityAlreadyShown = !profileUpdated && existingDetails.delivered === true
+      && existingDetails.senderIdentity === profile.name && profile.intercomName === profile.name
+      && profile.descriptionPublished;
     const intercomProjection = profile.intercomName && profile.intercomName !== profile.name
       ? ` (intercom: ${profile.intercomName})`
       : profile.intercomName
@@ -2948,69 +3187,66 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const publication = profile.description && !profile.descriptionPublished
       ? " [description local only: broker upgrade required]"
       : "";
-    result.content.push({
+    if (!identityAlreadyShown) result.content.push({
       type: "text",
-      text: `Self profile: ${profile.name}${intercomProjection} — ${profile.description ?? "no description set"}${publication}`,
+      text: `Self profile: ${profile.name}${intercomProjection}${profile.description ? ` — ${profile.description}` : ""}${publication}`,
     });
-    const existingDetails = typeof result.details === "object" && result.details !== null && !Array.isArray(result.details)
-      ? result.details as Record<string, unknown>
-      : {};
     result.details = { ...existingDetails, selfProfile: profile };
     return result;
+  }
+
+  function formatOutstandingAsks(limit = 3): string {
+    const entries = [...outstandingAsks.entries()].sort((a, b) => a[1].sentAt - b[1].sentAt);
+    if (!entries.length) return "";
+    const now = Date.now();
+    const lines = entries.slice(0, limit).map(([id, ask]) => {
+      const ageMs = Math.max(0, now - ask.sentAt);
+      const age = ageMs < 60_000 ? `${Math.round(ageMs / 1000)}s` : `${Math.round(ageMs / 60_000)}m`;
+      const elapsed = ageMs > askTimeoutMs ? "; local wait window elapsed" : "";
+      return `- ${ask.targetDisplay} · messageId ${id} · ${age}${elapsed} · ${ask.preview}`;
+    });
+    if (entries.length > limit) lines.push(`… ${entries.length - limit} more outstanding questions.`);
+    return `Outstanding asks (${entries.length}, local tracking):\n${lines.join("\n")}`;
   }
 
   pi.registerTool(defineTool({
     name: "intercom",
     label: "Intercom",
-    description: `Send a message to another pi session running on this machine.
-Use this to communicate findings, request help, or coordinate work with other sessions.
+    description: `Conversation with other Pi sessions visible in the current scope.
 
-Target a session by name, full session ID, or the short id shown in parentheses
-by "list" (a leading prefix of the ID is enough). Prefer the short id when two
-sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.
+• list / list-cwd: Connected peers, their identity, focus, location, and activity.
+• send: A notification to one peer or an explicit group; it does not answer a pending question.
+• ask: A question whose answer returns here. Waits by default; blocking: false delivers the answer later in the conversation.
+• reply: Responds to a message, answering its question when applicable.
+• pending / read: Unanswered questions, or a retained message's full content.
+• status: Connection state and outstanding questions.
+• cancel: Removes offline mail or communicates withdrawal; work already done is unchanged.
+• broadcast: Independent messages to visible local peers, not remote peers.
+• advertise: Subagent public visibility within the current scope.
+• rename: Changes this session's name.
 
-Usage:
-  intercom({ action: "list" })                    → List active sessions
-  intercom({ action: "list-cwd" })                → List sessions in the current working directory
-  intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
-  intercom({ action: "send", to: "name-or-id", message: "..." })  → Send to one session
-  intercom({ action: "send", targets: ["name-or-id", "other-id"], message: "..." }) → Send independently to several explicit sessions
-  intercom({ action: "broadcast", message: "..." }) → Send to every visible live session on this machine; avoid this when explicit targets are known
-  intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Launch Pi in /path through a registered project launcher, then send
-  intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
-  intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
-  intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
-  intercom({ action: "pending" })                                      → List unresolved inbound asks
-  intercom({ action: "status" })                  → Show connection status
-  intercom({ action: "advertise", name: "my-nickname" })  → Subagent-only: self-promote to full main-level visibility under a chosen name
-
-Any action may include profile: { name?, description? }. Use a concise 5-9 word current focus, or description: null to clear it. Profile text is display metadata, not routing identity.`,
-    promptSnippet:
-      "Discover and coordinate with other local Pi sessions: list peers, share focused updates, ask for help, or check intercom connectivity.",
+Receipts include sender/recipient identity, exact message IDs, delivery state, and nearby conversation context. Endpoint acceptance is not an acknowledgement from the colleague.`,
+    promptSnippet: "Communicate with other Pi sessions.",
     promptGuidelines: [
-      "Consider listing intercom peers early when substantial work may overlap or benefit from a nearby perspective. Any call can also publish a concise self profile.",
-      "Prefer targeted intercom sends. Machine-wide broadcast interrupts every visible live session and is appropriate only when each one genuinely needs the same information.",
-      "A compaction notice means the peer now relies on summarized conversational context. Continue normally, but make fragile references concrete with file paths, titled tickets, commits, or explicit decisions.",
+      "Intercom messages can wake colleagues; broadcasts reach every visible local peer.",
     ],
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "broadcast", "ask", "reply", "pending", "status", "cancel", "advertise"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'broadcast', 'ask', 'reply', 'pending', 'status', 'cancel', or 'advertise'",
+      action: StringEnum(["list", "list-cwd", "send", "broadcast", "ask", "reply", "pending", "status", "cancel", "advertise", "rename", "read"] as const, {
+        description: "Intercom operation.",
       }),
       profile: Type.Optional(Type.Object({
         name: Type.Optional(Type.String({
-          description: "Optional self-update: a concise name for this Pi session. Preserves Pi as the canonical naming authority.",
+          description: "Name for an unnamed or profile-managed session; does not replace a user-set name.",
         })),
         description: Type.Optional(Type.Union([
-          Type.String({
-            description: "A 5-9 word description of the session's current focus.",
-          }),
-          Type.Null({ description: "Clear the current focus description." }),
+          Type.String(),
+          Type.Null(),
         ], {
-          description: "Optional self-update: set a concise focus description, or use null to clear it. Display metadata only, never routing identity.",
+          description: "Current focus (5-9 words), or null to clear. Display metadata, not routing identity.",
         })),
       }, {
-        description: "Optionally update this session's name and/or short focus as part of any intercom call.",
+        description: "Optional self-profile update.",
       })),
       to: Type.Optional(Type.String({
         description: "One target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
@@ -3028,12 +3264,12 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
         name: Type.String(),
         content: Type.String(),
         language: Type.Optional(Type.String()),
-      }))),
+      }), { description: "Inline text snapshots; no files are created in the receiving workspace." })),
       replyTo: Type.Optional(Type.String({
         description: "Message ID to reply to (for threading or responding to an 'ask')",
       })),
       messageId: Type.Optional(Type.String({
-        description: "Message ID for actions that operate on an existing message, such as 'cancel'.",
+        description: "Exact message ID for read or cancel; session-ID prefix matching does not apply.",
       })),
       supersedes: Type.Optional(Type.String({
         description: "Previous message ID this send/ask explicitly supersedes. Only works for the same sender and receiver.",
@@ -3044,6 +3280,9 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
       cwd: Type.Optional(Type.String({
         description: "Working directory filter for 'list-cwd'. For send/ask, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
       })),
+      blocking: Type.Optional(Type.Boolean({
+        description: "For 'ask', true waits for the answer in this tool call (default); false returns immediately and delivers the answer as an incoming message.",
+      })),
       openProjectPaneIfMissing: Type.Optional(Type.Boolean({
         description: "For send/ask with cwd, launch Pi in that project through a registered generic project launcher when no matching live session exists.",
       })),
@@ -3051,17 +3290,29 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
         description: "For openProjectPaneIfMissing, focus the new terminal when the launcher supports it. Defaults to true.",
       })),
       name: Type.Optional(Type.String({
-        description: "For 'advertise': the public name this subagent wants to claim. Must be unique among currently connected sessions.",
+        description: "For 'advertise': the public name this subagent claims. For 'rename': the new canonical name for this session.",
       })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      let sendIdentity: string | undefined;
+      const historyWarnings: string[] = [];
+      const recordActionEntry = (type: string, data: unknown): void => {
+        try { pi.appendEntry(type, data); }
+        catch (error) { historyWarnings.push(`${type}: ${getErrorMessage(error)}`); }
+      };
+      const settleSupersededQuestion = (): void => {
+        if (!params.supersedes) return;
+        outstandingAsks.delete(params.supersedes);
+        rejectOwnedReplyWaiter(params.supersedes, new Error(`Request ${params.supersedes} was superseded.`));
+        recordActionEntry("intercom_ask_settled", { messageId: params.supersedes, reason: "superseded", timestamp: Date.now() });
+      };
       const toolResult = await (async (): Promise<AgentToolResult<unknown>> => {
       const profile = normalizeToolProfilePlaceholders(params.profile);
       const profileError = applySelfProfile(profile, ctx);
       if (profileError) {
         return {
-          content: [{ type: "text" as const, text: profileError }],
+          content: [{ type: "text" as const, text: `Action ${params.action} was not performed. ${profileError}` }],
           details: { error: true },
         };
       }
@@ -3096,6 +3347,11 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
         }
       }
 
+      const captureSendIdentity = (): void => {
+        sendIdentity = currentSendIdentity(connectedClient);
+        _onUpdate?.({ content: [{ type: "text", text: `Communicating as ${sendIdentity}…` }], details: { senderIdentity: sendIdentity } });
+      };
+      if (["send", "ask", "reply", "broadcast"].includes(params.action)) captureSendIdentity();
       const {
         action,
         to,
@@ -3108,6 +3364,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
         cwd,
         openProjectPaneIfMissing,
         focus,
+        blocking,
         name,
       } = params;
       // Some tool-schema adapters materialize optional arrays as [""]. Treat
@@ -3127,9 +3384,9 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
         ? undefined
         : params.targets;
 
-      if (messageId && action !== "cancel") {
+      if (messageId && action !== "cancel" && action !== "read") {
         return {
-          content: [{ type: "text", text: "messageId is only accepted by the cancel action; sends and asks always create a new message ID." }],
+          content: [{ type: "text", text: "messageId identifies a retained message for read or cancel; sends and asks create a new message ID." }],
           details: { error: true },
         };
       }
@@ -3190,7 +3447,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
           }
 
           return {
-            content: [{ type: "text", text: `Advertised as "${result.name}". You are now fully visible to and reachable by every session on the intercom mesh, not just your supervisor.` }],
+            content: [{ type: "text", text: `Advertised as "${result.name}" within this session's scope.` }],
             details: {},
           };
         }
@@ -3290,16 +3547,14 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
           }
           try {
             const result = await connectedClient.cancelMessage(messageId);
-            if (!result.delivered) {
-              const errorText = result.reason ?? "Message may not exist or may belong to another sender.";
-              return {
-                content: [{ type: "text", text: `Cancellation for ${messageId} was not delivered: ${errorText}` }],
-                details: { messageId, delivered: false, reason: result.reason },
-              };
+            if (result.delivered && result.outcomeKnown) {
+              outstandingAsks.delete(messageId);
+              rejectOwnedReplyWaiter(messageId, new Error(`Request ${messageId} was withdrawn.`));
+              recordActionEntry("intercom_ask_settled", { messageId, reason: "withdrawn", timestamp: Date.now() });
             }
             return {
-              content: [{ type: "text", text: `Cancellation requested for ${messageId}` }],
-              details: { messageId, delivered: true },
+              content: [{ type: "text", text: formatCancellationResult(result) }],
+              details: deliveryDetails(result),
             };
           } catch (error) {
             return {
@@ -3307,6 +3562,41 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               details: { error: true, messageId },
             };
           }
+        }
+
+        case "rename": {
+          const requestedName = name?.trim();
+          if (!requestedName) {
+            return {
+              content: [{ type: "text", text: "rename requires a non-empty 'name'." }],
+              details: { error: true },
+            };
+          }
+          if (!isValidSessionName(requestedName)) {
+            return {
+              content: [{ type: "text", text: `"${requestedName}" cannot be used as a session name.` }],
+              details: { error: true },
+            };
+          }
+          try {
+            pi.setSessionName(requestedName);
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: `Unable to set the session name: ${getErrorMessage(error)}` }],
+              details: { error: true },
+            };
+          }
+          // session_info_changed is the canonical identity contract; this
+          // direct push is an idempotent fast path so the broker roster shows
+          // the new name before the call returns.
+          syncPresenceIdentity(ctx.sessionManager.getSessionId());
+          let publication = "";
+          try { await connectedClient.listSessions({ timeoutMs: 1_000 }); }
+          catch { publication = " Broker publication has not been confirmed."; }
+          return {
+            content: [{ type: "text", text: `Session name set to "${requestedName}".${publication}` }],
+            details: {},
+          };
         }
 
         case "broadcast": {
@@ -3328,20 +3618,12 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               details: { error: true },
             };
           }
-          const activeReplyTarget = replyTracker.getActiveReplyTarget();
-          if (activeReplyTarget) {
-            const senderLabel = activeReplyTarget.from.name || activeReplyTarget.from.id;
-            return {
-              content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Reply to that ask before broadcasting so the answer is not lost in an unrelated machine-wide notice.` }],
-              details: { error: true, replyTo: activeReplyTarget.message.id },
-            };
-          }
           try {
             const sessions = await connectedClient.listSessions();
             const currentSessionId = connectedClient.sessionId;
             const prefixes = sessionIdPrefixes(sessions);
             const recipients: BatchDeliveryTarget[] = sessions
-              .filter((session) => session.id !== currentSessionId)
+              .filter((session) => session.id !== currentSessionId && !session.federation)
               .sort((left, right) => left.id.localeCompare(right.id))
               .map((session) => ({
                 requested: session.id,
@@ -3352,7 +3634,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               }));
             if (recipients.length === 0) {
               return {
-                content: [{ type: "text", text: "No other visible live sessions are connected; nothing was broadcast." }],
+                content: [{ type: "text", text: "No other visible local sessions are connected; nothing was broadcast." }],
                 details: { error: true, broadcast: true, recipientCount: 0 },
               };
             }
@@ -3383,6 +3665,8 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               requestedTargetCount: recipients.length,
               duplicateCount: 0,
               broadcast: true,
+              sender: sendIdentity!,
+              excludedRemoteCount: sessions.filter((session) => Boolean(session.federation)).length,
             });
           } catch (error) {
             return {
@@ -3422,14 +3706,6 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               return {
                 content: [{ type: "text", text: `targets must contain 1-${MAX_EXPLICIT_SEND_TARGETS} non-empty session names or IDs.` }],
                 details: { error: true },
-              };
-            }
-            const activeReplyTarget = replyTracker.getActiveReplyTarget();
-            if (activeReplyTarget) {
-              const senderLabel = activeReplyTarget.from.name || activeReplyTarget.from.id;
-              return {
-                content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Reply to that ask before sending an unthreaded multi-target message.` }],
-                details: { error: true, replyTo: activeReplyTarget.message.id },
               };
             }
             try {
@@ -3518,6 +3794,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
                 requestedTargetCount: requestedTargets.length,
                 duplicateCount,
                 broadcast: false,
+                sender: sendIdentity!,
               });
             } catch (error) {
               return {
@@ -3564,16 +3841,6 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
                 details: { error: true },
               };
             }
-            const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
-            if (activeReplyMismatch) {
-              const senderLabel = activeReplyMismatch.from.name || activeReplyMismatch.from.id;
-              return {
-                content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Use intercom({ action: "reply", message: "..." }) or set replyTo: "${activeReplyMismatch.message.id}". Refusing non-reply send to "${targetDisplay}" to avoid a misdirected reply.` }],
-                details: { error: true, replyTo: activeReplyMismatch.message.id },
-              };
-            }
-            const inferredAsk = replyTo ? null : replyTracker.findUniquePendingAskFrom(sendTo);
-            const effectiveReplyTo = replyTo ?? inferredAsk?.message.id;
             if (confirmSend && !(cwd && openProjectPaneIfMissing)) {
               const confirmed = await ctx.ui.confirm(
                 "Send message",
@@ -3586,41 +3853,35 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
                 };
               }
             }
+            captureSendIdentity();
             const result = await connectedClient.send(sendTo, {
               text: message,
               attachments,
-              replyTo: effectiveReplyTo,
+              replyTo,
+              completesAsk: false,
               supersedes,
               retryOf,
               signal: _signal,
               contactKind: "direct",
             });
             if (!result.delivered) {
-              const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
-                content: [{ type: "text", text: `Message to "${targetDisplay}" was not delivered: ${errorText}` }],
-                details: deliveryDetails(result),
+                content: [{ type: "text", text: formatDeliveryResult(result, { kind: "Message", sender: sendIdentity!, target: targetDisplay }) + projectObservation(target) }],
+                details: { ...deliveryDetails(result), ...(target.projectPane ? { projectLaunch: target.projectPane } : {}) },
               };
             }
-            pi.appendEntry("intercom_sent", {
+            settleSupersededQuestion();
+            recordActionEntry("intercom_sent", {
               to: targetDisplay,
-              message: { text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf },
+              targetId: result.recipient?.id ?? sendTo,
+              as: sendIdentity!,
+              toolCallId: _toolCallId,
+              message: { text: message, attachments, replyTo, completesAsk: false, supersedes, retryOf },
               messageId: result.id,
               ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
               timestamp: Date.now(),
             });
-            if (effectiveReplyTo) {
-              dismissIncomingAsk(effectiveReplyTo);
-            }
-            const sentText = target.projectPane
-              ? `Launched Pi in ${target.projectPane.projectRoot} via ${target.projectPane.provider.kind === "session" ? `project launcher ${target.projectPane.provider.name}` : "the configured project launcher command"} and sent message to ${targetDisplay}`
-              : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${targetDisplay}`;
-            const deliveryText = result.delivery === "queued"
-              ? `${sentText}\n\n${queuedDeliveryNote(targetDisplay)}`
-              : sentText;
-            const awarenessText = result.peerCompaction
-              ? `${deliveryText}\n\n${formatPeerCompactionNotice(targetDisplay, result.peerCompaction, sendTo)}`
-              : deliveryText;
+            const awarenessText = formatDeliveryResult(result, { kind: "Message", sender: sendIdentity!, target: targetDisplay }) + projectObservation(target);
             connectedClient.acknowledgeSendContact(result);
             return {
               content: [{
@@ -3629,7 +3890,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               }],
               details: {
                 ...deliveryDetails(result),
-                ...(effectiveReplyTo ? { replyTo: effectiveReplyTo } : {}),
+                ...(replyTo ? { replyTo } : {}),
                 ...(target.projectPane ? { openedProjectPane: true, projectRoot: target.projectPane.projectRoot, projectLauncher: target.projectPane.provider.kind === "session" ? target.projectPane.provider.name : "configured-command" } : {}),
               },
             };
@@ -3655,7 +3916,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
             };
           }
 
-          if (replyWaiter) {
+          if (replyWaiter && blocking !== false) {
             return {
               content: [{ type: "text", text: "Already waiting for a reply" }],
               details: { error: true },
@@ -3675,6 +3936,15 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
           let questionSendResult: SendResult | undefined;
           let questionTargetDisplay = to ?? cwd ?? "peer";
           let questionTargetId: string | undefined;
+          const rememberQuestion = (id: string, target: string, label: string): void => {
+            const sentAt = Date.now();
+            outstandingAsks.set(id, { to: target, targetDisplay: label, preview: previewText(message, 120) ?? message, sentAt, message: { text: message, attachments } });
+            recordActionEntry("intercom_ask_pending", { messageId: id, to: target, targetDisplay: label, message: { text: message, attachments }, sentAt });
+          };
+          const settleQuestion = (id: string, reason: string): void => {
+            outstandingAsks.delete(id);
+            recordActionEntry("intercom_ask_settled", { messageId: id, reason, timestamp: Date.now() });
+          };
 
           try {
             if (openProjectPaneIfMissing && !cwd) {
@@ -3690,7 +3960,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
               const resolved = await resolveSessionTarget(connectedClient, to!);
               if (!resolved) {
                 return {
-                  content: [{ type: "text", text: `Session "${to}" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects.` }],
+                  content: [{ type: "text", text: `Session "${to}" is not currently connected. Questions require a connected peer; no question was sent.` }],
                   details: { error: true },
                 };
               }
@@ -3712,21 +3982,76 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
                 details: { error: true },
               };
             }
-            if (replyWaiter) {
+            if (replyWaiter && blocking !== false) {
               return {
                 content: [{ type: "text", text: "Already waiting for a reply" }],
                 details: { error: true },
               };
             }
+            if (blocking === false) {
+              const askId = randomUUID();
+              rememberQuestion(askId, sendTo, targetDisplay);
+              captureSendIdentity();
+              const sendResult = await connectedClient.send(sendTo, {
+                messageId: askId,
+                text: message,
+                attachments,
+                replyTo,
+                expectsReply: true,
+                completesAsk: false,
+                senderWaitMode: "nonblocking",
+                supersedes,
+                retryOf,
+                signal: _signal,
+                contactKind: "direct",
+              });
+              if (!sendResult.delivered) {
+                if (sendResult.outcomeKnown) {
+                  settleQuestion(askId, "not-delivered");
+                }
+                return {
+                  content: [{ type: "text", text: formatDeliveryResult(sendResult, { kind: "Ask", sender: sendIdentity!, target: targetDisplay }) + projectObservation(target) }],
+                  details: { error: true, ...deliveryDetails(sendResult) },
+                };
+              }
+              settleSupersededQuestion();
+              recordActionEntry("intercom_sent", {
+                to: targetDisplay,
+                targetId: sendResult.recipient?.id ?? sendTo,
+                as: sendIdentity!,
+                toolCallId: _toolCallId,
+                message: { text: message, attachments, replyTo, completesAsk: false, supersedes, retryOf },
+                messageId: sendResult.id,
+                ...(sendResult.peerCompaction ? { peerCompaction: sendResult.peerCompaction } : {}),
+                timestamp: Date.now(),
+              });
+              connectedClient.acknowledgeSendContact(sendResult);
+              return {
+                content: [{
+                  type: "text",
+                  text: `${formatDeliveryResult(sendResult, { kind: "Ask", sender: sendIdentity!, target: targetDisplay }) + projectObservation(target)}\nNon-blocking: the answer arrives in this conversation.`,
+                }],
+                details: {
+                  nonBlocking: true,
+                  messageId: askId,
+                  ...deliveryDetails(sendResult),
+                  ...(target.projectPane ? { openedProjectPane: true, projectRoot: target.projectPane.projectRoot, projectLauncher: target.projectPane.provider.kind === "session" ? target.projectPane.provider.name : "configured-command" } : {}),
+                },
+              };
+            }
             questionId = randomUUID();
+            rememberQuestion(questionId, sendTo, targetDisplay);
             replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
             replyPromise.catch(() => undefined);
+            captureSendIdentity();
             const sendResult = await connectedClient.send(sendTo, {
               messageId: questionId,
               text: message,
               attachments,
               replyTo,
               expectsReply: true,
+              completesAsk: false,
+              senderWaitMode: "blocking",
               supersedes,
               retryOf,
               signal: _signal,
@@ -3737,8 +4062,9 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
             deliveryState = sendResult.delivery;
             questionCompaction = sendResult.peerCompaction;
             if (!sendResult.delivered) {
+              if (sendResult.outcomeKnown) settleQuestion(questionId, "not-delivered");
               const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
-              rejectReplyWaiter(new Error(`Message to "${targetDisplay}" was not delivered: ${errorText}`));
+              rejectOwnedReplyWaiter(questionId, new Error(`Message to "${targetDisplay}" was not delivered: ${errorText}`));
               if (replyPromise) {
                 try {
                   await replyPromise;
@@ -3747,23 +4073,28 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
                 }
               }
               return {
-                content: [{ type: "text", text: `Message to "${targetDisplay}" was not delivered: ${errorText}` }],
+                content: [{ type: "text", text: formatDeliveryResult(sendResult, { kind: "Ask", sender: sendIdentity!, target: targetDisplay }) + projectObservation(target) }],
                 details: { error: true, ...deliveryDetails(sendResult) },
               };
             }
-            pi.appendEntry("intercom_sent", {
+            settleSupersededQuestion();
+            recordActionEntry("intercom_sent", {
               to: targetDisplay,
-              message: { text: message, attachments, replyTo, supersedes, retryOf },
+              targetId: sendResult.recipient?.id ?? sendTo,
+              as: sendIdentity!,
+              toolCallId: _toolCallId,
+              message: { text: message, attachments, replyTo, completesAsk: false, supersedes, retryOf },
               messageId: sendResult.id,
               ...(sendResult.peerCompaction ? { peerCompaction: sendResult.peerCompaction } : {}),
               timestamp: Date.now(),
             });
             const replyMessage = await replyPromise;
+            settleQuestion(questionId, "answer returned");
             const replyText = replyMessage.content.text;
             const replyAttachments = replyMessage.content.attachments?.length
               ? formatAttachments(replyMessage.content.attachments)
               : "";
-            pi.appendEntry("intercom_received", {
+            recordActionEntry("intercom_received", {
               from: targetDisplay,
               message: { text: replyText, attachments: replyMessage.content.attachments },
               messageId: replyMessage.id,
@@ -3779,15 +4110,16 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
             connectedClient.acknowledgeSendContact(sendResult);
             acknowledgeInboundMessageContact(connectedClient, replyMessage);
             return {
-              content: [{ type: "text", text: `${awarenessText}**Reply from ${targetDisplay}:**\n${replyText}${replyAttachments}` }],
+              content: [{ type: "text", text: `${awarenessText}**Reply from ${targetDisplay}** (asked as ${sendIdentity!}):\nQuestion message ID: ${questionId}\nReply message ID: ${replyMessage.id}\n\n${replyText}${replyAttachments}` }],
               details: {
                 ...deliveryDetails(sendResult),
+                replyMessageId: replyMessage.id,
                 ...(latestCompaction ? { peerCompaction: latestCompaction } : {}),
                 ...(target.projectPane ? { openedProjectPane: true, projectRoot: target.projectPane.projectRoot, projectLauncher: target.projectPane.provider.kind === "session" ? target.projectPane.provider.name : "configured-command" } : {}),
               },
             };
           } catch (error) {
-            rejectReplyWaiter(toError(error));
+            rejectOwnedReplyWaiter(questionId, toError(error));
             if (replyPromise) {
               try {
                 await replyPromise;
@@ -3835,39 +4167,34 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
                 details: { error: true },
               };
             }
+            captureSendIdentity();
             const result = await connectedClient.send(target.from.id, {
               text: message,
               attachments,
               replyTo: target.message.id,
+              completesAsk: true,
               signal: _signal,
               contactKind: "direct",
             });
             if (!result.delivered) {
-              const errorText = result.reason ?? "Session may not exist or has disconnected.";
-              if (result.reason === "Session not found") {
-                dismissIncomingAsk(target.message.id);
-              }
               return {
-                content: [{ type: "text", text: `Reply to "${target.from.name || target.from.id}" was not delivered: ${errorText}` }],
+                content: [{ type: "text", text: formatDeliveryResult(result, { kind: "Reply", sender: sendIdentity!, target: target.from.name || target.from.id }) }],
                 details: deliveryDetails(result),
               };
             }
             dismissIncomingAsk(target.message.id);
-            pi.appendEntry("intercom_sent", {
+            recordActionEntry("intercom_sent", {
               to: target.from.name || target.from.id,
-              message: { text: message, attachments, replyTo: target.message.id },
+              targetId: result.recipient?.id ?? target.from.id,
+              as: sendIdentity!,
+              toolCallId: _toolCallId,
+              message: { text: message, attachments, replyTo: target.message.id, completesAsk: true },
               messageId: result.id,
               ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
               timestamp: Date.now(),
             });
             const targetDisplay = target.from.name || target.from.id;
-            const replyText = `Reply sent to ${targetDisplay}`;
-            const deliveryText = result.delivery === "queued"
-              ? `${replyText}\n\n${queuedDeliveryNote(targetDisplay)}`
-              : replyText;
-            const awarenessText = result.peerCompaction
-              ? `${deliveryText}\n\n${formatPeerCompactionNotice(targetDisplay, result.peerCompaction, target.from.id)}`
-              : deliveryText;
+            const awarenessText = formatDeliveryResult(result, { kind: "Reply", sender: sendIdentity!, target: targetDisplay });
             connectedClient.acknowledgeSendContact(result);
             return {
               content: [{
@@ -3884,24 +4211,25 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
           }
         }
 
-        case "pending": {
-          const pendingAsks = replyTracker.listPending();
-          if (pendingAsks.length === 0) {
-            return {
-              content: [{ type: "text", text: "No unresolved inbound asks." }],
-              details: {},
-            };
+        case "read": {
+          const retained = messageId ? replyTracker.getMessage(messageId) : undefined;
+          if (!retained) {
+            return { content: [{ type: "text", text: messageId ? `Message ${messageId} is not retained in this session.` : "Missing messageId." }], details: { error: true } };
           }
-
-          const now = Date.now();
-          const lines = pendingAsks.map(({ from, message, receivedAt }) => {
-            const preview = message.content.text.replace(/\s+/g, " ").slice(0, 80);
-            const elapsedSeconds = Math.max(0, Math.floor((now - receivedAt) / 1000));
-            const compactionContext = message.peerCompaction ? " · sender compacted since prior direct contact" : "";
-            return `- ${from.name || from.id} · ${message.id} · ${elapsedSeconds}s ago${compactionContext} · ${preview}`;
-          });
+          const { from, message: original, disposition } = retained;
+          const state = disposition ? `\nStatus: ${disposition.state}${disposition.replacementId ? ` by message ${disposition.replacementId}` : ""}` : "";
+          const attachmentsText = original.content.attachments?.length ? formatAttachments(original.content.attachments) : "";
+          const origin = from.federation ? `\nRemote origin: ${from.federation.originLabel || from.federation.originId}` : "";
           return {
-            content: [{ type: "text", text: `**Pending asks:**\n${lines.join("\n")}` }],
+            content: [{ type: "text", text: `From ${from.name || from.id}${from.description ? ` — ${from.description}` : ""} (${from.cwd})${origin}\n${formatInboundDeliveryMetadata(original)}${state}\n\n${original.content.text}${attachmentsText}` }],
+            details: { messageId: original.id },
+          };
+        }
+
+        case "pending": {
+          const conversation = replyTracker.formatConversationContext({ limit: Infinity, previewLength: 180 });
+          return {
+            content: [{ type: "text", text: conversation || "No unresolved inbound asks." }],
             details: {},
           };
         }
@@ -3910,12 +4238,19 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
           try {
             const mySessionId = connectedClient.sessionId;
             const sessions = await connectedClient.listSessions();
+            const outstandingText = `\n${formatOutstandingAsks(20) || "Outstanding asks: none"}`;
             return {
               content: [{
                 type: "text",
-                text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nActive sessions: ${sessions.length}`,
+                text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nVisible connected sessions: ${sessions.length} (including this session; scope and permissions apply)${outstandingText}`,
               }],
-              details: {},
+              details: {
+                outstandingAsks: [...outstandingAsks.entries()].map(([id, ask]) => ({
+                  messageId: id,
+                  to: ask.targetDisplay,
+                  sentAt: ask.sentAt,
+                })),
+              },
             };
           } catch (error) {
             return {
@@ -3932,9 +4267,22 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
           };
       }
       })();
-      return attachSelfProfile(toolResult);
+      if (sendIdentity && ["send", "ask", "reply", "broadcast"].includes(params.action)) {
+        toolResult.details = { ...(toolResult.details as Record<string, unknown> ?? {}), senderIdentity: sendIdentity };
+      }
+      if (["send", "ask", "reply", "cancel", "broadcast"].includes(params.action)) {
+        const conversation = replyTracker.formatConversationContext();
+        if (conversation) toolResult.content.push({ type: "text", text: conversation });
+        const outstanding = formatOutstandingAsks();
+        if (outstanding) toolResult.content.push({ type: "text", text: outstanding });
+      }
+      if (conversationPersistenceWarning) toolResult.content.push({ type: "text", text: conversationPersistenceWarning });
+      if (historyWarnings.length) {
+        toolResult.content.push({ type: "text", text: `Local history was not fully persisted; recovery may be incomplete. ${historyWarnings.join("; ")}` });
+      }
+      return attachSelfProfile(toolResult, normalizeToolProfilePlaceholders(params.profile) !== undefined);
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
       const action = typeof args.action === "string" ? args.action : "intercom";
       const target = typeof args.to === "string" && args.to.trim() ? args.to.trim() : undefined;
       const targets = Array.isArray(args.targets)
@@ -3944,13 +4292,17 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
       const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
       let text = theme.fg("toolTitle", theme.bold("intercom "));
       text += theme.fg(action === "ask" || action === "broadcast" ? "warning" : action === "reply" ? "success" : "accent", action);
+      const senderIdentity = (context?.state as { senderIdentity?: string } | undefined)?.senderIdentity;
+      if (senderIdentity && ["send", "ask", "reply", "broadcast"].includes(action)) {
+        text += " " + theme.fg("muted", `as ${senderIdentity}`);
+      }
       if (target) {
         text += " " + theme.fg("muted", "→") + " " + theme.fg("accent", target);
       } else if (targets.length > 0) {
         const targetSummary = targets.length <= 3 ? targets.join(", ") : `${targets.slice(0, 3).join(", ")} +${targets.length - 3}`;
         text += " " + theme.fg("muted", "→") + " " + theme.fg("accent", targetSummary);
       } else if (action === "broadcast") {
-        text += " " + theme.fg("muted", "→ all visible live sessions");
+        text += " " + theme.fg("muted", "→ visible local sessions");
       }
       if (attachmentCount > 0) {
         text += " " + theme.fg("dim", `(${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"})`);
@@ -3961,13 +4313,22 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
       return new Text(text, 0, 0);
     },
     renderResult(result, { isPartial }, theme, context) {
-      if (isPartial) {
-        return new Text(theme.fg("warning", "Intercom working..."), 0, 0);
+      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string; senderIdentity?: string; outcomeKnown?: boolean; unknownCount?: number } | undefined;
+      if (details?.senderIdentity) {
+        const state = (context.state ?? {}) as { senderIdentity?: string };
+        if (state.senderIdentity !== details.senderIdentity) {
+          state.senderIdentity = details.senderIdentity;
+          context.state = state;
+          context.invalidate?.();
+        }
       }
-      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string } | undefined;
+      if (isPartial) {
+        return new Text(theme.fg("warning", details?.senderIdentity ? `Intercom working as ${details.senderIdentity}…` : "Intercom working..."), 0, 0);
+      }
       const failed = Boolean(context.isError || details?.error === true || details?.delivered === false);
-      let text = failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
-      text += theme.fg(failed ? "error" : "text", firstTextContent(result));
+      const uncertain = details?.outcomeKnown === false || (details?.unknownCount ?? 0) > 0;
+      let text = uncertain ? theme.fg("warning", "? ") : failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
+      text += theme.fg(uncertain ? "warning" : failed ? "error" : "text", result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n"));
       if (details?.messageId && !context.expanded) {
         text += theme.fg("dim", ` (${details.messageId.slice(0, 8)})`);
       }
@@ -4121,8 +4482,10 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
     ).catch(() => undefined);
 
     if (result?.sent && result.messageId && result.text && getLiveContext(ctx, overlayGeneration)) {
-      pi.appendEntry("intercom_sent", {
+      recordConversationEntry("intercom_sent", {
         to: selectedSession.name || selectedSession.id,
+        targetId: selectedSession.id,
+        as: currentSendIdentity(overlayClient),
         message: { text: result.text },
         messageId: result.messageId,
         ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
@@ -4130,7 +4493,7 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
       });
       const deliveryNotice = result.delivery === "queued"
         ? `Message queued for offline session ${targetLabel} — delivered only if it reconnects within 24h`
-        : `Message sent to ${targetLabel}`;
+        : `Message sent to ${targetLabel} (as ${currentSendIdentity(overlayClient)})`;
       notifyIfLive(
         ctx,
         result.peerCompaction
@@ -4144,17 +4507,17 @@ Any action may include profile: { name?, description? }. Use a concise 5-9 word 
   }
 
   pi.registerCommand("intercom", {
-    description: "Open session intercom overlay",
+    description: "Open session intercom overlay to browse active sessions and send messages",
     handler: async (_args, ctx) => openIntercomOverlay(ctx),
   });
 
   pi.registerCommand("intercom-id", {
-    description: "Insert a stable pi-intercom handoff snippet for this session into the editor",
+    description: "Insert a stable pi-intercom contact target snippet for this session into the editor",
     handler: async (_args, ctx) => insertIntercomId(ctx),
   });
 
   pi.registerCommand("alias", {
-    description: "Set the current session alias (usage: /alias <name> or /alias menu)",
+    description: "Set or inspect this session's alias (usage: /alias <name> or /alias menu)",
     handler: async (args, ctx) => setIntercomAlias(args, ctx),
   });
 

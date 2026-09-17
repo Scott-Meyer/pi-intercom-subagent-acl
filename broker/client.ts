@@ -5,7 +5,7 @@ import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isPeerCompactionNotice, isSessionInfo } from "./protocol.ts";
 import { getIntercomScopeId } from "../config.ts";
-import { COMPACTION_AWARENESS_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -18,11 +18,15 @@ import type {
   SessionRegistration,
 } from "../types.ts";
 
-interface SendOptions {
+export interface SendOptions {
   text: string;
   attachments?: Attachment[];
   replyTo?: string;
+  completesAsk?: boolean;
   expectsReply?: boolean;
+  senderWaitMode?: "blocking" | "nonblocking";
+  /** Acceptance wait only; expiry is not proof of nondelivery or cancellation. */
+  timeoutMs?: number;
   messageId?: string;
   supersedes?: string;
   retryOf?: string;
@@ -34,7 +38,10 @@ interface SendOptions {
 }
 
 export interface SendResult extends DeliveryDetails {
+  /** Full authored message ID, retained even on failure/uncertainty. For
+   * cancellation this is the original message being withdrawn. */
   id: string;
+  /** True means this operation was accepted, not that the model read the message. */
   delivered: boolean;
   reason?: string;
 }
@@ -87,6 +94,10 @@ export class IntercomClient extends EventEmitter {
   private _selfSession: SessionInfo | null = null;
   private _features = new Set<string>();
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
+  private pendingCancellations = new Map<string, { messageId: string; resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
+  /** Untagged legacy cancellation ACKs can collide with any later send using
+   * the same ID on this connection. Only a fresh connection disambiguates it. */
+  private legacyCancellationMessageIds = new Set<string>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
   private pendingAdvertise = new Map<string, { resolve: (result: AdvertiseResult) => void; reject: (e: Error) => void }>();
   private pendingCompactionReports = new Map<string, { resolve: (result: CompactionRecordedResult) => void; reject: (e: Error) => void }>();
@@ -101,6 +112,8 @@ export class IntercomClient extends EventEmitter {
       pending.reject(error);
     }
     this.pendingSends.clear();
+    for (const pending of this.pendingCancellations.values()) pending.reject(error);
+    this.pendingCancellations.clear();
     for (const pending of this.pendingAdvertise.values()) {
       pending.reject(error);
     }
@@ -327,7 +340,7 @@ export class IntercomClient extends EventEmitter {
           session,
           ...(sessionId ? { sessionId } : {}),
           ...(scopeId ? { scopeId } : {}),
-          clientFeatures: [COMPACTION_AWARENESS_FEATURE],
+          clientFeatures: [COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE],
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
         });
       } catch (error) {
@@ -340,6 +353,40 @@ export class IntercomClient extends EventEmitter {
         reject(toError(error));
       }
     });
+  }
+
+  private takePendingDelivery(message: Record<string, unknown>) {
+    if (message.requestId !== undefined && typeof message.requestId !== "string") {
+      throw new Error("Invalid delivery requestId");
+    }
+    if (typeof message.requestId === "string") {
+      const pending = this.pendingCancellations.get(message.requestId);
+      if (pending?.messageId !== message.messageId) return undefined;
+      this.pendingCancellations.delete(message.requestId);
+      return pending;
+    }
+    if (this.legacyCancellationMessageIds.has(message.messageId as string)) return undefined;
+    const pending = this.pendingSends.get(message.messageId as string);
+    if (pending) {
+      this.pendingSends.delete(message.messageId as string);
+      return pending;
+    }
+    // A message ID alone cannot distinguish a late send ACK from a cancel ACK.
+    // Legacy cancellation therefore times out as unknown rather than borrowing
+    // an unrelated send's acceptance.
+    return undefined;
+  }
+
+  private deliveryMetadata(message: Record<string, unknown>): Pick<DeliveryDetails, "recipient" | "cancellation"> {
+    const { recipient, cancellation } = message;
+    if (recipient !== undefined && !isSessionInfo(recipient)) throw new Error("Invalid delivery recipient");
+    if (cancellation !== undefined && cancellation !== "removed_from_mailbox" && cancellation !== "withdrawal_requested" && cancellation !== "not_delivered") {
+      throw new Error("Invalid cancellation state");
+    }
+    return {
+      ...(recipient !== undefined ? { recipient: recipient as SessionInfo } : {}),
+      ...(cancellation !== undefined ? { cancellation } : {}),
+    };
   }
 
   private handleBrokerMessage(msg: unknown): void {
@@ -379,6 +426,7 @@ export class IntercomClient extends EventEmitter {
         this._sessionId = brokerMessage.sessionId;
         this._selfSession = brokerMessage.session as SessionInfo | undefined ?? null;
         this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
+        this.legacyCancellationMessageIds.clear();
         const registered: BrokerMessage = {
           type: "registered",
           sessionId: brokerMessage.sessionId,
@@ -496,17 +544,17 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid delivered message");
         }
 
-        const pending = this.pendingSends.get(messageId);
+        const metadata = this.deliveryMetadata(brokerMessage);
+        const pending = this.takePendingDelivery(brokerMessage);
         if (!pending) {
           // Late send responses are harmless once the caller has already timed out.
           return;
         }
 
-        this.pendingSends.delete(messageId);
         if (typeof contactToken === "string" && peerCompaction === undefined) {
           this.acknowledgeDirectContact(contactToken);
         }
-        pending.resolve({ id: messageId, delivered: true, delivery: delivery as "socket_delivered" | "queued" | undefined ?? "socket_delivered", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}), ...(peerCompaction !== undefined ? { peerCompaction } : {}), ...(typeof contactToken === "string" ? { contactToken } : {}) });
+        pending.resolve({ ...metadata, id: messageId, delivered: true, delivery: delivery as "socket_delivered" | "queued" | undefined ?? "socket_delivered", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}), ...(peerCompaction !== undefined ? { peerCompaction } : {}), ...(typeof contactToken === "string" ? { contactToken } : {}) });
         break;
       }
 
@@ -516,14 +564,14 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid delivery_failed message");
         }
 
-        const pending = this.pendingSends.get(messageId);
+        const metadata = this.deliveryMetadata(brokerMessage);
+        const pending = this.takePendingDelivery(brokerMessage);
         if (!pending) {
           // Late send responses are harmless once the caller has already timed out.
           return;
         }
 
-        this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: false, reason, delivery: delivery as "failed" | "unknown" | undefined ?? "failed", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
+        pending.resolve({ ...metadata, id: messageId, delivered: false, reason, delivery: delivery as "failed" | "unknown" | undefined ?? "failed", retryable: delivery === "unknown" ? false : retryable as boolean | undefined ?? false, outcomeKnown: delivery === "unknown" ? false : outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
         break;
       }
 
@@ -791,7 +839,8 @@ export class IntercomClient extends EventEmitter {
    * Send to a session from a caller-owned roster snapshot without listing the
    * roster again. Multi-recipient callers can therefore expand visibility once,
    * while every recipient still gets an ordinary message ID, delivery record,
-   * receipt route, rate-limit charge, and exact-endpoint rebound check.
+   * receipt route, rate-limit charge, and exact-endpoint rebound check. An
+   * endpoint epoch supplied by the caller is never silently re-resolved.
    */
   async sendToSession(session: SessionInfo, options: SendOptions): Promise<SendResult> {
     const exactTarget = session.endpointEpoch
@@ -805,14 +854,24 @@ export class IntercomClient extends EventEmitter {
     options: SendOptions,
     rosterTarget?: { id: string; epoch: string } | null,
   ): Promise<SendResult> {
+    const messageId = options.messageId ?? randomUUID();
+    const failedBeforeSend = (error: unknown, code = "E_NOT_CONNECTED"): SendResult => ({
+      id: messageId, delivered: false, delivery: "failed", outcomeKnown: true,
+      retryable: true, code, reason: toError(error).message,
+    });
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
     } catch (error) {
-      throw toError(error);
+      return failedBeforeSend(error);
     }
-
-    const messageId = options.messageId ?? randomUUID();
+    if (rosterTarget && !this.supportsFeature(EXACT_SEND_FEATURE)) {
+      return { ...failedBeforeSend("The connected broker cannot enforce the caller's endpoint snapshot; no message was written", "E_EXACT_SEND_UNSUPPORTED"), retryable: false };
+    }
+    const preservesQuestion = options.replyTo && !(options.completesAsk ?? !options.expectsReply);
+    if ((preservesQuestion || options.supersedes) && !this.supportsFeature(CONVERSATION_CONTRACT_FEATURE)) {
+      return { ...failedBeforeSend("The connected broker does not support this conversation intent; no message was written", "E_CONVERSATION_CONTRACT_UNSUPPORTED"), retryable: false };
+    }
     const message: Message = {
       id: messageId,
       timestamp: Date.now(),
@@ -820,63 +879,46 @@ export class IntercomClient extends EventEmitter {
       supersedes: options.supersedes,
       retryOf: options.retryOf,
       replyTo: options.replyTo,
+      completesAsk: options.completesAsk,
       expectsReply: options.expectsReply,
+      senderWaitMode: options.senderWaitMode,
       provenance: options.provenance,
-      content: {
-        text: options.text,
-        attachments: options.attachments,
-      },
+      content: { text: options.text, attachments: options.attachments },
     };
-
-    const cancelledResult = (): SendResult => ({
-      id: messageId,
-      delivered: false,
-      delivery: "failed",
-      retryable: true,
-      outcomeKnown: true,
-      code: "E_CANCELLED",
-      reason: "Send cancelled before the next delivery attempt",
+    const cancelledResult = (): SendResult => failedBeforeSend("Send cancelled before the next delivery attempt", "E_CANCELLED");
+    const unknownResult = (error: unknown, code = "E_DELIVERY_UNKNOWN"): SendResult => ({
+      id: messageId, delivered: false, delivery: "unknown", outcomeKnown: false,
+      retryable: false, code,
+      reason: `${toError(error).message}; delivery may have occurred. The message has not been withdrawn.`,
     });
-
     const sendOnce = (targetId?: string, targetEpoch?: string): Promise<SendResult> => {
+      if (this.legacyCancellationMessageIds.has(messageId)) return Promise.resolve(unknownResult("A legacy cancellation made this message ID's acknowledgements ambiguous on the current connection"));
       if (options.signal?.aborted) return Promise.resolve(cancelledResult());
-      return new Promise((resolve, reject) => {
-      const wrappedResolve = (result: SendResult) => {
-        clearTimeout(timeout);
-        resolve(result);
-      };
-      const wrappedReject = (error: Error) => {
-        clearTimeout(timeout);
-        reject(error);
-      };
-      const timeout = setTimeout(() => {
-        if (this.pendingSends.has(messageId)) {
+      if (this.pendingSends.has(messageId)) return Promise.resolve(unknownResult("This message ID already has an in-flight send", "E_MESSAGE_IN_FLIGHT"));
+      return new Promise((resolve) => {
+        const wrappedResolve = (result: SendResult) => {
+          clearTimeout(timeout);
+          resolve(result);
+        };
+        const wrappedReject = (error: Error) => wrappedResolve(unknownResult(error));
+        const timeout = setTimeout(() => {
           this.pendingSends.delete(messageId);
-          wrappedReject(new Error("Send timeout"));
+          wrappedResolve(unknownResult("Send acknowledgement timed out", "E_SEND_TIMEOUT"));
+        }, options.timeoutMs ?? 10_000);
+        this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
+        try {
+          writeMessage(socket, {
+            type: "send", to, message,
+            ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}),
+            ...(options.contactKind ? { contactKind: options.contactKind } : {}),
+          });
+        } catch (error) {
+          this.pendingSends.delete(messageId);
+          wrappedReject(toError(error));
         }
-      }, 10000);
-      this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
-
-      try {
-        writeMessage(socket, {
-          type: "send",
-          to,
-          message,
-          ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}),
-          ...(options.contactKind ? { contactKind: options.contactKind } : {}),
-        });
-      } catch (error) {
-        clearTimeout(timeout);
-        this.pendingSends.delete(messageId);
-        reject(toError(error));
-      }
-    });
+      });
     };
-
-    if (!this.supportsFeature(EXACT_SEND_FEATURE) || options.replyTo) {
-      return sendOnce();
-    }
-
+    if (!this.supportsFeature(EXACT_SEND_FEATURE) || (options.replyTo && rosterTarget === undefined)) return sendOnce();
     const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
       const sessions = await this.listSessions();
       const byId = sessions.find((session) => session.id === to);
@@ -886,50 +928,59 @@ export class IntercomClient extends EventEmitter {
       const target = matches.length === 1 ? matches[0]! : null;
       return target?.endpointEpoch ? { id: target.id, epoch: target.endpointEpoch } : null;
     };
-
-    const target = rosterTarget === undefined ? await resolveTarget() : rosterTarget;
-    if (options.signal?.aborted) return cancelledResult();
-    if (!target) return sendOnce();
-    const result = await sendOnce(target.id, target.epoch);
-    if (result.code !== "E_TARGET_REBOUND" || options.signal?.aborted) {
-      return options.signal?.aborted && !result.delivered ? cancelledResult() : result;
+    // Discovery failures happen before any send, and retain the caller's handle.
+    try {
+      const target = rosterTarget === undefined ? await resolveTarget() : rosterTarget;
+      if (options.signal?.aborted) return cancelledResult();
+      if (!target) return sendOnce();
+      const result = await sendOnce(target.id, target.epoch);
+      // Never turn an uncertain, already-written attempt into known cancellation.
+      if (rosterTarget !== undefined || result.code !== "E_TARGET_REBOUND" || !result.outcomeKnown || options.signal?.aborted) return result;
+      const reboundTarget = await resolveTarget();
+      if (options.signal?.aborted) return cancelledResult();
+      return reboundTarget ? sendOnce(reboundTarget.id, reboundTarget.epoch) : result;
+    } catch (error) {
+      return failedBeforeSend(error, "E_TARGET_RESOLUTION");
     }
-    const reboundTarget = await resolveTarget();
-    if (options.signal?.aborted) return cancelledResult();
-    return reboundTarget ? sendOnce(reboundTarget.id, reboundTarget.epoch) : result;
   }
 
-  cancelMessage(messageId: string): Promise<SendResult> {
+  /** Withdraw a message. A live endpoint can only receive a withdrawal notice;
+   * already-executed work cannot be retracted. An unknown result retains the ID. */
+  cancelMessage(messageId: string, options: { timeoutMs?: number } = {}): Promise<SendResult> {
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
     } catch (error) {
-      return Promise.reject(toError(error));
+      return Promise.resolve({ id: messageId, delivered: false, delivery: "failed", outcomeKnown: true,
+        retryable: true, code: "E_NOT_CONNECTED", reason: toError(error).message });
     }
-
-    return new Promise((resolve, reject) => {
+    if (!this.supportsFeature(CONVERSATION_CONTRACT_FEATURE)) {
+      this.legacyCancellationMessageIds.add(messageId);
+      const sending = this.pendingSends.get(messageId);
+      this.pendingSends.delete(messageId);
+      sending?.reject(new Error("The legacy broker cannot distinguish this in-flight send from its cancellation acknowledgement"));
+    }
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
       const wrappedResolve = (result: SendResult) => {
         clearTimeout(timeout);
         resolve(result);
       };
-      const wrappedReject = (error: Error) => {
-        clearTimeout(timeout);
-        reject(error);
-      };
+      const wrappedReject = (error: Error) => wrappedResolve({
+        id: messageId, delivered: false, delivery: "unknown", outcomeKnown: false,
+        retryable: false, code: "E_CANCELLATION_UNKNOWN",
+        reason: `${error.message}; withdrawal may or may not have reached the recipient.`,
+      });
       const timeout = setTimeout(() => {
-        if (this.pendingSends.has(messageId)) {
-          this.pendingSends.delete(messageId);
-          wrappedReject(new Error("Cancel timeout"));
-        }
-      }, 10000);
-      this.pendingSends.set(messageId, { resolve: wrappedResolve, reject: wrappedReject });
-
+        this.pendingCancellations.delete(requestId);
+        wrappedReject(new Error("Cancel acknowledgement timed out"));
+      }, options.timeoutMs ?? 10_000);
+      this.pendingCancellations.set(requestId, { messageId, resolve: wrappedResolve, reject: wrappedReject });
       try {
-        writeMessage(socket, { type: "cancel_message", messageId });
+        writeMessage(socket, { type: "cancel_message", messageId, requestId });
       } catch (error) {
-        clearTimeout(timeout);
-        this.pendingSends.delete(messageId);
-        reject(toError(error));
+        this.pendingCancellations.delete(requestId);
+        wrappedReject(toError(error));
       }
     });
   }

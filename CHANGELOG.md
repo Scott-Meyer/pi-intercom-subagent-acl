@@ -4,6 +4,23 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- Non-blocking asks (`blocking: false`) return an initial delivery outcome and receive the answer later in the conversation, including while a headless caller works. Outstanding questions and received-but-not-yet-persisted conversation content have journaled reload/resume recovery.
+- Communication results include bounded pending/outstanding context. `pending` exposes unanswered inbound requests, `status` shows local outstanding-question tracking, and `read` retrieves a retained incoming message's full text and attachment snapshots by exact ID.
+- `rename` changes the current session's canonical Pi name. Send/ask call displays and delivery results identify the sender used for the contact; results include exact message IDs and resolved recipient identities when known.
+
+### Changed
+- Notifications remain notifications: `send` no longer infers an answer or settles a pending ask. `reply` explicitly answers questions and also supports ordinary conversation threads. Active questions no longer block clarification asks, reverse asks, or contact with other colleagues.
+- Cancellation and supersession surface recipient-visible withdrawal/update context without claiming to undo work. Results distinguish offline mailbox removal from live withdrawal and unknown cancellation outcomes.
+- Delivery results distinguish accepted, queued, known nondelivery, and unknown outcomes. Lost acknowledgements do not imply a retry is safe. Offline queue notices state the broker-memory lifetime rather than promising durable delivery.
+- Project-launch results preserve request/command startup, observed registration, and message-delivery stages. Failures disclose prior side effects and uncertainty; a v1 roster match does not prove which launch created a peer.
+
+### Fixed
+- Implicit replies keep their active conversation across tool calls, not across unrelated runs. Ambiguous arrivals remain explicit, and naming the sender no longer redirects a reply from the current note to an older question.
+- Asynchronous reply tracking remains until host acceptance rather than disappearing before headless delivery; an unrelated failed async ask no longer tears down another blocking waiter. Elapsed reply windows are not treated as completion or withdrawal.
+- Broadcast excludes remote rows. Federation rows identify remote origin and text-only constraints; remote asks, replies, and attachments remain unsupported.
+- Tool contracts, README, and the conceptual skill replace workflow recipes with communication meaning and observable outcomes, correcting blocking defaults, native-supervisor precedence, visibility scope, attachment snapshots, and queue/timeout boundaries.
+
 ## [0.13.0-acl.11] - 2026-09-16
 
 ### Added

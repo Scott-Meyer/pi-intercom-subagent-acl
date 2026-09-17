@@ -18,8 +18,8 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { COMPACTION_AWARENESS_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "../types.ts";
-import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, PeerCompactionNotice } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "../types.ts";
+import type { CancellationState, DeliveryDetails, DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, PeerCompactionNotice } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { CollaborationStateStore } from "./collaboration-state.ts";
@@ -123,6 +123,8 @@ interface ConnectedSession {
 
 interface DeliveryRecord {
   fingerprint: string;
+  recipient?: SessionInfo;
+  cancellation?: CancellationState;
   state: DeliveryState;
   reason?: string;
   code?: string;
@@ -373,7 +375,7 @@ class IntercomBroker {
         this.federationRoster.linkDown(link.linkId);
         this.federationSendDedup.delete(link.linkId);
         for (const pending of this.federationPendingSends.dropLink(link.linkId)) {
-          this.failPendingFederatedSend(pending, "Remote federation link disconnected before delivery", "E_TARGET_DISCONNECTED", true);
+          this.failPendingFederatedSend(pending, "Remote federation link disconnected before acknowledgement; delivery may have occurred", "E_DELIVERY_UNKNOWN", false, false);
         }
         this.scheduleShutdownCheck();
       },
@@ -810,7 +812,7 @@ class IntercomBroker {
         if (existing?.socket === socket) {
           this.rememberDisconnectedSession(existing);
           this.sessions.delete(sessionKey);
-          this.clearMessageReceiptRoutesForSession(sessionKey);
+          this.pruneMessageReceiptRoutes();
           this.broadcastScoped({ type: "session_left", sessionId: existing.info.id }, existing.info, sessionKey, existing.scopeId);
           this.federationRoster.reconcileLocalRoster();
           this.recomputeNamespaceOwners();
@@ -1032,9 +1034,9 @@ class IntercomBroker {
     this.federationPendingSends.resolve(frame.sendId);
     if (frame.ok) {
       this.federationInFlightMessageIds.delete(JSON.stringify([pending.senderKey, pending.messageId]));
-      this.recordDelivery(pending.senderKey, pending.messageId, pending.fingerprint, "socket_delivered");
+      this.recordDelivery(pending.senderKey, pending.messageId, pending.fingerprint, "socket_delivered", undefined, undefined, false, undefined, undefined, undefined, pending.recipient);
       const session = this.sessions.get(pending.senderKey);
-      if (session) this.writeDeliverySuccess(session.socket, pending.messageId, "socket_delivered");
+      if (session) this.writeDeliverySuccess(session.socket, pending.messageId, "socket_delivered", undefined, undefined, { recipient: pending.recipient });
       return;
     }
     this.failPendingFederatedSend(
@@ -1042,6 +1044,7 @@ class IntercomBroker {
       frame.error,
       frame.code,
       frame.code === "E_SEND_TARGET_DISCONNECTED",
+      frame.code !== "E_SEND_DUPLICATE",
     );
   }
 
@@ -1070,18 +1073,19 @@ class IntercomBroker {
     reason: string,
     code: string,
     retryable: boolean,
+    outcomeKnown = true,
   ): void {
     this.federationInFlightMessageIds.delete(JSON.stringify([pending.senderKey, pending.messageId]));
-    this.recordDelivery(pending.senderKey, pending.messageId, pending.fingerprint, "failed", reason, code, retryable);
+    this.recordDelivery(pending.senderKey, pending.messageId, pending.fingerprint, outcomeKnown ? "failed" : "unknown", reason, code, outcomeKnown && retryable, undefined, undefined, undefined, pending.recipient);
     const session = this.sessions.get(pending.senderKey);
-    if (session) this.writeDeliveryFailure(session.socket, pending.messageId, reason, code, retryable);
+    if (session) this.writeDeliveryFailure(session.socket, pending.messageId, reason, code, retryable, outcomeKnown, { recipient: pending.recipient });
   }
 
   private ensureFederationSendSweep(): void {
     if (this.federationSendSweepTimer) return;
     this.federationSendSweepTimer = setInterval(() => {
       for (const expired of this.federationPendingSends.expire()) {
-        this.failPendingFederatedSend(expired, "Remote federation delivery timed out", "E_TARGET_DISCONNECTED", true);
+        this.failPendingFederatedSend(expired, "Remote federation acknowledgement timed out; delivery may have occurred", "E_DELIVERY_UNKNOWN", false, false);
       }
       if (this.federationPendingSends.size === 0 && this.federationSendSweepTimer) {
         clearInterval(this.federationSendSweepTimer);
@@ -1142,7 +1146,7 @@ class IntercomBroker {
     const fingerprint = this.deliveryFingerprint(message, qualifiedId, contactKind);
     const inFlightKey = JSON.stringify([currentKey, message.id]);
     if (this.federationInFlightMessageIds.has(inFlightKey)) {
-      reject("A delivery for this message id is already in flight", "E_MESSAGE_ID_REUSE");
+      this.writeDeliveryFailure(socket, message.id, "A delivery for this message id is already in flight; its outcome is not yet known", "E_MESSAGE_ID_REUSE", false, false, { recipient: imported.info });
       return;
     }
     if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
@@ -1153,6 +1157,7 @@ class IntercomBroker {
       linkId: link.linkId,
       messageId: message.id,
       senderKey: currentKey,
+      recipient: { ...imported.info },
       fingerprint,
     });
     if (!pending) {
@@ -1185,8 +1190,7 @@ class IntercomBroker {
       writeMessage(link.socket, frame);
     } catch (error) {
       this.federationPendingSends.resolve(sendId);
-      this.federationInFlightMessageIds.delete(inFlightKey);
-      reject(`Failed to write the routed send to the federation link: ${error instanceof Error ? error.message : String(error)}`, "E_TARGET_DISCONNECTED", true);
+      this.failPendingFederatedSend(pending, `Federation send write failed: ${error instanceof Error ? error.message : String(error)}; delivery may have occurred`, "E_DELIVERY_UNKNOWN", false, false);
       return;
     }
     this.ensureFederationSendSweep();
@@ -1356,7 +1360,7 @@ class IntercomBroker {
           break;
         }
         if (previous) {
-          this.clearMessageReceiptRoutesForSession(key);
+          this.pruneMessageReceiptRoutes();
           previous.socket.end();
         }
         setKey(key);
@@ -1402,7 +1406,7 @@ class IntercomBroker {
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, COMPACTION_AWARENESS_FEATURE, SESSION_PROFILE_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, COMPACTION_AWARENESS_FEATURE, SESSION_PROFILE_FEATURE, CONVERSATION_CONTRACT_FEATURE],
           session: info,
         });
         this.broadcastScoped({ type: "session_joined", session: info }, info, key, scopeId);
@@ -1441,7 +1445,7 @@ class IntercomBroker {
         if (existing?.socket === socket) {
           this.rememberDisconnectedSession(existing);
           this.sessions.delete(currentKey);
-          this.clearMessageReceiptRoutesForSession(currentKey);
+          this.pruneMessageReceiptRoutes();
           this.broadcastScoped({ type: "session_left", sessionId: existing.info.id }, existing.info, currentKey, existing.scopeId);
           this.federationRoster.reconcileLocalRoster();
           this.recomputeNamespaceOwners();
@@ -1635,6 +1639,8 @@ class IntercomBroker {
           // Origin-qualified identities are imported federation rows. They
           // route over the peer link only when routed delivery is negotiated;
           // they never fall through to local name or mailbox resolution.
+          const fingerprint = this.deliveryFingerprint(message, clientMessage.to, contactKind);
+          if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) break;
           const imported = this.federationRoster.findImportedByQualifiedId(clientMessage.to);
           if (imported) {
             this.attemptFederatedSend(socket, currentKey, fromSession, clientMessage.to, message, contactKind, imported);
@@ -1649,7 +1655,8 @@ class IntercomBroker {
         const brokerReceivedAt = Date.now();
         this.pruneAskEdges();
         this.pruneMessageReceiptRoutes(brokerReceivedAt);
-        const replyEdge = message.replyTo ? this.askEdges.get(message.replyTo) : undefined;
+        const replyRoute = message.replyTo ? this.messageReceiptRoutes.get(message.replyTo) ?? this.askEdges.get(message.replyTo) : undefined;
+        const completesAsk = message.completesAsk ?? Boolean(message.replyTo && !message.expectsReply);
 
         const hasTargetId = clientMessage.targetId !== undefined;
         const hasTargetEpoch = clientMessage.targetEpoch !== undefined;
@@ -1701,10 +1708,6 @@ class IntercomBroker {
 
         const targets = this.findSessions(clientMessage.to as string, fromSession.scopeId, currentKey);
         if (targets.length === 1) {
-          if (message.replyTo && !replyEdge) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
-            break;
-          }
           const target = targets[0];
           const fingerprint = this.deliveryFingerprint(message, target.info.id, contactKind);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
@@ -1717,16 +1720,11 @@ class IntercomBroker {
               break;
             }
           }
-          if (replyEdge && (replyEdge.to !== currentKey || replyEdge.from !== target.key)) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET");
+          if (message.replyTo && (!replyRoute || replyRoute.to !== currentKey || replyRoute.from !== target.key)) {
+            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a previous message from this recipient", "E_REPLY_TARGET");
             break;
           }
           if (message.expectsReply) {
-            const reverseEdge = Array.from(this.askEdges.entries()).find(([edgeMessageId, edge]) => edgeMessageId !== message.replyTo && edge.from === target.key && edge.to === currentKey);
-            if (reverseEdge) {
-              this.writeDeliveryFailure(socket, message.id, "Mutual ask refused: target session is already waiting for a reply from this session.", "E_MUTUAL_ASK");
-              break;
-            }
             this.writePendingAskRecord(message, fromSession, target.info, brokerReceivedAt);
             this.askEdges.set(message.id, {
               from: currentKey,
@@ -1752,6 +1750,7 @@ class IntercomBroker {
             ...message,
             brokerReceivedAt,
             brokerDeliveredAt: Date.now(),
+            ...(message.expectsReply ? { replyDeadline: brokerReceivedAt + this.askTimeoutMs } : {}),
             ...(receiverContact?.notice ? { peerCompaction: receiverContact.notice } : {}),
             ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
             ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
@@ -1768,7 +1767,7 @@ class IntercomBroker {
               from: fromSession.info,
               control,
             });
-            this.updateDeliveryRecord(currentKey, message.supersedes, "failed", `Superseded by ${message.id}`, "E_DELIVERY_SUPERSEDED");
+            // Replacing an instruction does not undo its earlier delivery or its replay receipt.
           }
           writeMessage(target.socket, {
             type: "message",
@@ -1776,7 +1775,11 @@ class IntercomBroker {
             message: deliveredMessage,
           });
           this.finalizeSenderContact(senderContact, senderBaselineToken);
-          if (message.replyTo) {
+          if (message.supersedes) {
+            this.askEdges.delete(message.supersedes);
+            this.removePendingAskRecord(message.supersedes, fromSession.scopeId);
+          }
+          if (message.replyTo && completesAsk) {
             this.askEdges.delete(message.replyTo);
             this.removePendingAskRecord(message.replyTo, fromSession.scopeId);
           }
@@ -1796,6 +1799,7 @@ class IntercomBroker {
             senderContact?.notice,
             senderContactToken,
             senderContact,
+            target.info,
           );
           this.writeDeliverySuccess(
             socket,
@@ -1803,6 +1807,7 @@ class IntercomBroker {
             "socket_delivered",
             senderContact?.notice,
             senderContactToken,
+            { recipient: target.info },
           );
           break;
         }
@@ -1818,10 +1823,6 @@ class IntercomBroker {
             this.writeDeliveryFailure(socket, message.id, "Broadcast recipients must still be connected", "E_TARGET_NOT_FOUND");
             break;
           }
-          if (message.replyTo && !replyEdge) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
-            break;
-          }
           const disconnectedTarget = disconnectedTargets[0]!;
           const target = disconnectedTarget.info;
           const fingerprint = this.deliveryFingerprint(message, target.id, contactKind);
@@ -1832,12 +1833,12 @@ class IntercomBroker {
             this.writeDeliveryFailure(socket, message.id, "Supersede target is not connected", "E_SUPERSEDE_TARGET");
             break;
           }
-          if (replyEdge && (replyEdge.to !== currentKey || replyEdge.from !== disconnectedTarget.key)) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match the pending ask", "E_REPLY_TARGET");
+          if (message.replyTo && (!replyRoute || replyRoute.to !== currentKey || replyRoute.from !== disconnectedTarget.key)) {
+            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a previous message from this recipient", "E_REPLY_TARGET");
             break;
           }
           if (message.expectsReply) {
-            this.writeDeliveryFailure(socket, message.id, "Target session is not currently connected; blocking asks are not queued", "E_TARGET_DISCONNECTED");
+            this.writeDeliveryFailure(socket, message.id, "Target session is not currently connected; asks are not queued", "E_TARGET_DISCONNECTED");
             break;
           }
           const liveMailboxTarget = this.findUniqueLiveSessionForDisconnectedSession(disconnectedTarget, currentKey);
@@ -1880,7 +1881,7 @@ class IntercomBroker {
             this.queueMailboxMessage(fromSession, disconnectedTarget, message, contactKind, brokerReceivedAt);
           }
           this.finalizeSenderContact(senderContact, senderBaselineToken);
-          if (message.replyTo) {
+          if (message.replyTo && completesAsk) {
             this.askEdges.delete(message.replyTo);
             this.removePendingAskRecord(message.replyTo, fromSession.scopeId);
           }
@@ -1896,6 +1897,7 @@ class IntercomBroker {
             senderContact?.notice,
             senderContactToken,
             senderContact,
+            acceptedTarget,
           );
           this.writeDeliverySuccess(
             socket,
@@ -1903,6 +1905,7 @@ class IntercomBroker {
             acceptedDelivery,
             senderContact?.notice,
             senderContactToken,
+            { recipient: acceptedTarget },
           );
           break;
         }
@@ -2011,68 +2014,30 @@ class IntercomBroker {
       }
 
       case "cancel_message": {
-        if (!currentKey) {
-          throw new Error("Received cancel_message before register");
-        }
-        if (typeof clientMessage.messageId !== "string") {
+        if (!currentKey) throw new Error("Received cancel_message before register");
+        if (typeof clientMessage.messageId !== "string" || (clientMessage.requestId !== undefined && typeof clientMessage.requestId !== "string")) {
           throw new Error("Invalid cancel_message message");
         }
-        this.pruneMessageReceiptRoutes();
-        this.pruneMailboxMessages();
         const sender = this.sessions.get(currentKey);
-        const queuedIndex = this.mailboxMessages.findIndex(entry => entry.message.id === clientMessage.messageId && entry.fromKey === currentKey);
-        if (queuedIndex >= 0 && sender?.socket === socket) {
-          this.mailboxMessages.splice(queuedIndex, 1);
-          this.updateDeliveryRecord(currentKey, clientMessage.messageId, "failed", "Sender cancelled the queued delivery", "E_DELIVERY_CANCELLED");
-          const edge = this.askEdges.get(clientMessage.messageId);
-          if (edge?.from === currentKey) {
-            this.askEdges.delete(clientMessage.messageId);
-            this.removePendingAskRecord(clientMessage.messageId, sender.scopeId);
-          }
-          writeMessage(socket, { type: "delivered", messageId: clientMessage.messageId });
-          break;
-        }
-        const route = this.messageReceiptRoutes.get(clientMessage.messageId);
-        const receiver = route ? this.sessions.get(route.to) : undefined;
-        if (route?.from !== currentKey || sender?.socket !== socket || !receiver) {
-          writeMessage(socket, {
-            type: "delivery_failed",
-            messageId: clientMessage.messageId,
-            reason: "Message cannot be cancelled by this session",
-          });
-          break;
-        }
-        writeMessage(receiver.socket, {
-          type: "message_control",
-          from: sender.info,
-          control: {
-            action: "cancel",
-            messageId: clientMessage.messageId,
-            timestamp: Date.now(),
-          },
+        if (sender?.socket !== socket) throw new Error("Sender session not found");
+        const result = this.withdrawMessage(sender, clientMessage.messageId);
+        const { accepted, ...details } = result;
+        writeMessage(socket, {
+          type: accepted ? "delivered" : "delivery_failed",
+          messageId: clientMessage.messageId,
+          ...(clientMessage.requestId ? { requestId: clientMessage.requestId } : {}),
+          ...details,
         });
-        const edge = this.askEdges.get(clientMessage.messageId);
-        if (edge?.from === currentKey) {
-          this.askEdges.delete(clientMessage.messageId);
-          this.removePendingAskRecord(clientMessage.messageId, sender.scopeId);
-        }
-        this.updateDeliveryRecord(currentKey, clientMessage.messageId, "failed", "Sender cancelled the delivery", "E_DELIVERY_CANCELLED");
-        writeMessage(socket, { type: "delivered", messageId: clientMessage.messageId });
         break;
       }
 
       case "cancel_ask": {
-        if (!currentKey) {
-          throw new Error("Received cancel_ask before register");
-        }
-        if (typeof clientMessage.messageId !== "string") {
-          throw new Error("Invalid cancel_ask message");
-        }
-        const session = this.sessions.get(currentKey);
-        const edge = this.askEdges.get(clientMessage.messageId);
-        if (session?.socket === socket && edge?.from === currentKey) {
-          this.askEdges.delete(clientMessage.messageId);
-          this.removePendingAskRecord(clientMessage.messageId, session.scopeId);
+        if (!currentKey) throw new Error("Received cancel_ask before register");
+        if (typeof clientMessage.messageId !== "string") throw new Error("Invalid cancel_ask message");
+        const sender = this.sessions.get(currentKey);
+        if (sender?.socket === socket) {
+          // Best-effort withdrawal is distinct from stopping the local waiter.
+          this.withdrawMessage(sender, clientMessage.messageId);
         }
         break;
       }
@@ -2298,12 +2263,66 @@ class IntercomBroker {
     });
   }
 
+  private withdrawMessage(sender: ConnectedSession, messageId: string): DeliveryDetails & { accepted: boolean; reason?: string } {
+    this.pruneMessageReceiptRoutes();
+    this.pruneMailboxMessages();
+    this.pruneDeliveryRecords();
+    const record = this.deliveryRecords.get(this.deliveryRecordKey(sender.key, messageId));
+    const accepted = (cancellation: CancellationState, recipient?: SessionInfo) => ({
+      accepted: true, delivery: "socket_delivered" as const, outcomeKnown: true, retryable: false,
+      cancellation, ...(recipient ? { recipient } : {}),
+    });
+    if (record?.cancellation) return accepted(record.cancellation, record.recipient);
+    const clearAsk = () => {
+      const edge = this.askEdges.get(messageId);
+      if (edge?.from !== sender.key) return;
+      this.askEdges.delete(messageId);
+      this.removePendingAskRecord(messageId, sender.scopeId);
+    };
+    const queuedIndex = this.mailboxMessages.findIndex(entry => entry.message.id === messageId && entry.fromKey === sender.key);
+    if (queuedIndex >= 0) {
+      const [entry] = this.mailboxMessages.splice(queuedIndex, 1);
+      this.updateDeliveryRecord(sender.key, messageId, "failed", "Sender removed the queued delivery", "E_DELIVERY_CANCELLED");
+      if (record) record.cancellation = "removed_from_mailbox";
+      clearAsk();
+      return accepted("removed_from_mailbox", entry!.target);
+    }
+    const route = this.messageReceiptRoutes.get(messageId);
+    if (record?.state === "failed" && !route && record.code !== "E_DELIVERY_SUPERSEDED") {
+      record.cancellation = "not_delivered";
+      clearAsk();
+      return accepted("not_delivered", record.recipient);
+    }
+    const receiver = route?.from === sender.key ? this.sessions.get(route.to) : undefined;
+    if (!receiver) {
+      // We may still stop broker ask tracking, but cannot pretend remote work was withdrawn.
+      clearAsk();
+      return { accepted: false, delivery: "failed", outcomeKnown: true, retryable: false,
+        code: "E_CANCELLATION_UNAVAILABLE", reason: "No reachable recipient or queued message owned by this session; earlier work may already have happened" };
+    }
+    try {
+      writeMessage(receiver.socket, {
+        type: "message_control", from: sender.info,
+        control: { action: "cancel", messageId, timestamp: Date.now(), detail: "The sender withdrew this message. Work may already have happened." },
+      });
+    } catch {
+      clearAsk();
+      return { accepted: false, delivery: "unknown", outcomeKnown: false, retryable: false,
+        code: "E_CANCELLATION_UNKNOWN", reason: "Withdrawal write failed; the recipient may or may not have received the notice", recipient: receiver.info };
+    }
+    clearAsk();
+    // The original delivery remains accepted; a notice does not undo it.
+    if (record) record.cancellation = "withdrawal_requested";
+    return accepted("withdrawal_requested", receiver.info);
+  }
+
   private writeDeliverySuccess(
     socket: net.Socket,
     messageId: string,
     delivery: "socket_delivered" | "queued",
     peerCompaction?: PeerCompactionNotice,
     contactToken?: string,
+    details: Pick<DeliveryDetails, "recipient" | "cancellation"> = {},
   ): void {
     writeMessage(socket, {
       type: "delivered",
@@ -2311,13 +2330,14 @@ class IntercomBroker {
       delivery,
       retryable: false,
       outcomeKnown: true,
+      ...details,
       ...(peerCompaction ? { peerCompaction } : {}),
       ...(contactToken ? { contactToken } : {}),
     });
   }
 
-  private writeDeliveryFailure(socket: net.Socket, messageId: string, reason: string, code: string, retryable = false): void {
-    writeMessage(socket, { type: "delivery_failed", messageId, reason, delivery: "failed", code, retryable, outcomeKnown: true });
+  private writeDeliveryFailure(socket: net.Socket, messageId: string, reason: string, code: string, retryable = false, outcomeKnown = true, details: Pick<DeliveryDetails, "recipient" | "cancellation"> = {}): void {
+    writeMessage(socket, { type: "delivery_failed", messageId, reason, delivery: outcomeKnown ? "failed" : "unknown", code, retryable: outcomeKnown && retryable, outcomeKnown, ...details });
   }
 
   private deliveryFingerprint(message: Message, targetId: string, contactKind: "direct" | "broadcast"): string {
@@ -2328,6 +2348,8 @@ class IntercomBroker {
       attachments: message.content.attachments,
       replyTo: message.replyTo,
       expectsReply: message.expectsReply,
+      completesAsk: message.completesAsk,
+      senderWaitMode: message.senderWaitMode,
       supersedes: message.supersedes,
       retryOf: message.retryOf,
       provenance: message.provenance,
@@ -2353,9 +2375,9 @@ class IntercomBroker {
       if (record.senderContact && !record.senderContact.durableBaseline && (!record.contactToken || !this.pendingDirectContacts.has(record.contactToken))) {
         record.contactToken = this.trackDirectContact(fromSessionId, record.senderContact);
       }
-      this.writeDeliverySuccess(socket, messageId, record.state, record.peerCompaction, record.contactToken);
+      this.writeDeliverySuccess(socket, messageId, record.state, record.peerCompaction, record.contactToken, { recipient: record.recipient, cancellation: record.cancellation });
     } else {
-      this.writeDeliveryFailure(socket, messageId, record.reason ?? "Previous delivery failed", record.code ?? "E_DELIVERY_FAILED", record.retryable);
+      this.writeDeliveryFailure(socket, messageId, record.reason ?? "Previous delivery failed", record.code ?? "E_DELIVERY_FAILED", record.retryable, record.outcomeKnown, { recipient: record.recipient, cancellation: record.cancellation });
     }
     return true;
   }
@@ -2371,6 +2393,7 @@ class IntercomBroker {
     peerCompaction?: PeerCompactionNotice,
     contactToken?: string,
     senderContact?: DirectContactPlan,
+    recipient?: SessionInfo,
   ): void {
     this.pruneDeliveryRecords();
     while (this.deliveryRecords.size >= MAX_DELIVERY_RECORDS) {
@@ -2384,7 +2407,8 @@ class IntercomBroker {
       ...(reason ? { reason } : {}),
       ...(code ? { code } : {}),
       retryable,
-      outcomeKnown: true,
+      outcomeKnown: state !== "unknown",
+      ...(recipient ? { recipient: { ...recipient } } : {}),
       ...(peerCompaction ? { peerCompaction } : {}),
       ...(contactToken ? { contactToken } : {}),
       ...(senderContact ? { senderContact } : {}),
@@ -2473,6 +2497,8 @@ class IntercomBroker {
         createdAt: entry.message.brokerReceivedAt ?? entry.queuedAt,
       });
       this.updateDeliveryRecord(entry.fromKey, entry.message.id, "socket_delivered");
+      const record = this.deliveryRecords.get(this.deliveryRecordKey(entry.fromKey, entry.message.id));
+      if (record) record.recipient = { ...session.info };
     }
   }
 
@@ -2541,17 +2567,11 @@ class IntercomBroker {
     }
   }
 
+  // Thread ownership belongs to stable scoped identities, not one socket lifetime.
+  // Keep the bounded relationship on reconnect; live receipt/control delivery still checks current sockets.
   private pruneMessageReceiptRoutes(now = Date.now()): void {
     for (const [messageId, route] of this.messageReceiptRoutes) {
-      if (now - route.createdAt > MESSAGE_RECEIPT_ROUTE_RETENTION_MS) {
-        this.messageReceiptRoutes.delete(messageId);
-      }
-    }
-  }
-
-  private clearMessageReceiptRoutesForSession(sessionKey: string): void {
-    for (const [messageId, route] of this.messageReceiptRoutes) {
-      if (route.from === sessionKey || route.to === sessionKey) {
+      if (now - route.createdAt > MESSAGE_RECEIPT_ROUTE_RETENTION_MS || this.messageReceiptRoutes.size > MAX_DELIVERY_RECORDS) {
         this.messageReceiptRoutes.delete(messageId);
       }
     }

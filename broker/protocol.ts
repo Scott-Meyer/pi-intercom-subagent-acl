@@ -136,6 +136,10 @@ export function isMessage(value: unknown): value is Message {
   if (value.expectsReply !== undefined && typeof value.expectsReply !== "boolean") {
     return false;
   }
+  if (value.completesAsk !== undefined && typeof value.completesAsk !== "boolean") return false;
+  if (value.completesAsk === true && !value.replyTo) return false;
+  if (value.senderWaitMode !== undefined && value.senderWaitMode !== "blocking" && value.senderWaitMode !== "nonblocking") return false;
+  if (value.replyDeadline !== undefined && (!Number.isSafeInteger(value.replyDeadline) || (value.replyDeadline as number) < 0)) return false;
 
   if (value.provenance !== undefined && !isMessageProvenance(value.provenance)) {
     return false;
@@ -274,7 +278,8 @@ export function isAuthoredMessage(value: unknown): value is Message {
   return isMessage(value)
     && value.peerCompaction === undefined
     && value.contactToken === undefined
-    && value.contactBaseline === undefined;
+    && value.contactBaseline === undefined
+    && value.replyDeadline === undefined;
 }
 
 export function isSessionId(value: unknown): value is string {

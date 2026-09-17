@@ -167,12 +167,13 @@ async function registerOrdinaryClient(
 async function waitForBrokerMessage(
   socket: net.Socket,
   predicate: (value: Record<string, unknown>) => boolean,
+  timeoutMs = 5_000,
 ): Promise<Record<string, unknown>> {
   return await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       socket.off("data", reader);
       reject(new Error("Timed out waiting for broker push message"));
-    }, 5_000);
+    }, timeoutMs);
     const reader = createMessageReader((value) => {
       if (typeof value !== "object" || value === null || Array.isArray(value) || !predicate(value as Record<string, unknown>)) return;
       clearTimeout(timeout);
@@ -198,9 +199,9 @@ async function advertiseSession(socket: net.Socket, requestId: string, name: str
   return await response;
 }
 
-async function sendDirect(socket: net.Socket, to: string, messageId: string): Promise<Record<string, unknown>> {
+async function sendDirect(socket: net.Socket, to: string, messageId: string, timeoutMs = 5_000): Promise<Record<string, unknown>> {
   const response = waitForBrokerMessage(socket, (value) =>
-    (value.type === "delivered" || value.type === "delivery_failed") && value.messageId === messageId);
+    (value.type === "delivered" || value.type === "delivery_failed") && value.messageId === messageId, timeoutMs);
   writeMessage(socket, {
     type: "send",
     to,
@@ -252,6 +253,7 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
   const attachments: FederationBridgeAttach[] = [];
   const expectedCapabilities = new Set(["A".repeat(32), "C".repeat(32), "D".repeat(32)]);
   let delayFirstPreparedHello = true;
+  let dropPeerAcks = false;
   /** Assigned from broker_list_scopes once the brokers are up; the proxy
    * closures below capture it and only run during dials after assignment. */
   let localOriginId = "";
@@ -290,7 +292,11 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
         await new Promise((resolve) => setTimeout(resolve, 1_200));
       }
       if (first.leftover.length > 0) destination.write(first.leftover);
-      destination.pipe(source);
+      destination.on("data", createMessageReader(value => {
+        if (dropPeerAcks && (value as { type?: string }).type === "peer_send_result") return;
+        writeMessage(source, value);
+      }, error => source.destroy(error)));
+      destination.resume();
       source.pipe(destination);
       source.resume();
 })().catch((error) => source.destroy(error));
@@ -395,6 +401,7 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     const federatedSend = await sendDirect(localClient, importedRemote.id, "federated_direct_1");
     assert.equal(federatedSend.type, "delivered");
     assert.equal(federatedSend.delivery, "socket_delivered");
+    assert.equal((federatedSend.recipient as SessionInfo).id, importedRemote.id);
     const remoteMessage = await remoteInbound;
     assert.equal((remoteMessage.from as SessionInfo).id, importedLocal.id);
     assert.equal((remoteMessage.from as SessionInfo).trustedLocal, false);
@@ -404,6 +411,28 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     // remote delivery.
     const replayed = await sendDirect(localClient, importedRemote.id, "federated_direct_1");
     assert.equal(replayed.type, "delivered");
+
+    // The destination receives work even when its ACK is lost. Expiry is an
+    // unknown outcome, and replaying the same handle must not repeat the work.
+    dropPeerAcks = true;
+    const timeoutDeliveries: unknown[] = [];
+    const timeoutCollector = createMessageReader(value => {
+      if ((value as { message?: { id?: string } }).message?.id === "lost_peer_ack") timeoutDeliveries.push(value);
+    }, error => { throw error; });
+    remoteClient.on("data", timeoutCollector);
+    const uncertain = await sendDirect(localClient, importedRemote.id, "lost_peer_ack", 12_000);
+    assert.equal(timeoutDeliveries.length, 1, "recipient accepted the work before ACK loss");
+    assert.equal(uncertain.messageId, "lost_peer_ack");
+    assert.equal(uncertain.delivery, "unknown");
+    assert.equal(uncertain.outcomeKnown, false);
+    assert.equal(uncertain.retryable, false);
+    assert.equal((uncertain.recipient as SessionInfo).id, importedRemote.id);
+    dropPeerAcks = false;
+    const uncertainReplay = await sendDirect(localClient, importedRemote.id, "lost_peer_ack");
+    assert.equal(uncertainReplay.delivery, "unknown");
+    await listSessions(remoteClient, "timeout_replay_barrier");
+    assert.equal(timeoutDeliveries.length, 1, "uncertain outcome is retained for duplicate suppression");
+    remoteClient.off("data", timeoutCollector);
 
     // A second send that races the first delivery with the same message id
     // is refused while the first is still in flight; the first still delivers.
@@ -510,10 +539,21 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     assert.equal(duplicate.ok, false);
     if (!duplicate.ok) assert.equal(duplicate.code, "E_ALREADY_CONNECTED");
 
+    dropPeerAcks = true;
+    const beforeLinkLoss = waitForBrokerMessage(remoteClient, value =>
+      value.type === "message" && (value.message as { id?: string })?.id === "link_lost_after_delivery");
+    const linkLossResult = sendDirect(localClient, importedRemote.id, "link_lost_after_delivery");
+    await beforeLinkLoss;
     const leftPush = waitForBrokerMessage(localClient, (value) => value.type === "session_left" && value.sessionId === importedRemote.id);
     for (const socket of proxiedSockets.splice(0)) socket.destroy();
     await leftPush;
+    const linkLoss = await linkLossResult;
+    assert.equal(linkLoss.delivery, "unknown");
+    assert.equal(linkLoss.outcomeKnown, false);
+    assert.equal(linkLoss.retryable, false);
+    dropPeerAcks = false;
     await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await sendDirect(localClient, importedRemote.id, "link_lost_after_delivery")).delivery, "unknown", "loss of roster cannot rewrite an uncertain delivery as nondelivery");
     const pruned = await listSessions(localClient, "roster_pruned_1");
     assert.equal(pruned.some((session) => session.federation?.originId === "host:penguin"), false);
 

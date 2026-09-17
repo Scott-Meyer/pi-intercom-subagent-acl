@@ -17,6 +17,7 @@
  * - No remote mailbox queueing in federation v1: a disconnected target fails.
  */
 
+import type { SessionInfo } from "../types.ts";
 import {
   FEDERATION_PROTOCOL_NAME,
   FEDERATION_PROTOCOL_VERSION,
@@ -32,9 +33,9 @@ export const FEDERATION_SEND_TEXT_MAX_LENGTH = 32 * 1024;
 export const FEDERATION_SEND_ERROR_MAX_LENGTH = 256;
 export const FEDERATION_SEND_MAX_SEEN_IDS = 4096;
 export const FEDERATION_SEND_MAX_PENDING = 4096;
-/** Origin-side correlation deadline before a pending send fails. Kept below
+/** Origin-side correlation deadline before a pending send becomes uncertain. Kept below
  * the ordinary client send timeout (with sweep-tick margin) so senders
- * observe a structured remote failure instead of a generic client-side
+ * observe structured remote uncertainty instead of a generic client-side
  * timeout. */
 export const FEDERATION_SEND_TIMEOUT_MS = 8_500;
 
@@ -221,6 +222,7 @@ export interface PendingPeerSend {
   messageId: string;
   /** Broker session key of the local sending session. */
   senderKey: string;
+  recipient?: SessionInfo;
   /** Delivery fingerprint used for replay records once the result arrives. */
   fingerprint: string;
   createdAt: number;
@@ -242,7 +244,7 @@ export class PendingPeerSendTracker {
 
   add(
     sendId: string,
-    entry: { linkId: string; messageId: string; senderKey: string; fingerprint: string },
+    entry: Omit<PendingPeerSend, "createdAt" | "expiresAt">,
     now = Date.now(),
   ): PendingPeerSend | undefined {
     if (this.pending.has(sendId) || this.pending.size >= this.capacity) return undefined;

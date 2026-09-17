@@ -7,9 +7,8 @@ import type { SessionInfo } from "./types.ts";
 const DEFAULT_PROJECT_AGENT_TIMEOUT_MS = 20_000;
 const DEFAULT_PROJECT_AGENT_POLL_MS = 250;
 /**
- * A launch command that exits non-zero within this window failed to start.
- * Commands that keep running (a blocking terminal launcher) or exit later
- * are treated as successful; pi-intercom never manages their lifetime.
+ * Observe immediate command failures without managing the launcher's lifetime.
+ * Surviving this window is not proof that a terminal or Pi session was created.
  */
 const LAUNCH_COMMAND_FAILURE_WINDOW_MS = 1_000;
 const LAUNCH_COMMAND_MAX_LENGTH = 1024;
@@ -39,11 +38,50 @@ export interface ProjectLaunchRequest {
   focus: boolean;
 }
 
+/** Receipt for the launch attempt, not proof that a terminal or session exists. */
 export interface ProjectPaneLaunch {
   projectRoot: string;
   provider:
     | { kind: "session"; sessionId: string; name: string }
     | { kind: "command"; command: string };
+  /**
+   * Request acceptance means transport acceptance, not provider execution.
+   * Command startup means no immediate failure was observed. An unknown outcome
+   * can already have created resources; repeating the launch can duplicate them.
+   */
+  outcome: "request-accepted" | "command-started" | "not-started" | "unknown";
+  requestMessageId?: string;
+}
+
+/**
+ * Failure context survives each boundary: requesting a launch, observing a new
+ * registration, and contacting that session. Callers can attach the same receipt
+ * and session to a delivery error without re-running the launch. This is a
+ * snapshot of observations, not a retry policy or a managed session lifecycle.
+ */
+export class ProjectLaunchError extends Error {
+  readonly stage: "launch" | "registration" | "delivery";
+  readonly launch?: ProjectPaneLaunch;
+  readonly session?: SessionInfo;
+
+  constructor(message: string, context: {
+    stage: "launch" | "registration" | "delivery";
+    launch?: ProjectPaneLaunch;
+    session?: SessionInfo;
+    cause?: unknown;
+  }) {
+    super(message, { cause: context.cause });
+    this.name = "ProjectLaunchError";
+    this.stage = context.stage;
+    this.launch = context.launch;
+    this.session = context.session;
+  }
+}
+
+class LaunchCommandError extends Error {
+  constructor(message: string, readonly outcome: "not-started" | "unknown") {
+    super(message);
+  }
 }
 
 export interface ProjectTargetResolution {
@@ -138,9 +176,10 @@ export async function launchProjectCommand(
   root: string,
   options: { signal?: AbortSignal; spawnImpl?: LaunchCommandSpawn; failureWindowMs?: number } = {},
 ): Promise<void> {
-  if (!command.trim()) throw new Error("Project launcher command must not be empty.");
+  if (options.signal?.aborted) throw new LaunchCommandError("Project launcher command was cancelled before startup.", "not-started");
+  if (!command.trim()) throw new LaunchCommandError("Project launcher command must not be empty.", "not-started");
   if (command.length > LAUNCH_COMMAND_MAX_LENGTH) {
-    throw new Error(`Project launcher command must be at most ${LAUNCH_COMMAND_MAX_LENGTH} characters.`);
+    throw new LaunchCommandError(`Project launcher command must be at most ${LAUNCH_COMMAND_MAX_LENGTH} characters.`, "not-started");
   }
   const commandLine = command.replaceAll("{root}", shellQuotePath(root));
   const spawnImpl = options.spawnImpl ?? spawn;
@@ -157,7 +196,7 @@ export async function launchProjectCommand(
         detached: true,
       });
     } catch (cause) {
-      rejectLaunch(new Error(`Failed to start the project launcher: ${cause instanceof Error ? cause.message : String(cause)}`));
+      rejectLaunch(new LaunchCommandError(`Failed to start the project launcher: ${errorText(cause)}`, "not-started"));
       return;
     }
     const finish = (error?: Error): void => {
@@ -169,25 +208,33 @@ export async function launchProjectCommand(
     };
     const onAbort = () => {
       try { child.kill(); } catch { /* already gone */ }
-      finish(new Error("Project launcher command was aborted."));
+      finish(new LaunchCommandError("Project launcher command was aborted after startup was attempted.", "unknown"));
     };
     const window = setTimeout(() => finish(), windowMs);
     window.unref?.();
+    let spawned = false;
+    child.on("spawn", () => { spawned = true; });
+    child.on("error", (cause) => finish(new LaunchCommandError(
+      `Project launcher command failed: ${cause.message}`,
+      spawned || child.pid !== undefined ? "unknown" : "not-started",
+    )));
+    // Even a non-zero exit can follow terminal creation. It is a command
+    // failure, not evidence that nothing was launched.
+    child.on("close", (exitCode, signal) => {
+      if (exitCode !== 0) {
+        finish(new LaunchCommandError(
+          signal ? `Project launcher command ended on signal ${signal}.` : `Project launcher command exited with code ${exitCode}.`,
+          "unknown",
+        ));
+        return;
+      }
+      finish();
+    });
     if (options.signal?.aborted) {
       onAbort();
       return;
     }
     options.signal?.addEventListener("abort", onAbort, { once: true });
-    child.on("error", (cause) => finish(new Error(`Project launcher command failed to start: ${cause.message}`)));
-    // Only an early non-zero exit is treated as a launch failure; a command
-    // that is still running after the window (or exited zero) launched fine.
-    child.on("close", (exitCode) => {
-      if (exitCode != null && exitCode !== 0) {
-        finish(new Error(`Project launcher command exited with code ${exitCode}.`));
-        return;
-      }
-      finish();
-    });
   });
 }
 
@@ -197,7 +244,8 @@ export function resolveTargetInCwd(input: {
   targetCwd: string;
   to?: string;
 }): ProjectTargetResolution {
-  const inCwd = input.sessions.filter((session) => sameCwd(session.cwd, input.targetCwd));
+  // cwd addresses a local filesystem, not a similarly spelled remote path.
+  const inCwd = input.sessions.filter((session) => session.federation === undefined && sameCwd(session.cwd, input.targetCwd));
   const target = input.to?.trim();
 
   if (!target) {
@@ -206,7 +254,7 @@ export function resolveTargetInCwd(input: {
       return { kind: "found", session: candidates[0], targetCwd: input.targetCwd };
     }
     if (candidates.length === 0) {
-      return { kind: "missing", targetCwd: input.targetCwd, reason: `No other intercom sessions are connected in ${input.targetCwd}.` };
+      return { kind: "missing", targetCwd: input.targetCwd, reason: `No other local intercom sessions are visible in ${input.targetCwd}.` };
     }
     throw new Error(`Multiple intercom sessions are connected in ${input.targetCwd}: ${formatSessionRefs(candidates)}. Specify 'to'.`);
   }
@@ -227,14 +275,15 @@ export function resolveTargetInCwd(input: {
     throw new Error(`Multiple intercom sessions in ${input.targetCwd} match ID prefix "${target}". Use a longer session ID prefix.`);
   }
 
-  return { kind: "missing", targetCwd: input.targetCwd, reason: `No intercom session matching "${target}" is connected in ${input.targetCwd}.` };
+  return { kind: "missing", targetCwd: input.targetCwd, reason: `No local intercom session matching "${target}" is visible in ${input.targetCwd}.` };
 }
 
 /**
  * Launches a Pi session in a project through whatever generic provider is
  * available: first a live mesh session advertising the project-launch
- * namespace, then a configured default launch command. Registration on the
- * intercom roster -- not any provider reply -- is what completes the launch.
+ * namespace, then a configured default launch command. Success reports only
+ * request acceptance or command startup. Registration is a separate observation
+ * through waitForProjectSession; neither observation proves terminal creation.
  */
 export async function openProjectPane(input: {
   cwd: string;
@@ -242,82 +291,137 @@ export async function openProjectPane(input: {
   sessions: readonly SessionInfo[];
   currentSessionId: string;
   launcherCommand?: string;
-  sendRequest: (provider: SessionInfo, request: ProjectLaunchRequest) => Promise<{ delivered: boolean; reason?: string }>;
+  sendRequest: (provider: SessionInfo, request: ProjectLaunchRequest) => Promise<{
+    delivered: boolean;
+    reason?: string;
+    id?: string;
+    /** A negative receipt only proves no acceptance when its outcome is known. */
+    outcomeKnown?: boolean;
+  }>;
   signal?: AbortSignal;
   spawnImpl?: LaunchCommandSpawn;
 }): Promise<ProjectPaneLaunch> {
-  const projectRoot = resolveProjectRoot(input.cwd);
+  if (input.signal?.aborted) {
+    throw new ProjectLaunchError("Project launch was cancelled before it was requested.", { stage: "launch" });
+  }
+  let projectRoot: string;
+  try {
+    projectRoot = resolveProjectRoot(input.cwd);
+  } catch (cause) {
+    throw new ProjectLaunchError(errorText(cause), { stage: "launch", cause });
+  }
   const command = process.env.PI_INTERCOM_PI_BIN?.trim() || process.env.PI_BIN?.trim() || "pi";
   const provider = findProjectLaunchProvider(input.sessions, input.currentSessionId);
   if (provider) {
+    const launch: ProjectPaneLaunch = {
+      projectRoot,
+      provider: { kind: "session", sessionId: provider.id, name: provider.name ?? provider.id },
+      outcome: "unknown",
+    };
     const request: ProjectLaunchRequest = {
       type: PROJECT_LAUNCH_REQUEST_TYPE,
       root: projectRoot,
       command,
       focus: input.focus !== false,
     };
-    const sent = await input.sendRequest(provider, request);
-    if (!sent.delivered) {
-      throw new Error(`Failed to request a project terminal from ${provider.name ?? provider.id}: ${sent.reason ?? "the message was not delivered."}`);
+    let sent: Awaited<ReturnType<typeof input.sendRequest>>;
+    try {
+      sent = await input.sendRequest(provider, request);
+    } catch (cause) {
+      throw new ProjectLaunchError(
+        `The launch request to ${provider.name ?? provider.id} has an unknown outcome: ${errorText(cause)} The provider may already have acted; another launch could create a duplicate.`,
+        { stage: "launch", launch, cause },
+      );
     }
-    return {
-      projectRoot,
-      provider: { kind: "session", sessionId: provider.id, name: provider.name ?? provider.id },
+    const receipt: ProjectPaneLaunch = {
+      ...launch,
+      outcome: sent.delivered ? "request-accepted" : sent.outcomeKnown === true ? "not-started" : "unknown",
+      ...(sent.id ? { requestMessageId: sent.id } : {}),
     };
+    if (!sent.delivered) {
+      throw new ProjectLaunchError(
+        `The launch request to ${provider.name ?? provider.id} was not confirmed accepted: ${sent.reason ?? "no delivery confirmation."}`
+        + (receipt.outcome === "unknown" ? " The provider may already have acted; another launch could create a duplicate." : " No launch request was accepted."),
+        { stage: "launch", launch: receipt },
+      );
+    }
+    return receipt;
   }
   if (input.launcherCommand) {
-    await launchProjectCommand(input.launcherCommand, projectRoot, { signal: input.signal, spawnImpl: input.spawnImpl });
-    return { projectRoot, provider: { kind: "command", command: input.launcherCommand } };
+    const launch: ProjectPaneLaunch = {
+      projectRoot,
+      provider: { kind: "command", command: input.launcherCommand },
+      outcome: "unknown",
+    };
+    try {
+      await launchProjectCommand(input.launcherCommand, projectRoot, { signal: input.signal, spawnImpl: input.spawnImpl });
+    } catch (cause) {
+      const outcome = cause instanceof LaunchCommandError ? cause.outcome : "unknown";
+      throw new ProjectLaunchError(
+        errorText(cause) + (outcome === "unknown" ? " The command may already have created resources; another launch could create a duplicate." : " No launcher command was started."),
+        { stage: "launch", launch: { ...launch, outcome }, cause },
+      );
+    }
+    return { ...launch, outcome: "command-started" };
   }
-  throw new Error(
-    "No project launcher is available. A terminal manager can register as a provider by advertising the "
-    + `"${PROJECT_LAUNCH_NAMESPACE}" extension capability and answering its launch requests, or set a default `
-    + "launcher with PI_INTERCOM_PROJECT_LAUNCHER (or config \"projectLauncher\"), for example "
-    + "'tmux new-window -c \"{root}\" pi'.",
+  throw new ProjectLaunchError(
+    "No project launcher is available. No launch was attempted. Local project launch is supported through a visible session advertising "
+    + `the "${PROJECT_LAUNCH_NAMESPACE}" capability or a configured PI_INTERCOM_PROJECT_LAUNCHER (config "projectLauncher"). `
+    + "Neither is available in this session; intercom does not supply a terminal manager.",
+    { stage: "launch" },
   );
 }
 
+/**
+ * Observes a sole new, visible local session in the project. The v1 launcher
+ * contract does not assign a peer name or carry registration correlation, so
+ * an earlier `to` selector is not a constraint on this observation. A roster
+ * match is not proof that this particular launch created the session. Multiple
+ * candidates remain ambiguous rather than selecting one arbitrarily.
+ *
+ * Passing the launch receipt preserves it on timeout, cancellation, or roster
+ * failure. Ending this wait never cancels a launch or removes created resources.
+ */
 export async function waitForProjectSession(client: ListSessionsClient, input: {
   projectRoot: string;
   currentSessionId: string;
   beforeSessionIds: ReadonlySet<string>;
-  to?: string;
+  launch?: ProjectPaneLaunch;
   signal?: AbortSignal;
   timeoutMs?: number;
   pollMs?: number;
 }): Promise<SessionInfo> {
-  const startedAt = Date.now();
-  const timeoutMs = input.timeoutMs ?? DEFAULT_PROJECT_AGENT_TIMEOUT_MS;
+  const deadline = Date.now() + (input.timeoutMs ?? DEFAULT_PROJECT_AGENT_TIMEOUT_MS);
   const pollMs = input.pollMs ?? DEFAULT_PROJECT_AGENT_POLL_MS;
 
-  while (Date.now() - startedAt < timeoutMs) {
-    if (input.signal?.aborted) throw new Error("Cancelled");
-    const sessions = await client.listSessions({ timeoutMs: Math.min(5_000, timeoutMs) });
+  try {
+    while (Date.now() < deadline) {
+      if (input.signal?.aborted) throw new Error("Cancelled while waiting for project registration.");
+      const sessions = await client.listSessions({ timeoutMs: Math.min(5_000, deadline - Date.now()) });
+      if (input.signal?.aborted) throw new Error("Cancelled while waiting for project registration.");
+      if (Date.now() >= deadline) break;
 
-    if (input.to?.trim()) {
-      const resolved = resolveTargetInCwd({
-        sessions,
-        currentSessionId: input.currentSessionId,
-        targetCwd: input.projectRoot,
-        to: input.to,
-      });
-      if (resolved.kind === "found" && resolved.session) return resolved.session;
-      await sleep(pollMs, input.signal);
-      continue;
+      const newInProject = sessions.filter(
+        (session) => session.federation === undefined
+          && session.id !== input.currentSessionId
+          && !input.beforeSessionIds.has(session.id)
+          && sameCwd(session.cwd, input.projectRoot),
+      );
+      if (newInProject.length === 1) return newInProject[0]!;
+      if (newInProject.length > 1) {
+        throw new Error(`Multiple new local intercom sessions are visible in ${input.projectRoot}: ${formatSessionRefs(newInProject)}. Their relationship to the launch is unknown.`);
+      }
+
+      await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())), input.signal);
     }
 
-    const newInProject = sessions.filter(
-      (session) => !input.beforeSessionIds.has(session.id) && sameCwd(session.cwd, input.projectRoot),
+    throw new Error(`Timed out waiting for a local Pi intercom session to register in ${input.projectRoot}. The project launcher may still be starting, or pi-intercom may not be loaded there.`);
+  } catch (cause) {
+    throw new ProjectLaunchError(
+      errorText(cause) + (input.launch ? " The launch attempt has not been undone; another launch could create a duplicate." : ""),
+      { stage: "registration", launch: input.launch, cause },
     );
-    if (newInProject.length === 1) return newInProject[0]!;
-    if (newInProject.length > 1) {
-      throw new Error(`Multiple new intercom sessions registered in ${input.projectRoot}: ${formatSessionRefs(newInProject)}. Address one explicitly.`);
-    }
-
-    await sleep(pollMs, input.signal);
   }
-
-  throw new Error(`Timed out waiting for a Pi intercom session to register in ${input.projectRoot}. The project launcher may still be starting, or pi-intercom may not be loaded there.`);
 }
 
 function resolveProjectRoot(cwd: string): string {
@@ -327,6 +431,10 @@ function resolveProjectRoot(cwd: string): string {
     throw new Error(`Project target '${resolved}' is not a directory.`);
   }
   return realpathSync(resolved);
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatSessionRefs(sessions: SessionInfo[]): string {

@@ -31,8 +31,7 @@ test("reply resolves from current triggered message context", () => {
   const message = createMessage("ask-1", "Need a decision");
 
   const context = tracker.recordIncomingMessage(from, message, 1000);
-  tracker.queueTurnContext(context);
-  tracker.beginTurn(1001);
+  tracker.activateContexts([context]);
 
   assert.equal(tracker.resolveReplyTarget({}, 1002).message.id, "ask-1");
   assert.equal(tracker.resolveReplyTarget({}, 1002).from.id, "planner-id");
@@ -86,8 +85,7 @@ test("explicit to overrides the current turn context", () => {
   const tracker = new ReplyTracker();
   const current = tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-1", "First"), 1000);
   tracker.recordIncomingMessage(createSession("reviewer-id", "reviewer"), createMessage("ask-2", "Second"), 1001);
-  tracker.queueTurnContext(current);
-  tracker.beginTurn(1002);
+  tracker.activateContexts([current]);
 
   assert.equal(tracker.resolveReplyTarget({ to: "reviewer" }, 1003).message.id, "ask-2");
   assert.throws(() => tracker.resolveReplyTarget({ to: "missing" }, 1003), /No pending ask from/);
@@ -96,8 +94,7 @@ test("explicit to overrides the current turn context", () => {
 test("active ask context flags non-reply sends to a different target", () => {
   const tracker = new ReplyTracker();
   const current = tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-1", "Need a reply"), 1000);
-  tracker.queueTurnContext(current);
-  tracker.beginTurn(1001);
+  tracker.activateContexts([current]);
 
   assert.equal(tracker.findActiveReplyTargetMismatch("planner-id", 1002), null);
   assert.equal(tracker.findActiveReplyTargetMismatch("planner", 1002)?.message.id, "ask-1");
@@ -107,8 +104,7 @@ test("active ask context flags non-reply sends to a different target", () => {
 test("active ask context does not trust sender names as destination identity", () => {
   const tracker = new ReplyTracker();
   const current = tracker.recordIncomingMessage(createSession("asker-session", "root-session"), createMessage("ask-1", "Need a reply"), 1000);
-  tracker.queueTurnContext(current);
-  tracker.beginTurn(1001);
+  tracker.activateContexts([current]);
 
   assert.equal(tracker.findActiveReplyTargetMismatch("root-session", 1002)?.message.id, "ask-1");
 });
@@ -170,13 +166,12 @@ test("pending asks can be explicitly dismissed without removing retryable failur
   assert.deepEqual(tracker.listPending(1002).map((context) => context.message.id), ["ask-2"]);
 });
 
-test("dismissing a pending ask removes queued turn context", () => {
+test("dismissing a pending ask removes its active reply context", () => {
   const tracker = new ReplyTracker();
   const context = tracker.recordIncomingMessage(createSession("planner-id", "planner"), createMessage("ask-1", "Need a decision"), 1000);
-  tracker.queueTurnContext(context);
+  tracker.activateContexts([context]);
 
   tracker.dismissPendingAsk("ask-1");
-  tracker.beginTurn(1001);
 
   assert.throws(() => tracker.resolveReplyTarget({}, 1002), /No active intercom context to reply to/);
 });

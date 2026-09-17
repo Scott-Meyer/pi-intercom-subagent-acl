@@ -2,6 +2,9 @@ export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
 export const COMPACTION_AWARENESS_FEATURE = "compaction-awareness-v1";
 export const SESSION_PROFILE_FEATURE = "session-profile-v1";
+/** Explicit ask completion, historical reply threading, supersession cleanup,
+ * and requestId-correlated cancellation acknowledgements. */
+export const CONVERSATION_CONTRACT_FEATURE = "conversation-contract-v1";
 
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
 
@@ -22,10 +25,21 @@ export interface PeerCompactionNotice {
   contextPct?: number;
 }
 
+/** Cancellation is an operation outcome, not proof that earlier work was undone. */
+export type CancellationState = "removed_from_mailbox" | "withdrawal_requested" | "not_delivered";
+
 export interface DeliveryDetails {
   delivery: DeliveryState;
+  /** Broker-resolved endpoint (or mailbox identity) for this attempt. Its
+   * presence alone is not proof of delivery; consult delivery/outcomeKnown. */
+  recipient?: SessionInfo;
+  /** Present on a confirmed cancellation; uncertainty uses delivery/outcomeKnown. */
+  cancellation?: CancellationState;
   code?: string;
+  /** A new attempt is reasonable after known nondelivery; never true when
+   * the prior instruction might already have been accepted. */
   retryable: boolean;
+  /** False means ACK loss or another uncertain boundary, not nondelivery. */
   outcomeKnown: boolean;
   /** Present once when the recipient compacted since the prior direct contact. */
   peerCompaction?: PeerCompactionNotice;
@@ -109,8 +123,16 @@ export interface Message {
   injectedAt?: number;
   supersedes?: string;
   retryOf?: string;
+  /** Correlates this message to a previous message from this recipient. */
   replyTo?: string;
+  /** Explicit answer intent, separate from conversational correlation. Legacy
+   * omission treats replyTo without expectsReply as an answer. */
+  completesAsk?: boolean;
   expectsReply?: boolean;
+  /** Informational sender activity; it does not lock the conversation. */
+  senderWaitMode?: "blocking" | "nonblocking";
+  /** Broker-authored tracking deadline, not withdrawal or a work deadline. */
+  replyDeadline?: number;
   provenance?: MessageProvenance;
   /** Broker-authored notice about the sender, attached only to direct contact. */
   peerCompaction?: PeerCompactionNotice;
@@ -174,7 +196,7 @@ export type ClientMessage =
   | { type: "compaction_completed"; eventId: string }
   | { type: "direct_contact_seen"; token: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
-  | { type: "cancel_message"; messageId: string }
+  | { type: "cancel_message"; messageId: string; requestId?: string }
   | { type: "cancel_ask"; messageId: string }
   | { type: "presence"; name?: string; description?: string | null; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }
   | {
@@ -206,8 +228,8 @@ export type BrokerMessage =
   | { type: "session_joined"; session: SessionInfo }
   | { type: "session_left"; sessionId: string }
   | { type: "error"; error: string }
-  | ({ type: "delivered"; messageId: string } & DeliveryDetails)
-  | ({ type: "delivery_failed"; messageId: string; reason: string } & DeliveryDetails)
+  | ({ type: "delivered"; messageId: string; requestId?: string } & DeliveryDetails)
+  | ({ type: "delivery_failed"; messageId: string; requestId?: string; reason: string } & DeliveryDetails)
   | { type: "message_receipt"; from: SessionInfo; receipt: MessageReceipt }
   | { type: "message_control"; from: SessionInfo; control: MessageControl }
   | { type: "extension_owner"; namespace: string; ownerId?: string; ownerEpoch?: string }

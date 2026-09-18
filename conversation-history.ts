@@ -1,5 +1,12 @@
-import type { IntercomContext } from "./reply-tracker.ts";
+import type { ParleyContext } from "./reply-tracker.ts";
 import type { Message, MessageControl, SessionInfo } from "./types.ts";
+
+/** Journals and peers before parley 1.1.0 recorded entry types with the intercom_ prefix.
+ * Normalization keeps pre-1.1 session histories recoverable while new writes use parley_ types. */
+export function normalizeEntryType(customType: string | undefined): string | undefined {
+  if (!customType?.startsWith("intercom_")) return customType;
+  return `parley_${customType.slice("intercom_".length)}`;
+}
 
 export interface OutstandingAsk {
   to: string;
@@ -10,7 +17,7 @@ export interface OutstandingAsk {
 }
 
 export interface ConversationHistory {
-  incoming: Map<string, IntercomContext>;
+  incoming: Map<string, ParleyContext>;
   settledIncoming: Set<string>;
   persistedIncoming: Set<string>;
   controls: Map<string, { from: SessionInfo; control: MessageControl }>;
@@ -41,13 +48,13 @@ export function restoreConversationHistory(entries: readonly unknown[]): Convers
       continue;
     }
     if (entry.type === "custom_message") {
-      if (entry.customType === "intercom_message") {
-        const details = entry.details as Partial<IntercomContext> | undefined;
+      if (normalizeEntryType(entry.customType) === "parley_message") {
+        const details = entry.details as Partial<ParleyContext> | undefined;
         if (details?.from?.id && details.message?.id && details.message.content) {
           state.incoming.set(details.message.id, { from: details.from, message: details.message, receivedAt: details.message.receiverReceivedAt ?? details.message.timestamp });
           state.persistedIncoming.add(details.message.id);
         }
-      } else if (entry.customType === "intercom_message_control") {
+      } else if (normalizeEntryType(entry.customType) === "parley_message_control") {
         const details = entry.details as { from?: SessionInfo; control?: MessageControl } | undefined;
         if (details?.control?.messageId) {
           const key = messageControlKey(details.control);
@@ -59,18 +66,18 @@ export function restoreConversationHistory(entries: readonly unknown[]): Convers
       continue;
     }
     if (entry.type !== "custom" || !data) continue;
-    switch (entry.customType) {
-      case "intercom_inbound_received": {
-        const context = data as unknown as IntercomContext;
+    switch (normalizeEntryType(entry.customType)) {
+      case "parley_inbound_received": {
+        const context = data as unknown as ParleyContext;
         if (context.from?.id && context.message?.id && context.message.content) {
           state.incoming.set(context.message.id, context);
         }
         break;
       }
-      case "intercom_inbound_settled":
+      case "parley_inbound_settled":
         if (typeof data.messageId === "string") state.settledIncoming.add(data.messageId);
         break;
-      case "intercom_inbound_control": {
+      case "parley_inbound_control": {
         const value = data as unknown as { from: SessionInfo; control: MessageControl };
         if (value.from?.id && value.control?.messageId) {
           state.controls.set(messageControlKey(value.control), value);
@@ -78,14 +85,14 @@ export function restoreConversationHistory(entries: readonly unknown[]): Convers
         }
         break;
       }
-      case "intercom_sent": {
+      case "parley_sent": {
         const message = data.message as Partial<Message> | undefined;
         const replyTo = message?.replyTo ?? data.replyTo;
         const completesAsk = message?.completesAsk ?? data.completesAsk;
         if (typeof replyTo === "string" && completesAsk !== false && !message?.expectsReply && !data.expectsReply) state.settledIncoming.add(replyTo);
         break;
       }
-      case "intercom_ask_pending":
+      case "parley_ask_pending":
         if (typeof data.messageId === "string" && typeof data.to === "string" && typeof data.sentAt === "number") {
           const message = data.message as Message["content"] | undefined;
           state.outgoing.set(data.messageId, {
@@ -95,7 +102,7 @@ export function restoreConversationHistory(entries: readonly unknown[]): Convers
           });
         }
         break;
-      case "intercom_ask_settled":
+      case "parley_ask_settled":
         if (typeof data.messageId === "string") state.outgoing.delete(data.messageId);
         break;
     }

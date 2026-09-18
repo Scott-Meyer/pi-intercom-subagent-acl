@@ -7,7 +7,7 @@ import test from "node:test";
 import { CollaborationStateStore, type CollaborationContactSnapshot } from "./collaboration-state.ts";
 
 function temporaryRuntime(): string {
-  return mkdtempSync(path.join(tmpdir(), "pi-intercom-collaboration-"));
+  return mkdtempSync(path.join(tmpdir(), "pi-parley-collaboration-"));
 }
 
 function statePath(runtimeDir: string, scopeId: string | undefined): string {

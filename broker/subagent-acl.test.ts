@@ -17,10 +17,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import type { SessionRegistration } from "../types.ts";
-import { IntercomClient } from "./client.ts";
+import { ParleyClient } from "./client.ts";
 
 const repoDir = process.cwd();
-const TSX_BIN = process.env.PI_INTERCOM_TEST_TSX_BIN
+const TSX_BIN = process.env.PI_PARLEY_TEST_TSX_BIN
   ?? path.join(repoDir, "node_modules", "tsx", "dist", "cli.mjs");
 
 function baseRegistration(name: string): SessionRegistration {
@@ -47,7 +47,7 @@ async function startBroker(agentDir: string): Promise<ChildProcessWithoutNullStr
   const ready = new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Broker startup timed out")), 10_000);
     broker.stdout.on("data", (chunk: Buffer) => {
-      if (chunk.toString().includes("Intercom broker started")) {
+      if (chunk.toString().includes("Parley broker started")) {
         clearTimeout(timeout);
         resolve();
       }
@@ -72,7 +72,7 @@ function idsOf(sessions: { id: string }[]): Set<string> {
 }
 
 test("subagent ACL: list/send scoping by supervisorSessionId and supervisorName fallback", { concurrency: false, timeout: 30_000 }, async () => {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-acl-"));
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-parley-acl-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   // The client library resolves the broker connect target from THIS
   // process's env, independent of the env passed only to the spawned broker
@@ -80,19 +80,19 @@ test("subagent ACL: list/send scoping by supervisorSessionId and supervisorName 
   // broker at the default location instead of the isolated test broker.
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const broker = await startBroker(agentDir);
-  const clients: IntercomClient[] = [];
+  const clients: ParleyClient[] = [];
 
   try {
     const mainAId = randomUUID();
     const mainBId = randomUUID();
-    const mainA = new IntercomClient();
-    const mainB = new IntercomClient();
+    const mainA = new ParleyClient();
+    const mainB = new ParleyClient();
     clients.push(mainA, mainB);
     await mainA.connect(baseRegistration("main-a"), mainAId);
     await mainB.connect(baseRegistration("main-b"), mainBId);
 
     // childOfA matches its supervisor by session ID.
-    const childOfA = new IntercomClient();
+    const childOfA = new ParleyClient();
     clients.push(childOfA);
     await childOfA.connect({
       ...baseRegistration("child-of-a"),
@@ -103,9 +103,9 @@ test("subagent ACL: list/send scoping by supervisorSessionId and supervisorName 
 
     // childOfB deliberately carries a WRONG supervisorSessionId (simulating
     // the stableId-mismatch case: pi-subagents passed the parent's raw pi
-    // session id, but the parent registered with pi-intercom under a
+    // session id, but the parent registered with pi-parley under a
     // different stable id) and must still resolve via supervisorName.
-    const childOfB = new IntercomClient();
+    const childOfB = new ParleyClient();
     clients.push(childOfB);
     await childOfB.connect({
       ...baseRegistration("child-of-b"),
@@ -212,7 +212,7 @@ test("subagent ACL: list/send scoping by supervisorSessionId and supervisorName 
     const fromAdvertised = await childOfA.send(mainB.sessionId!, { text: "hi back" });
     assert.equal(fromAdvertised.delivered, true);
 
-    // Ordinary presence sync (fired on every real intercom tool call) must
+    // Ordinary presence sync (fired on every real parley tool call) must
     // never silently revert the advertised identity back toward a fallback
     // name/alias while `advertised` stays true.
     (childOfA as any).updatePresence({ name: "subagent-chat-fallback-should-not-apply", runtimeFallbackAlias: true });

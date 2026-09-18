@@ -37,7 +37,7 @@ async function startBroker(agentDir: string): Promise<ChildProcess> {
       broker.off("exit", onExit);
     };
     const onData = (chunk: Buffer) => {
-      if (!chunk.toString().includes("Intercom broker started")) return;
+      if (!chunk.toString().includes("Parley broker started")) return;
       cleanup();
       resolve();
     };
@@ -360,7 +360,7 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     const versionResponse = readOneMessage(negotiationSocket);
     writeMessage(negotiationSocket, {
       type: "peer_hello",
-      protocol: "pi-intercom-peer",
+      protocol: "pi-parley-peer",
       version: 2,
       linkId: "link_badversion",
     });

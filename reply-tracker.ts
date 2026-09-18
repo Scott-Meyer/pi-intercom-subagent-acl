@@ -1,25 +1,25 @@
 import { getAskTimeoutMs } from "./config.ts";
 import type { Message, SessionInfo } from "./types.ts";
 
-export interface IntercomContext {
+export interface ParleyContext {
   from: SessionInfo;
   message: Message;
   receivedAt: number;
   disposition?: { state: "withdrawn" | "superseded"; replacementId?: string };
 }
 
-function senderMatchPriority(context: IntercomContext, to: string): number {
+function senderMatchPriority(context: ParleyContext, to: string): number {
   if (context.from.id === to) return 0;
   if (context.from.name?.toLowerCase() === to.toLowerCase()) return 1;
   if (context.from.id.startsWith(to)) return 2;
   return 3;
 }
 
-function matchesPendingSender(context: IntercomContext, to: string): boolean {
+function matchesPendingSender(context: ParleyContext, to: string): boolean {
   return senderMatchPriority(context, to) < 3;
 }
 
-function resolvePendingSender(pending: IntercomContext[], to: string): IntercomContext {
+function resolvePendingSender(pending: ParleyContext[], to: string): ParleyContext {
   const exactIdMatches = pending.filter((context) => senderMatchPriority(context, to) === 0);
   if (exactIdMatches.length === 1) {
     return exactIdMatches[0]!;
@@ -48,13 +48,13 @@ function resolvePendingSender(pending: IntercomContext[], to: string): IntercomC
 }
 
 export class ReplyTracker {
-  private readonly messages = new Map<string, IntercomContext>();
-  private readonly pendingAsks = new Map<string, IntercomContext>();
-  private activeContexts: readonly IntercomContext[] = [];
+  private readonly messages = new Map<string, ParleyContext>();
+  private readonly pendingAsks = new Map<string, ParleyContext>();
+  private activeContexts: readonly ParleyContext[] = [];
 
   constructor(private readonly askTimeoutMs = getAskTimeoutMs()) {}
 
-  recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now()): IntercomContext {
+  recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now()): ParleyContext {
     const context = { from, message, receivedAt };
     this.messages.set(message.id, context);
     // Pending requests retain their full context until an explicit settlement.
@@ -70,7 +70,7 @@ export class ReplyTracker {
 
   /** Newly surfaced messages replace the active conversation; tool-only iterations retain it.
    * Keep simultaneous candidates distinct from an absence of context. */
-  activateContexts(contexts: readonly IntercomContext[]): void {
+  activateContexts(contexts: readonly ParleyContext[]): void {
     if (contexts.length > 0) this.activeContexts = [...contexts];
   }
 
@@ -84,7 +84,7 @@ export class ReplyTracker {
     this.clearActiveContexts();
   }
 
-  resolveReplyTarget(options: { to?: string; replyTo?: string }, now = Date.now()): IntercomContext {
+  resolveReplyTarget(options: { to?: string; replyTo?: string }, now = Date.now()): ParleyContext {
 
     if (options.replyTo) {
       const target = this.messages.get(options.replyTo);
@@ -137,7 +137,7 @@ export class ReplyTracker {
     throw new Error(`Multiple pending asks — specify \`to\` or \`replyTo\`.\n${this.formatConversationContext({ now })}`);
   }
 
-  findUniquePendingAskFrom(to: string, now = Date.now()): IntercomContext | null {
+  findUniquePendingAskFrom(to: string, now = Date.now()): ParleyContext | null {
     const candidates = Array.from(this.pendingAsks.values()).filter((context) => {
       if (now - context.receivedAt > this.askTimeoutMs) {
         return false;
@@ -147,12 +147,12 @@ export class ReplyTracker {
     return candidates.length === 1 ? candidates[0]! : null;
   }
 
-  getActiveReplyTarget(now = Date.now()): IntercomContext | null {
+  getActiveReplyTarget(now = Date.now()): ParleyContext | null {
     const active = this.activeContexts.length === 1 ? this.activeContexts[0] : undefined;
     return active?.message.expectsReply ? active : null;
   }
 
-  findActiveReplyTargetMismatch(to: string, now = Date.now()): IntercomContext | null {
+  findActiveReplyTargetMismatch(to: string, now = Date.now()): ParleyContext | null {
     const activeReplyTarget = this.getActiveReplyTarget(now);
     if (!activeReplyTarget) {
       return null;
@@ -169,24 +169,24 @@ export class ReplyTracker {
     this.activeContexts = this.activeContexts.filter((context) => context.message.id !== replyTo);
   }
 
-  listPending(now = Date.now()): IntercomContext[] {
+  listPending(now = Date.now()): ParleyContext[] {
     return Array.from(this.pendingAsks.values()).sort((a, b) => a.receivedAt - b.receivedAt);
   }
 
   /** Retained text keeps its later withdrawal/replacement context. */
-  setDisposition(messageId: string, disposition: NonNullable<IntercomContext["disposition"]>): void {
+  setDisposition(messageId: string, disposition: NonNullable<ParleyContext["disposition"]>): void {
     const context = this.messages.get(messageId);
     if (context) this.messages.set(messageId, { ...context, disposition });
     this.dismissPendingAsk(messageId);
   }
 
   /** Full retained snapshot for recovery or explicit conversation threading. */
-  getMessage(messageId: string): IntercomContext | undefined {
+  getMessage(messageId: string): ParleyContext | undefined {
     return this.messages.get(messageId);
   }
 
   /** A response timeout is a waiting-window boundary, not completed or withdrawn work. */
-  replyWindowElapsed(context: IntercomContext, now = Date.now()): boolean {
+  replyWindowElapsed(context: ParleyContext, now = Date.now()): boolean {
     return now > (context.message.replyDeadline ?? context.receivedAt + this.askTimeoutMs);
   }
 

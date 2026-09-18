@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const scratch = mkdtempSync(join(tmpdir(), "pi-intercom-host-compat-"));
+const scratch = mkdtempSync(join(tmpdir(), "pi-parley-host-compat-"));
 const packed = join(scratch, "packed");
 const agentDirs = [];
 
@@ -147,7 +147,7 @@ try {
   }
 } finally {
   const brokerPids = agentDirs.flatMap((agentDir) => {
-    const pidPath = join(agentDir, "intercom", "broker.pid");
+    const pidPath = join(agentDir, "parley", "broker.pid");
     if (!existsSync(pidPath)) return [];
     const pid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
     return Number.isInteger(pid) && pid > 0 ? [pid] : [];
@@ -171,7 +171,7 @@ try {
   if (brokerPids.length > 0) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
   }
-  if (process.env.PI_INTERCOM_KEEP_SMOKE_TMP === "1") {
+  if (process.env.PI_PARLEY_KEEP_SMOKE_TMP === "1") {
     console.log(`Kept smoke workspace: ${scratch}`);
   } else {
     rmSync(scratch, { recursive: true, force: true });

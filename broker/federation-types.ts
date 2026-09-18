@@ -7,7 +7,7 @@
  * peer roles, and all later federation state.
  */
 
-export const FEDERATION_PROTOCOL_NAME = "pi-intercom-peer" as const;
+export const FEDERATION_PROTOCOL_NAME = "pi-parley-peer" as const;
 export const FEDERATION_PROTOCOL_VERSION = 1 as const;
 export const FEDERATION_IDENTITY_FEATURE = "peer-identity-v1" as const;
 export const FEDERATION_SINGLE_HOP_FEATURE = "peer-single-hop-v1" as const;
@@ -52,7 +52,7 @@ export interface FederationScopeMapping {
 
 /** Local authority binding supplied independently to each broker. */
 export interface FederationScopeBinding extends FederationScopeMapping {
-  /** Exact local PI_INTERCOM_SCOPE_ID, or null for the unscoped namespace. */
+  /** Exact local PI_PARLEY_SCOPE_ID, or null for the unscoped namespace. */
   localScopeId: string | null;
 }
 
@@ -193,7 +193,7 @@ export interface BrokerListScopesRequest {
 }
 
 export interface BrokerScopeSummary {
-  /** Exact local PI_INTERCOM_SCOPE_ID, or null for the unscoped namespace. */
+  /** Exact local PI_PARLEY_SCOPE_ID, or null for the unscoped namespace. */
   scopeId: string | null;
   liveSessions: number;
 }

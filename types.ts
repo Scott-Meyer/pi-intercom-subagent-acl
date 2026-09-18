@@ -88,7 +88,7 @@ export interface SessionInfo {
    *  process knows it (PI_SUBAGENT_ORCHESTRATOR_SESSION_ID). Preferred over
    *  supervisorName for matching because IDs are stable and unambiguous. */
   supervisorSessionId?: string;
-  /** ACL fork: the supervisor session's intercom name/target
+  /** ACL fork: the supervisor session's parley name/target
    *  (PI_SUBAGENT_ORCHESTRATOR_TARGET), used to match a supervisor when the
    *  child does not have the supervisor's session ID yet. */
   supervisorName?: string;
@@ -100,7 +100,7 @@ export interface SessionInfo {
    *  by a presence update. */
   advertised?: boolean;
   /** Generic capabilities this session offers to other sessions through the
-   *  roster (e.g. the pi-intercom/project-launch-v1 provider namespace).
+   *  roster (e.g. the pi-parley/project-launch-v1 provider namespace).
    *  Broker-authoritative from registration and extension_capabilities_update. */
   extensions?: ExtensionCapability[];
   /** Broker-authored provenance for a live session imported from one peer link.

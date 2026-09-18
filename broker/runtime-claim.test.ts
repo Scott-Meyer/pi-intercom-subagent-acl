@@ -6,13 +6,13 @@ import { tmpdir } from "node:os";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 
 test("broker startup refuses to replace a live broker PID", () => {
-  const directory = mkdtempSync(path.join(tmpdir(), "pi-intercom-runtime-"));
+  const directory = mkdtempSync(path.join(tmpdir(), "pi-parley-runtime-"));
   const pidPath = path.join(directory, "broker.pid");
   try {
     writeFileSync(pidPath, `${process.pid}\n`);
     assert.throws(
       () => assertNoLiveBroker(pidPath),
-      new RegExp(`Refusing to replace live intercom broker process ${process.pid}`),
+      new RegExp(`Refusing to replace live parley broker process ${process.pid}`),
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -20,7 +20,7 @@ test("broker startup refuses to replace a live broker PID", () => {
 });
 
 test("broker startup tolerates absent, invalid, and stale PID files", () => {
-  const directory = mkdtempSync(path.join(tmpdir(), "pi-intercom-runtime-"));
+  const directory = mkdtempSync(path.join(tmpdir(), "pi-parley-runtime-"));
   const pidPath = path.join(directory, "broker.pid");
   try {
     assert.doesNotThrow(() => assertNoLiveBroker(pidPath));

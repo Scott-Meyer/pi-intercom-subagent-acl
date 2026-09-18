@@ -18,12 +18,12 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import net from "node:net";
 import type { BrokerMessage, Message, MessageControl, SessionRegistration } from "../types.ts";
-import { IntercomClient } from "./client.ts";
+import { ParleyClient } from "./client.ts";
 import { createMessageReader, writeMessage } from "./framing.ts";
 import { getBrokerSocketPath } from "./paths.ts";
 
 const repoDir = process.cwd();
-const TSX_BIN = process.env.PI_INTERCOM_TEST_TSX_BIN
+const TSX_BIN = process.env.PI_PARLEY_TEST_TSX_BIN
   ?? path.join(repoDir, "node_modules", "tsx", "dist", "cli.mjs");
 
 function baseRegistration(name: string): SessionRegistration {
@@ -50,7 +50,7 @@ async function startBroker(agentDir: string, env: NodeJS.ProcessEnv = {}): Promi
   const ready = new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Broker startup timed out")), 10_000);
     broker.stdout.on("data", (chunk: Buffer) => {
-      if (chunk.toString().includes("Intercom broker started")) {
+      if (chunk.toString().includes("Parley broker started")) {
         clearTimeout(timeout);
         resolve();
       }
@@ -71,15 +71,15 @@ async function stopBroker(broker: ChildProcessWithoutNullStreams): Promise<void>
 }
 
 test("name dedup: registering a colliding name auto-suffixes and stays addressable", { concurrency: false, timeout: 30_000 }, async () => {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-namedup-"));
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-parley-namedup-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const broker = await startBroker(agentDir);
-  const clients: IntercomClient[] = [];
+  const clients: ParleyClient[] = [];
 
   try {
-    const first = new IntercomClient();
-    const second = new IntercomClient();
+    const first = new ParleyClient();
+    const second = new ParleyClient();
     clients.push(first, second);
     await first.connect(baseRegistration("pi"), randomUUID());
     await second.connect(baseRegistration("pi"), randomUUID());
@@ -96,7 +96,7 @@ test("name dedup: registering a colliding name auto-suffixes and stays addressab
     assert.equal(toFirst.delivered, true, "original name still resolves to the first session");
 
     // A third collision keeps counting up.
-    const third = new IntercomClient();
+    const third = new ParleyClient();
     clients.push(third);
     await third.connect(baseRegistration("pi"), randomUUID());
     const roster3 = await first.listSessions();
@@ -113,7 +113,7 @@ test("name dedup: registering a colliding name auto-suffixes and stays addressab
     // When the colliding session leaves, a fresh registration can take the
     // original name again.
     await third.disconnect();
-    const fourth = new IntercomClient();
+    const fourth = new ParleyClient();
     clients.push(fourth);
     await fourth.connect(baseRegistration("pi-3"), randomUUID());
     const roster5 = await first.listSessions();
@@ -130,18 +130,18 @@ test("name dedup: registering a colliding name auto-suffixes and stays addressab
 });
 
 test("mailbox undelivered receipt: sender is notified when a queued message can no longer be delivered", { concurrency: false, timeout: 60_000 }, async () => {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-expiry-"));
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-parley-expiry-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const broker = await startBroker(agentDir);
-  const clients: IntercomClient[] = [];
+  const clients: ParleyClient[] = [];
 
   try {
-    const sender = new IntercomClient();
+    const sender = new ParleyClient();
     clients.push(sender);
     await sender.connect(baseRegistration("sender"), randomUUID());
 
-    const target = new IntercomClient();
+    const target = new ParleyClient();
     await target.connect(baseRegistration("target"), randomUUID());
     const targetId = target.sessionId!;
     await target.disconnect();
@@ -197,15 +197,15 @@ test("mailbox undelivered receipt: sender is notified when a queued message can 
 });
 
 
-async function withConversationBroker(run: (agentDir: string, connect: (name: string, id?: string, beforeConnect?: (client: IntercomClient) => void) => Promise<IntercomClient>) => Promise<void>) {
+async function withConversationBroker(run: (agentDir: string, connect: (name: string, id?: string, beforeConnect?: (client: ParleyClient) => void) => Promise<ParleyClient>) => Promise<void>) {
   const agentDir = mkdtempSync(path.join(process.platform === "win32" ? tmpdir() : "/tmp", "pi-conv-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  const clients: IntercomClient[] = [];
+  const clients: ParleyClient[] = [];
   const broker = await startBroker(agentDir);
   try {
     await run(agentDir, async (name, id = randomUUID(), beforeConnect) => {
-      const client = new IntercomClient();
+      const client = new ParleyClient();
       clients.push(client);
       beforeConnect?.(client);
       await client.connect(baseRegistration(name), id);
@@ -238,7 +238,7 @@ test("colleagues can thread ordinary replies, clarify an open ask and consult a 
     const [, received] = await incomingAsk as [unknown, Message];
     assert.equal(received.senderWaitMode, "nonblocking");
     assert.ok(received.replyDeadline! > received.brokerReceivedAt!);
-    const pendingRecord = path.join(agentDir, "intercom", "pending-asks", `${encodeURIComponent(question.id)}.json`);
+    const pendingRecord = path.join(agentDir, "parley", "pending-asks", `${encodeURIComponent(question.id)}.json`);
     assert.equal(existsSync(pendingRecord), true, "the recovery record represents the open question");
     const progress = await reviewer.send("planner", { text: "Still checking the migration lock", replyTo: question.id, completesAsk: false });
     assert.equal(progress.delivered, true);
@@ -428,7 +428,7 @@ test("accepted supersession closes the old ask, preserves its replacement, and l
   await withConversationBroker(async (agentDir, connect) => {
     const sender = await connect("sender");
     const receiver = await connect("receiver");
-    const recoveryRecord = (id: string) => path.join(agentDir, "intercom", "pending-asks", `${encodeURIComponent(id)}.json`);
+    const recoveryRecord = (id: string) => path.join(agentDir, "parley", "pending-asks", `${encodeURIComponent(id)}.json`);
     const original = await sender.send("receiver", { text: "Review the first plan", expectsReply: true });
     assert.equal(existsSync(recoveryRecord(original.id)), true);
     const rejected = await sender.send("sender", { text: "Wrong recipient", supersedes: original.id });
@@ -476,14 +476,14 @@ test("accepted supersession closes the old ask, preserves its replacement, and l
 });
 
 test("authorized conversation replies survive a real ask timeout and endpoint reconnect", { concurrency: false, timeout: 10_000 }, async () => {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-reply-recovery-"));
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-parley-reply-recovery-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  const broker = await startBroker(agentDir, { PI_INTERCOM_ASK_TIMEOUT_MS: "40" });
-  const asker = new IntercomClient();
-  const original = new IntercomClient();
-  const restored = new IntercomClient();
-  const stranger = new IntercomClient();
+  const broker = await startBroker(agentDir, { PI_PARLEY_ASK_TIMEOUT_MS: "40" });
+  const asker = new ParleyClient();
+  const original = new ParleyClient();
+  const restored = new ParleyClient();
+  const stranger = new ParleyClient();
   try {
     await asker.connect(baseRegistration("planner"), "recovery-planner");
     await original.connect(baseRegistration("reviewer"), "recovery-reviewer");

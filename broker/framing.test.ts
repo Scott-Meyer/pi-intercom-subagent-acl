@@ -62,7 +62,7 @@ test("createMessageReader rejects an oversized declared frame", () => {
 
   assert.deepEqual(messages, []);
   assert.equal(errors.length, 1);
-  assert.match(errors[0].message, /Intercom frame length \d+ exceeds maximum 8 bytes/);
+  assert.match(errors[0].message, /Parley frame length \d+ exceeds maximum 8 bytes/);
 });
 
 test("createMessageReader rejects an oversized frame before retaining same-chunk payload bytes", () => {
@@ -80,7 +80,7 @@ test("createMessageReader rejects an oversized frame before retaining same-chunk
 
   assert.deepEqual(messages, []);
   assert.equal(errors.length, 1);
-  assert.equal(errors[0].message, "Intercom frame length 9 exceeds maximum 8 bytes");
+  assert.equal(errors[0].message, "Parley frame length 9 exceeds maximum 8 bytes");
 });
 
 test("createMessageReader rejects a partial oversized frame before buffering the payload", () => {
@@ -98,7 +98,7 @@ test("createMessageReader rejects a partial oversized frame before buffering the
 
   assert.deepEqual(messages, []);
   assert.equal(errors.length, 1);
-  assert.equal(errors[0].message, "Intercom frame length 9 exceeds maximum 8 bytes");
+  assert.equal(errors[0].message, "Parley frame length 9 exceeds maximum 8 bytes");
 });
 
 test("writeMessage emits frames accepted by createMessageReader", () => {

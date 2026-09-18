@@ -4,7 +4,7 @@ Parley is a durable conversation layer for Pi sessions: targeted messaging, expl
 
 **Alt+M** or **`/parley`** opens the session picker and message composer. Agents communicate through the `parley` tool.
 
-> Parley began as a fork of [nicobailon/pi-intercom](https://github.com/nicobailon/pi-intercom) that grew into its own extension. On-disk runtime paths, the broker wire protocol, persisted history entry types, and `PI_INTERCOM_*` env vars deliberately keep their `intercom` names so existing deployments and session histories carry over unchanged.
+> Parley began as a fork of [nicobailon/pi-intercom](https://github.com/nicobailon/pi-intercom) that grew into its own extension. Parley 1.0 kept the intercom runtime names so deployments upgraded in place; 1.1.0 completed the rename — the runtime directory migrates automatically on first start, and pre-1.1 session journals still replay.
 
 ## Why
 
@@ -24,7 +24,7 @@ Each pi session that has parley loaded and enabled connects to a tiny local brok
 
 ## Install
 
-If any earlier intercom extension is installed — upstream `npm:pi-intercom` or the previous ACL-fork git pin — remove it first so Pi does not load both copies:
+If any earlier parley extension is installed — upstream `npm:pi-intercom` or the previous ACL-fork git pin — remove it first so Pi does not load both copies:
 
 ```bash
 pi remove npm:pi-intercom                 # if upstream was installed
@@ -37,7 +37,7 @@ Then install parley at the pinned release:
 pi install git:github.com/Scott-Meyer/pi-parley@v1.0.0
 ```
 
-Restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-parley` skill with conversation and delivery context. Existing intercom runtime state (`~/.pi/agent/intercom/`, including config, federation links, and queued mail) is picked up unchanged.
+Restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-parley` skill with conversation and delivery context. An existing `~/.pi/agent/intercom/` runtime (config, federation links, queued mail) migrates to `~/.pi/agent/parley/` automatically on first start; see [Upgrading from 1.0.x or the intercom fork](#upgrading-from-10x-or-the-intercom-fork).
 
 This README describes the working tree. Features listed under [Unreleased](CHANGELOG.md#unreleased) are not yet in the pinned release.
 
@@ -54,7 +54,7 @@ The ACL additions are also optional at runtime. An ordinary Pi session without p
 
 A session becomes parley-connected when all of these are true:
 - the `pi-parley` extension is installed and loaded in that session
-- `enabled` is not set to `false` in the parley config file, which defaults to `~/.pi/agent/intercom/config.json`
+- `enabled` is not set to `false` in the parley config file, which defaults to `~/.pi/agent/parley/config.json`
 - the session has started or reloaded after the extension was installed
 - the local broker is running or can be auto-started
 
@@ -80,7 +80,7 @@ Incoming content can wake an idle session or join a busy session's next model tu
 
 Action results include a small view of pending conversations. `pending`, `status`, and `read` expose unanswered requests, outgoing questions, and retained message text. Session history supports reload/resume recovery, including interrupted delivery; it is not a promise of exactly-once processing.
 
-The local wait normally ends after ten minutes (`PI_INTERCOM_ASK_TIMEOUT_MS`), but that does not withdraw the question. Cancellation removes undelivered mail or communicates withdrawal; work already performed remains unchanged.
+The local wait normally ends after ten minutes (`PI_PARLEY_ASK_TIMEOUT_MS`), but that does not withdraw the question. Cancellation removes undelivered mail or communicates withdrawal; work already performed remains unchanged.
 
 Local history and broker routing have different lifetimes. Thread relationships survive endpoint reconnects but remain bounded broker memory (up to one hour and 4,096 recent relationships). Offline mail lasts up to 24 hours while the broker remains running. Neither survives a broker restart. A locally retained message may therefore remain readable after its thread is no longer authorized.
 
@@ -116,7 +116,7 @@ Registered only with the required pi-subagents child bridge metadata and no nati
 | `message` | string | The decision request, optional interview note, or progress update |
 | `interview` | object | Required for `interview_request`: `{ title?, description?, questions: [...] }` |
 
-**`need_decision`** — Sends a formatted ask to the supervisor and blocks until it replies (10-minute timeout by default; configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`). The reply comes back as the tool result. Includes run metadata in the message so the supervisor knows which subagent is asking.
+**`need_decision`** — Sends a formatted ask to the supervisor and blocks until it replies (10-minute timeout by default; configurable with `PI_PARLEY_ASK_TIMEOUT_MS`). The reply comes back as the tool result. Includes run metadata in the message so the supervisor knows which subagent is asking.
 
 **`interview_request`** — Sends a formatted, agent-readable interview to the supervisor and blocks until it replies. Questions use a local pi-interview-like shape: `{ id, type, question, options?, context? }` where `type` is `single`, `multi`, `text`, `image`, or `info`. `info` questions are context-only and do not need responses. The supervisor reply should be JSON with `{ "responses": [{ "id": "...", "value": ... }] }`. Validated responses are returned in `details.structuredReply`; parse or validation failures are also reported in the visible result text.
 
@@ -146,9 +146,9 @@ Registered only with the required pi-subagents child bridge metadata and no nati
 
 For `send`/`ask`, `to` alone resolves within the visible roster. `cwd` addresses a local directory: alone it selects the sole local peer there; with `to` it constrains lookup to that directory. `openProjectPaneIfMissing: true` enables a launch attempt when no matching peer exists.
 
-Parley uses a generic launcher, not a built-in terminal manager. It selects a visible local session advertising `pi-intercom/project-launch-v1`; otherwise it uses the configured `PI_INTERCOM_PROJECT_LAUNCHER` (or config `projectLauncher`). With neither, no launch is attempted.
+Parley uses a generic launcher, not a built-in terminal manager. It selects a visible local session advertising `pi-parley/project-launch-v1`; otherwise it uses the configured `PI_PARLEY_PROJECT_LAUNCHER` (or config `projectLauncher`). With neither, no launch is attempted.
 
-The provider API receives an ordinary parley message containing `{ type: "pi-intercom/project-launch-request", root, command, focus }`. A configured command receives the raw root in `PI_INTERCOM_PROJECT_ROOT`; a bare `{root}` placeholder is replaced with a shell-quoted path. There is no default command.
+The provider API receives an ordinary parley message containing `{ type: "pi-parley/project-launch-request", root, command, focus }`. A configured command receives the raw root in `PI_PARLEY_PROJECT_ROOT`; a bare `{root}` placeholder is replaced with a shell-quoted path. There is no default command.
 
 Results preserve separate observations: **launch request accepted or command started**, **new peer registration observed**, and **message accepted**. A later failure does not erase earlier stages. The v1 request carries no requested name or registration correlation: it observes a sole new local peer in the project, cannot prove that a particular launch created it, and reports ambiguity when several appear. Ending the registration wait does not cancel startup; repeating a launch can create another visible surface.
 
@@ -171,7 +171,7 @@ Compaction itself never sends a message or wakes another session. Broadcast neit
 
 ## Config
 
-Create `~/.pi/agent/intercom/config.json`:
+Create `~/.pi/agent/parley/config.json`:
 
 ```json
 {
@@ -209,9 +209,9 @@ Custom broker commands are trusted local configuration: anyone who can edit this
 
 Pi Parley publishes live session status automatically. Sessions register as `idle`, switch to `thinking` while the agent is running, and show `tool:<name>` during tool execution. On hosts that report unsuccessful compactions to extensions (Earendil Pi 0.85+), they also publish `compacting` from pre-compaction until success, failure, or abort; the underlying thinking/tool/idle state resumes afterward. Older hosts leave compaction presence disabled rather than risk stale status after an unreported failure. This is passive roster presence and never wakes peer agents. If `status` is set in config, it is appended as context instead of replacing the lifecycle status.
 
-Set `PI_INTERCOM_SCOPE_ID` before starting Pi to opt a session into an opaque broker routing scope. The value is trimmed. Empty values are treated as unscoped. A scoped session can list, address by full ID, name, ID prefix, or cwd, receive presence and session lifecycle events, recover queued mailbox messages, and use extension-channel owner, publish, and state traffic only with sessions that registered the exact same scope. Scoped sessions and unscoped sessions do not cross this boundary. Existing unscoped behavior is unchanged when the variable is not set.
+Set `PI_PARLEY_SCOPE_ID` before starting Pi to opt a session into an opaque broker routing scope. The value is trimmed. Empty values are treated as unscoped. A scoped session can list, address by full ID, name, ID prefix, or cwd, receive presence and session lifecycle events, recover queued mailbox messages, and use extension-channel owner, publish, and state traffic only with sessions that registered the exact same scope. Scoped sessions and unscoped sessions do not cross this boundary. Existing unscoped behavior is unchanged when the variable is not set.
 
-By default, runtime state and config live under `~/.pi/agent/intercom`. If Pi is launched with `PI_CODING_AGENT_DIR`, pi-parley uses `$PI_CODING_AGENT_DIR/intercom` instead, including `config.json`, broker PID/lock files, sockets, and launcher state.
+By default, runtime state and config live under `~/.pi/agent/parley`. If Pi is launched with `PI_CODING_AGENT_DIR`, pi-parley uses `$PI_CODING_AGENT_DIR/parley` instead, including `config.json`, broker PID/lock files, sockets, and launcher state.
 
 ## Extension channels
 
@@ -223,18 +223,18 @@ Register during `session_start` so parley includes the capability in its deferre
 // Use @earendil-works/pi-coding-agent here when targeting that distribution.
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
-  INTERCOM_EXTENSION_REGISTER_EVENT,
-  type IntercomExtensionChannel,
+  PARLEY_EXTENSION_REGISTER_EVENT,
+  type ParleyExtensionChannel,
 } from "pi-parley/extension-api.ts";
 
 export default function (pi: ExtensionAPI) {
-  let channel: IntercomExtensionChannel | undefined;
+  let channel: ParleyExtensionChannel | undefined;
 
   pi.on("session_start", () => {
-    pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, {
+    pi.events.emit(PARLEY_EXTENSION_REGISTER_EVENT, {
       namespace: "example/v1",
       ownerEligible: true,
-      onReady: (value: IntercomExtensionChannel) => { channel = value; },
+      onReady: (value: ParleyExtensionChannel) => { channel = value; },
       onEvent: (event: unknown) => { /* owner, state, peer, or payload event */ },
     });
   });
@@ -253,22 +253,22 @@ The broker:
 
 ### Extension outbox
 
-Same-process extensions can request a user-visible parley send through the consent-aware outbox. Emit `intercom:outbox-request` with a unique `requestId`; listen for `intercom:outbox-result` and treat `sent`, `rejected`, `blocked`, and `failed` as terminal states. There is no fire-and-forget mode.
+Same-process extensions can request a user-visible parley send through the consent-aware outbox. Emit `parley:outbox-request` with a unique `requestId`; listen for `parley:outbox-result` and treat `sent`, `rejected`, `blocked`, and `failed` as terminal states. There is no fire-and-forget mode.
 
 ```typescript
 import {
-  INTERCOM_OUTBOX_REQUEST_EVENT,
-  INTERCOM_OUTBOX_RESULT_EVENT,
-  type IntercomOutboxResult,
+  PARLEY_OUTBOX_REQUEST_EVENT,
+  PARLEY_OUTBOX_RESULT_EVENT,
+  type ParleyOutboxResult,
 } from "pi-parley/extension-api.ts";
 
-pi.events.on(INTERCOM_OUTBOX_RESULT_EVENT, (result: IntercomOutboxResult) => {
+pi.events.on(PARLEY_OUTBOX_RESULT_EVENT, (result: ParleyOutboxResult) => {
   if (result.requestId === "example-request-1") {
     // Handle the terminal result.
   }
 });
 
-pi.events.emit(INTERCOM_OUTBOX_REQUEST_EVENT, {
+pi.events.emit(PARLEY_OUTBOX_REQUEST_EVENT, {
   version: 1,
   requestId: "example-request-1",
   extensionId: "example-extension",
@@ -308,7 +308,7 @@ graph TB
 
 The broker is a standalone TypeScript process that manages session registration and message routing. It auto-spawns when the first parley-enabled session needs it and exits after 5 seconds when the last connected session and peer link disconnect. Clients now reconnect automatically if the broker disappears and later comes back.
 
-**Liveness heartbeat.** Transport loss can leave a connection apparently open without a responsive broker. Each registered client round-trips a lightweight `list` request and tears down the socket if the broker does not respond within the timeout, allowing reconnection. The interval defaults to 30s and the probe timeout to 5s; override them with `PI_INTERCOM_LIVENESS_INTERVAL_MS` and `PI_INTERCOM_LIVENESS_TIMEOUT_MS` (the timeout is clamped to the interval).
+**Liveness heartbeat.** Transport loss can leave a connection apparently open without a responsive broker. Each registered client round-trips a lightweight `list` request and tears down the socket if the broker does not respond within the timeout, allowing reconnection. The interval defaults to 30s and the probe timeout to 5s; override them with `PI_PARLEY_LIVENESS_INTERVAL_MS` and `PI_PARLEY_LIVENESS_TIMEOUT_MS` (the timeout is clamped to the interval).
 
 Messages use length-prefixed JSON over a local socket/pipe transport (4-byte length + JSON payload) to handle fragmentation properly. The protocol includes request correlation for session listing, explicit delivery failures, validation for malformed or out-of-order messages, a frame-size cap, per-connection local rate limiting, and no-op presence coalescing.
 
@@ -322,11 +322,11 @@ The broker owns a persisted canonical federation origin (adopted from the first 
 
 Remote links without `peer-send-v1` support remain discovery-only. Broadcast, queued mailboxes, extension channels, and compaction awareness remain host-local in federation v1. Mixed ACL.9 peers can retain the base identity link without falsely negotiating roster support.
 
-Session IDs are the trusted addressing key within one broker routing scope. Duplicate names remain allowed, but ambiguous names fail rather than selecting a recipient. The stable session ID shown by `list`/`status` distinguishes those endpoints. Mail queued for a disconnected session is redelivered to a session that reconnects under the same session ID, or to a session that matches both its explicit name and its directory, so a same-named session in a different project never inherits another project's queued messages. Runtime-only `session-...` aliases are excluded from name-based mailbox reconnection, and a disconnected mailbox is never remapped to the sender. Set `PI_INTERCOM_STABLE_ID` or `stableId` in `config.json` to pin a session's parley ID across full process relaunches; `config.json` is machine-global, so a fixed `stableId` there applies to every session on the machine and the newest registration takes over that identity only within the same `PI_INTERCOM_SCOPE_ID` boundary. The broker owns local trust metadata such as `trustedLocal`; `peerUid` is reserved for runtimes that can expose real peer credentials and is left unset otherwise. Client-supplied cwd/model/pid/status are display metadata, not authentication.
+Session IDs are the trusted addressing key within one broker routing scope. Duplicate names remain allowed, but ambiguous names fail rather than selecting a recipient. The stable session ID shown by `list`/`status` distinguishes those endpoints. Mail queued for a disconnected session is redelivered to a session that reconnects under the same session ID, or to a session that matches both its explicit name and its directory, so a same-named session in a different project never inherits another project's queued messages. Runtime-only `session-...` aliases are excluded from name-based mailbox reconnection, and a disconnected mailbox is never remapped to the sender. Set `PI_PARLEY_STABLE_ID` or `stableId` in `config.json` to pin a session's parley ID across full process relaunches; `config.json` is machine-global, so a fixed `stableId` there applies to every session on the machine and the newest registration takes over that identity only within the same `PI_PARLEY_SCOPE_ID` boundary. The broker owns local trust metadata such as `trustedLocal`; `peerUid` is reserved for runtimes that can expose real peer credentials and is left unset otherwise. Client-supplied cwd/model/pid/status are display metadata, not authentication.
 
 Async extension work (startup, inbound flushes, reconnects, overlays, and relays) no-ops if the session shuts down or reloads before it settles.
 
-Runtime files live at `~/.pi/agent/intercom/` by default, or `$PI_CODING_AGENT_DIR/intercom/` when `PI_CODING_AGENT_DIR` is set:
+Runtime files live at `~/.pi/agent/parley/` by default, or `$PI_CODING_AGENT_DIR/intercom/` when `PI_CODING_AGENT_DIR` is set:
 - `broker.sock` — Unix domain socket for communication (macOS/Linux only; Windows uses a named pipe instead)
 - `broker-launch.vbs` — Windows helper script used to launch the broker without a console window
 - `broker.pid` — Broker process ID
@@ -338,7 +338,7 @@ Supported `config.json` keys include `stableId` for restart-stable addressing, `
 
 ## Design Decisions
 
-**Local broker IPC instead of a listening network service.** `pi-parley` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps local setup simple and avoids exposed broker ports. Cross-machine federation delegates authenticated SSH transport and ephemeral loopback attachment to FlightDeck rather than making the broker network-addressable. Windows TCP is available only as an explicit escape hatch with `PI_INTERCOM_TRANSPORT=tcp` (or `PI_INTERCOM_TCP=1`) for environments where named pipes are blocked. In that mode the broker binds a dynamic `127.0.0.1` port, records the endpoint plus a local secret under the parley state dir, and requires that secret before health or registration succeeds. Health replies do not echo the secret, so a random localhost process cannot discover it through the broker protocol.
+**Local broker IPC instead of a listening network service.** `pi-parley` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps local setup simple and avoids exposed broker ports. Cross-machine federation delegates authenticated SSH transport and ephemeral loopback attachment to FlightDeck rather than making the broker network-addressable. Windows TCP is available only as an explicit escape hatch with `PI_PARLEY_TRANSPORT=tcp` (or `PI_PARLEY_TCP=1`) for environments where named pipes are blocked. In that mode the broker binds a dynamic `127.0.0.1` port, records the endpoint plus a local secret under the parley state dir, and requires that secret before health or registration succeeds. Health replies do not echo the secret, so a random localhost process cannot discover it through the broker protocol.
 
 **Auto-spawn with file lock.** The broker starts on first connection and exits after 5 seconds idle. There is no daemon to manage. A spawn lock file, keyed by PID and timestamp, prevents duplicate brokers when multiple sessions start at once.
 
@@ -370,7 +370,7 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 ├── message-results.ts    # Model-visible delivery and withdrawal outcomes
 ├── broker/
 │   ├── broker.ts         # Broker process and connection roles
-│   ├── client.ts         # IntercomClient class
+│   ├── client.ts         # ParleyClient class
 │   ├── federation-types.ts    # Broker-peer wire contracts
 │   ├── federation-protocol.ts # Strict validators and qualified ID codec
 │   ├── federation-roster.ts   # Snapshot/delta import and resynchronization
@@ -398,3 +398,15 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 - **No attachments UI** — `file`, `snippet`, and `context` attachments are supported in the protocol, but not in the compose overlay
 - **Visibility is scoped** — The roster includes connected sessions permitted by routing scope and child ACLs, not every Pi process or every sibling
 - **Broker-memory mailboxes** — The broker auto-spawns and clients reconnect after a restart, but queued offline messages do not survive broker exit
+
+## Upgrading from 1.0.x or the intercom fork
+
+Parley 1.1.0 retires the intercom names from runtime surfaces (directories, wire protocol, events, env vars, pipe names). The cutover is coordinated, never a live move:
+
+1. **Install 1.1.0 everywhere together.** The wire protocol and federation protocol renamed (`pi-parley`, `pi-parley-peer`); 1.0.x and 1.1.0 brokers do not interoperate.
+2. **Restart Pi sessions.** A still-running 1.0.x broker drains once its sessions disconnect. If a federation peer link (e.g. a FlightDeck bridge) holds it open, disconnect the link or stop the drained broker.
+3. **First 1.1.0 start migrates the runtime** — a stopped `~/.pi/agent/intercom/` moves to `~/.pi/agent/parley/` whole. While the legacy broker is live, parley blocks startup (no split roster) and retries; sessions reconnect automatically once it drains.
+4. **Two populated runtimes are an explicit conflict.** The broker refuses to start and names both paths; resolve manually rather than losing either state.
+5. **Pre-1.1 session histories still replay** — legacy `intercom_*` journal entries are read transparently while new writes use `parley_*`.
+
+Consumer extensions must update in step: `pi-subagents` (subagent relay events, the `parley` tool name), `coord-observer`-style listeners (`parley:*` extension events), and FlightDeck (tool/command/event/env names — see the rename tracking issue).

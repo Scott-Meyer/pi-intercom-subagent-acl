@@ -142,17 +142,17 @@ test("reply removes pending ask after successful reply", () => {
 });
 
 test("ask timeout can be configured from environment", () => {
-  const previous = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
-  process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "42";
+  const previous = process.env.PI_PARLEY_ASK_TIMEOUT_MS;
+  process.env.PI_PARLEY_ASK_TIMEOUT_MS = "42";
   try {
     assert.equal(getAskTimeoutMs(), 42);
     assert.throws(() => {
-      process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "0";
+      process.env.PI_PARLEY_ASK_TIMEOUT_MS = "0";
       getAskTimeoutMs();
     }, /positive integer/);
   } finally {
-    if (previous === undefined) delete process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
-    else process.env.PI_INTERCOM_ASK_TIMEOUT_MS = previous;
+    if (previous === undefined) delete process.env.PI_PARLEY_ASK_TIMEOUT_MS;
+    else process.env.PI_PARLEY_ASK_TIMEOUT_MS = previous;
   }
 });
 

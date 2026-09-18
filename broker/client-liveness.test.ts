@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { IntercomClient } from "./client.ts";
+import { ParleyClient } from "./client.ts";
 import { writeMessage } from "./framing.ts";
 
 /**
@@ -15,8 +15,8 @@ import { writeMessage } from "./framing.ts";
  * the client's socket stays "writable" indefinitely. isConnected() keeps
  * returning true, no "disconnected" event fires, and the extension's
  * scheduleReconnect() is never called — so the agent silently drops out of the
- * intercom roster forever (this is why long-lived headless/RPC pi agents
- * vanish from `intercom list` after a broker restart).
+ * parley roster forever (this is why long-lived headless/RPC pi agents
+ * vanish from `parley list` after a broker restart).
  *
  * The fix: (1) a socket "error" after registration destroys the socket so the
  * existing onClose -> "disconnected" path runs, and (2) a liveness heartbeat
@@ -25,7 +25,7 @@ import { writeMessage } from "./framing.ts";
  * window even when the OS never delivers an error.
  */
 
-const homeDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-liveness-unit-"));
+const homeDir = mkdtempSync(path.join(tmpdir(), "pi-parley-liveness-unit-"));
 const runtimeAgentDir = process.platform === "win32" ? undefined : mkdtempSync("/tmp/piic-");
 const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
@@ -33,8 +33,8 @@ const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 process.env.HOME = homeDir;
 process.env.USERPROFILE = homeDir;
 if (runtimeAgentDir) process.env.PI_CODING_AGENT_DIR = runtimeAgentDir;
-process.env.PI_INTERCOM_LIVENESS_INTERVAL_MS = "100";
-process.env.PI_INTERCOM_LIVENESS_TIMEOUT_MS = "200";
+process.env.PI_PARLEY_LIVENESS_INTERVAL_MS = "100";
+process.env.PI_PARLEY_LIVENESS_TIMEOUT_MS = "200";
 
 test.after(() => {
   process.env.HOME = previousHome;
@@ -46,11 +46,11 @@ test.after(() => {
 });
 
 /**
- * Build a registered IntercomClient wired to a fake server socket pair, so we
+ * Build a registered ParleyClient wired to a fake server socket pair, so we
  * can simulate a half-open connection without spawning a real broker.
  */
 async function registeredClientAgainstFakeSocket(): Promise<{
-  client: IntercomClient;
+  client: ParleyClient;
   serverSide: net.Socket;
   closeServerSideAbruptly(): void;
   stopResponding(): void;
@@ -58,11 +58,11 @@ async function registeredClientAgainstFakeSocket(): Promise<{
   const { getBrokerSocketPath } = await import("./paths.ts");
   const { mkdirSync, unlinkSync } = await import("node:fs");
   const socketPath = getBrokerSocketPath();
-  const intercomDir = path.dirname(socketPath);
-  mkdirSync(intercomDir, { recursive: true });
+  const parleyDir = path.dirname(socketPath);
+  mkdirSync(parleyDir, { recursive: true });
   try { unlinkSync(socketPath); } catch { /* no stale socket */ }
 
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   let resolveReady: (value: { serverSide: net.Socket; closeServerSideAbruptly(): void; stopResponding(): void }) => void;
   let rejectReady: (reason: unknown) => void;
   const ready = new Promise<{ serverSide: net.Socket; closeServerSideAbruptly(): void; stopResponding(): void }>((res, rej) => {

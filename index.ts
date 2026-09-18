@@ -3,31 +3,31 @@ import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { defineTool, sessionCompactFailuresReachExtensions, sessionInfoChangesReachExtensions, StringEnum } from "./pi-compat.ts";
-import { IntercomClient, type SendResult } from "./broker/client.ts";
+import { ParleyClient, type SendResult } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
-import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
+import { getAskTimeoutMs, loadConfig, type ParleyConfig } from "./config.ts";
 import { COMPACTION_AWARENESS_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceipt, MessageReceiptStatus, PeerCompactionNotice, SessionInfo, SessionRegistration } from "./types.ts";
 import {
-  INTERCOM_EXTENSION_REGISTER_EVENT,
-  INTERCOM_EXTENSION_REGISTRY_READY_EVENT,
-  INTERCOM_OUTBOX_REQUEST_EVENT,
-  INTERCOM_OUTBOX_RESULT_EVENT,
-  type IntercomExtensionChannel,
-  type IntercomExtensionEvent,
-  type IntercomExtensionOwner,
-  type IntercomExtensionRegistration,
-  type IntercomExtensionState,
-  type IntercomOutboxRequestV1,
-  type IntercomOutboxResultCode,
-  type IntercomOutboxResultStatus,
-  type IntercomOutboxResultV1,
+  PARLEY_EXTENSION_REGISTER_EVENT,
+  PARLEY_EXTENSION_REGISTRY_READY_EVENT,
+  PARLEY_OUTBOX_REQUEST_EVENT,
+  PARLEY_OUTBOX_RESULT_EVENT,
+  type ParleyExtensionChannel,
+  type ParleyExtensionEvent,
+  type ParleyExtensionOwner,
+  type ParleyExtensionRegistration,
+  type ParleyExtensionState,
+  type ParleyOutboxRequestV1,
+  type ParleyOutboxResultCode,
+  type ParleyOutboxResultStatus,
+  type ParleyOutboxResultV1,
 } from "./extension-api.ts";
-import { ReplyTracker, type IntercomContext } from "./reply-tracker.ts";
-import { restoreConversationHistory, messageControlKey, type OutstandingAsk } from "./conversation-history.ts";
+import { ReplyTracker, type ParleyContext } from "./reply-tracker.ts";
+import { normalizeEntryType, restoreConversationHistory, messageControlKey, type OutstandingAsk } from "./conversation-history.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
@@ -47,9 +47,9 @@ import { isValidSessionDescription, isValidSessionName, normalizeSelfProfileUpda
 type SessionInfoChangedEvent = Extract<AgentSessionEvent, { type: "session_info_changed" }>;
 
 const PARLEY_TOOL_NAME = "parley";
-const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
-const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
-const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
+const SUBAGENT_CONTROL_PARLEY_EVENT = "subagent:control-parley";
+const SUBAGENT_RESULT_PARLEY_EVENT = "subagent:result-parley";
+const SUBAGENT_RESULT_PARLEY_DELIVERY_EVENT = "subagent:result-parley-delivery";
 const INBOUND_MESSAGE_DEDUPE_MAX = 1000;
 const INBOUND_MESSAGE_DEDUPE_RETENTION_MS = 60 * 60 * 1000;
 const MAX_EXPLICIT_SEND_TARGETS = 32;
@@ -58,12 +58,15 @@ const COMPACTION_STATUS_FAILSAFE_MS = 15 * 60 * 1000;
 const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "session";
 const SUBAGENT_ORCHESTRATOR_TARGET_ENV = "PI_SUBAGENT_ORCHESTRATOR_TARGET";
 const SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV = "PI_SUBAGENT_ORCHESTRATOR_SESSION_ID";
-const INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_SESSION_ID";
-const STABLE_INTERCOM_SESSION_ID_ENV = "PI_INTERCOM_STABLE_ID";
+const PARLEY_SESSION_ID_ENV = "PI_PARLEY_SESSION_ID";
+const STABLE_PARLEY_SESSION_ID_ENV = "PI_PARLEY_STABLE_ID";
 const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
-const SUBAGENT_INTERCOM_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
+const SUBAGENT_PARLEY_SESSION_NAME_ENV = "PI_SUBAGENT_PARLEY_SESSION_NAME";
+/** pi-subagents sets this before its own 1:1 rename lands; reading both keeps
+ * child session-name targeting working during a mixed-version rollout. */
+const SUBAGENT_LEGACY_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
 const SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV = "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
 
 interface ChildOrchestratorMetadata {
@@ -271,14 +274,14 @@ function formatAttachments(attachments: Attachment[]): string {
 function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
   const orchestratorTarget = process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV]?.trim();
   const orchestratorSessionId = process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV]?.trim()
-    || process.env[INTERCOM_SESSION_ID_ENV]?.trim();
+    || process.env[PARLEY_SESSION_ID_ENV]?.trim();
   const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
   const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
   const index = process.env[SUBAGENT_CHILD_INDEX_ENV]?.trim();
   if (!orchestratorTarget || !runId || !agent || !index) {
     return null;
   }
-  const sessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
+  const sessionName = process.env[SUBAGENT_PARLEY_SESSION_NAME_ENV]?.trim() ?? process.env[SUBAGENT_LEGACY_SESSION_NAME_ENV]?.trim();
   return {
     orchestratorTarget,
     ...(orchestratorSessionId ? { orchestratorSessionId } : {}),
@@ -579,7 +582,7 @@ export function sessionIdPrefixes(sessions: SessionInfo[]): Map<string, string> 
   }
   return prefixes;
 }
-function parseSubagentIntercomPayload(payload: unknown): { to: string; message: string; requestId?: string } | null {
+function parseSubagentParleyPayload(payload: unknown): { to: string; message: string; requestId?: string } | null {
   if (typeof payload !== "object" || payload === null) {
     return null;
   }
@@ -590,7 +593,7 @@ function parseSubagentIntercomPayload(payload: unknown): { to: string; message: 
   const requestId = typeof record.requestId === "string" ? record.requestId : undefined;
   return { to: record.to, message: record.message, ...(requestId ? { requestId } : {}) };
 }
-function parseOutboxRequestPayload(payload: unknown): { ok: true; request: IntercomOutboxRequestV1 } | { ok: false; requestId?: string; extensionId?: string; extensionName?: string; detail: string } {
+function parseOutboxRequestPayload(payload: unknown): { ok: true; request: ParleyOutboxRequestV1 } | { ok: false; requestId?: string; extensionId?: string; extensionName?: string; detail: string } {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
     return { ok: false, detail: "request must be an object" };
   }
@@ -628,7 +631,7 @@ function parseOutboxRequestPayload(payload: unknown): { ok: true; request: Inter
     },
   };
 }
-function resolveIntercomPresenceName(sessionName: string | undefined, sessionId: string): string {
+function resolveParleyPresenceName(sessionName: string | undefined, sessionId: string): string {
   const trimmedName = sessionName?.trim();
   if (trimmedName) {
     return trimmedName;
@@ -639,12 +642,12 @@ function resolveIntercomPresenceName(sessionName: string | undefined, sessionId:
 function buildPresenceIdentity(pi: ExtensionAPI, sessionId: string): { name: string; runtimeFallbackAlias: boolean } {
   const sessionName = pi.getSessionName();
   return {
-    name: resolveIntercomPresenceName(sessionName, sessionId),
+    name: resolveParleyPresenceName(sessionName, sessionId),
     runtimeFallbackAlias: !sessionName?.trim(),
   };
 }
-function resolveConfiguredIntercomSessionId(piSessionId: string, config: IntercomConfig): string {
-  return process.env[STABLE_INTERCOM_SESSION_ID_ENV]?.trim() || config.stableId || piSessionId;
+function resolveConfiguredParleySessionId(piSessionId: string, config: ParleyConfig): string {
+  return process.env[STABLE_PARLEY_SESSION_ID_ENV]?.trim() || config.stableId || piSessionId;
 }
 // The tmux pane id (e.g. "%212") the session was launched in. $TMUX_PANE is
 // inherited at process start and immutable for the lifetime — moving the pane
@@ -654,7 +657,7 @@ function currentTmuxPane(): string | undefined {
   const pane = process.env.TMUX_PANE?.trim();
   return pane ? pane : undefined;
 }
-function formatIntercomContactSnippet(sessionId: string): string {
+function formatParleyContactSnippet(sessionId: string): string {
   return `Pi parley target: ${sessionId}`;
 }
 function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): string {
@@ -705,20 +708,20 @@ function formatInboundDeliveryMetadata(message: Message): string {
   if (Date.now() - message.timestamp > 60_000) parts.push(`Originally sent: ${formatMessageTimestamp(message.timestamp)}`);
   return parts.join("\n");
 }
-export default function piIntercomExtension(pi: ExtensionAPI) {
-  let client: IntercomClient | null = null;
-  const config: IntercomConfig = loadConfig();
+export default function piParleyExtension(pi: ExtensionAPI) {
+  let client: ParleyClient | null = null;
+  const config: ParleyConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
   const compactionPresenceSupported = sessionCompactFailuresReachExtensions();
   const localExtensions = new Map<string, {
-    registration: IntercomExtensionRegistration;
-    channel: IntercomExtensionChannel;
-    owner?: IntercomExtensionOwner;
-    state?: IntercomExtensionState;
+    registration: ParleyExtensionRegistration;
+    channel: ParleyExtensionChannel;
+    owner?: ParleyExtensionOwner;
+    state?: ParleyExtensionState;
   }>();
   let runtimeContext: ExtensionContext | null = null;
   let currentSessionId: string | null = null;
-  let currentIntercomSessionId: string | null = null;
+  let currentParleySessionId: string | null = null;
   // ACL fork: fires the quiet, one-time supervisor notice the first time this
   // subagent successfully advertises itself. Re-advertising under a new name
   // later in the same session does not repeat the notice.
@@ -726,8 +729,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let currentModel = "unknown";
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
-  const previousIntercomSessionId = process.env[INTERCOM_SESSION_ID_ENV];
-  let reconnectPromise: Promise<IntercomClient> | null = null;
+  const previousParleySessionId = process.env[PARLEY_SESSION_ID_ENV];
+  let reconnectPromise: Promise<ParleyClient> | null = null;
   let reconnectPromiseGeneration: number | null = null;
   let startupConnectTimer: NodeJS.Timeout | null = null;
   let sessionNameCompatibilityTimer: NodeJS.Timeout | null = null;
@@ -771,7 +774,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const pendingOutboxRequests = new Map<string, PendingOutboxRequest>();
   function dismissIncomingAsk(messageId: string): void {
     replyTracker.dismissPendingAsk(messageId);
-    recordConversationEntry("intercom_inbound_settled", { messageId, timestamp: Date.now() });
+    recordConversationEntry("parley_inbound_settled", { messageId, timestamp: Date.now() });
   }
   function hasSeenInboundMessage(from: SessionInfo, message: Message, now = Date.now()): boolean {
     for (const [key, seenAt] of seenInboundMessages) {
@@ -804,7 +807,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
   }
   function handleMessageControl(from: SessionInfo, control: MessageControl, restored = false): void {
-    if (!restored) recordConversationEntry("intercom_inbound_control", { from, control });
+    if (!restored) recordConversationEntry("parley_inbound_control", { from, control });
     replyTracker.setDisposition(control.messageId, {
       state: control.action === "cancel" ? "withdrawn" : "superseded",
       ...(control.supersededBy ? { replacementId: control.supersededBy } : {}),
@@ -826,7 +829,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const entry = deferredInboundControls.get(key);
     const ctx = getLiveContext();
     if (!entry || !ctx) return;
-    const envelope = { customType: "intercom_message_control", content: entry.content, display: true, details: { from: entry.from, control: entry.control } };
+    const envelope = { customType: "parley_message_control", content: entry.content, display: true, details: { from: entry.from, control: entry.control } };
     pendingHostEnvelopes.set(`control:${key}`, envelope);
     try {
       pi.sendMessage(envelope, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
@@ -858,7 +861,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let inboundRetryTimer: NodeJS.Timeout | null = null;
   const pendingHostEnvelopes = new Map<string, { customType: string; content: string; display: boolean; details: unknown }>();
   const contextFallbackEnvelopes = new Map<string, { customType: string; content: string; display: boolean; details: unknown }>();
-  const freshModelContexts = new Map<string, IntercomContext>();
+  const freshModelContexts = new Map<string, ParleyContext>();
 
   function scheduleInboundRetry(): void {
     if (inboundRetryTimer || (!deferredInboundMessages.size && !deferredInboundControls.size)) return;
@@ -893,8 +896,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
   function inboundEnvelopeKey(value: { customType?: string; details?: unknown }): string | undefined {
     const details = value.details as { message?: Message; control?: MessageControl } | undefined;
-    if (value.customType === "intercom_message" && details?.message?.id) return `message:${details.message.id}`;
-    if (value.customType === "intercom_message_control" && details?.control?.messageId) return `control:${messageControlKey(details.control)}`;
+    if (normalizeEntryType(value.customType) === "parley_message" && details?.message?.id) return `message:${details.message.id}`;
+    if (normalizeEntryType(value.customType) === "parley_message_control" && details?.control?.messageId) return `control:${messageControlKey(details.control)}`;
     return undefined;
   }
 
@@ -904,7 +907,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       const id = key.slice("message:".length);
       const entry = deferredInboundMessages.get(id);
       if (!entry) return;
-      recordConversationEntry("intercom_inbound_visible", { messageId: id, timestamp: Date.now() });
+      recordConversationEntry("parley_inbound_visible", { messageId: id, timestamp: Date.now() });
       deferredInboundMessages.delete(id);
       freshModelContexts.set(id, { from: entry.from, message: entry.message, receivedAt: entry.message.receiverReceivedAt ?? Date.now() });
       emitMessageReceipt(id, "injected", "observed in host conversation/model context; not proof of processing");
@@ -914,7 +917,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       const controlId = key.slice("control:".length);
       const entry = deferredInboundControls.get(controlId);
       if (!entry) return;
-      recordConversationEntry("intercom_control_visible", { key: controlId, timestamp: Date.now() });
+      recordConversationEntry("parley_control_visible", { key: controlId, timestamp: Date.now() });
       deferredInboundControls.delete(controlId);
       emitMessageReceipt(entry.control.messageId, entry.control.action === "cancel" ? "cancellation_requested" : "superseded", "withdrawal/update observed in host conversation/model context; earlier work may have happened");
     }
@@ -924,14 +927,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (!message.replyTo || message.completesAsk === false || message.expectsReply) return;
     const ask = outstandingAsks.get(message.replyTo);
     if (!ask || ask.to !== from.id) return;
-    recordConversationEntry("intercom_ask_settled", { messageId: message.replyTo, reason: "reply accepted by host", timestamp: Date.now() });
+    recordConversationEntry("parley_ask_settled", { messageId: message.replyTo, reason: "reply accepted by host", timestamp: Date.now() });
     outstandingAsks.delete(message.replyTo);
   }
-  /** The effective intercom identity for an outgoing message: the broker's
+  /** The effective parley identity for an outgoing message: the broker's
    * collision-resolved projection of this session when available, else the
    * canonical Pi name. Captured at send time so receipts keep the identity
    * actually used, even after a later rename. */
-  function currentSendIdentity(client: IntercomClient): string {
+  function currentSendIdentity(client: ParleyClient): string {
     return client.getSelfSession()?.name?.trim() || pi.getSessionName()?.trim() || "unnamed session";
   }
   function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
@@ -1071,14 +1074,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         : agentRunning ? "thinking" : "idle";
     return config.status ? `${lifecycleStatus} · ${config.status}` : lifecycleStatus;
   }
-  function emitLocalExtensionEvent(namespace: string, event: IntercomExtensionEvent): void {
+  function emitLocalExtensionEvent(namespace: string, event: ParleyExtensionEvent): void {
     try {
       localExtensions.get(namespace)?.registration.onEvent(event);
     } catch {
-      // One local extension must not break intercom or other extension channels.
+      // One local extension must not break parley or other extension channels.
     }
   }
-  function createExtensionChannel(namespace: string): IntercomExtensionChannel {
+  function createExtensionChannel(namespace: string): ParleyExtensionChannel {
     return {
       namespace,
       snapshot() {
@@ -1134,12 +1137,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ownerEligible: registration.ownerEligible,
     }));
   }
-  function registerLocalExtension(registration: IntercomExtensionRegistration): void {
+  function registerLocalExtension(registration: ParleyExtensionRegistration): void {
     if (!/^[a-z0-9][a-z0-9._/-]{0,63}$/.test(registration.namespace)) {
       throw new Error(`Invalid parley extension namespace: ${registration.namespace}`);
     }
     if (localExtensions.has(registration.namespace)) {
-      throw new Error(`Intercom extension namespace already registered: ${registration.namespace}`);
+      throw new Error(`Parley extension namespace already registered: ${registration.namespace}`);
     }
     const channel = createExtensionChannel(registration.namespace);
     localExtensions.set(registration.namespace, { registration, channel });
@@ -1159,10 +1162,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   function buildRegistration(): SessionRegistration {
     const liveContext = getLiveContext();
     if (!liveContext || !currentSessionId || sessionStartedAt === null) {
-      throw new Error("Intercom runtime not initialized");
+      throw new Error("Parley runtime not initialized");
     }
 
-    const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId);
+    const identity = buildPresenceIdentity(pi, currentParleySessionId ?? currentSessionId);
     const tmuxPane = currentTmuxPane();
     return {
       ...identity,
@@ -1222,7 +1225,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   function persistProfileOwnershipRevocation(): void {
     if (!profileOwnershipRevocationPending) return;
     try {
-      pi.appendEntry("intercom_profile_updated", {
+      pi.appendEntry("parley_profile_updated", {
         managedName: null,
         description: currentSessionDescription ?? null,
         timestamp: Date.now(),
@@ -1235,7 +1238,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
   function syncPresenceIdentity(sessionId: string): void {
     if (!getLiveContext()) return;
-    const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? sessionId);
+    const identity = buildPresenceIdentity(pi, currentParleySessionId ?? sessionId);
     if (
       profileManagedName
       && !identity.runtimeFallbackAlias
@@ -1260,15 +1263,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ...currentContextUsage(),
     });
   }
-  function publishIntercomSessionId(sessionId: string): void {
-    process.env[INTERCOM_SESSION_ID_ENV] = sessionId;
+  function publishParleySessionId(sessionId: string): void {
+    process.env[PARLEY_SESSION_ID_ENV] = sessionId;
   }
-  function restoreIntercomSessionId(): void {
-    if (previousIntercomSessionId === undefined) {
-      delete process.env[INTERCOM_SESSION_ID_ENV];
+  function restoreParleySessionId(): void {
+    if (previousParleySessionId === undefined) {
+      delete process.env[PARLEY_SESSION_ID_ENV];
       return;
     }
-    process.env[INTERCOM_SESSION_ID_ENV] = previousIntercomSessionId;
+    process.env[PARLEY_SESSION_ID_ENV] = previousParleySessionId;
   }
   function syncPresenceStatus(): void {
     if (!client || !currentSessionId || !getLiveContext()) {
@@ -1364,34 +1367,34 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         requiredName?: unknown;
         updateId?: unknown;
       };
-      if (entry.customType === "intercom_profile_pending" && typeof data.updateId === "string") {
+      if (normalizeEntryType(entry.customType) === "parley_profile_pending" && typeof data.updateId === "string") {
         const state = parseProfileState(data, entryIndex);
         if (state) pendingProfiles.set(data.updateId, state);
-      } else if (entry.customType === "intercom_profile_abandoned" && typeof data.updateId === "string") {
+      } else if (normalizeEntryType(entry.customType) === "parley_profile_abandoned" && typeof data.updateId === "string") {
         pendingProfiles.delete(data.updateId);
-      } else if (entry.customType === "intercom_profile_updated") {
+      } else if (normalizeEntryType(entry.customType) === "parley_profile_updated") {
         const state = parseProfileState(data, entryIndex);
         if (state) {
           applyProfileState(state);
           if (typeof data.updateId === "string") pendingProfiles.delete(data.updateId);
         }
       }
-      if (entry.customType === "intercom_receiver_baseline_pending" && typeof data.token === "string") {
+      if (normalizeEntryType(entry.customType) === "parley_receiver_baseline_pending" && typeof data.token === "string") {
         pendingReceiverBaselineTokens.add(data.token);
       } else if (
-        (entry.customType === "intercom_receiver_baseline_recorded"
-          || entry.customType === "intercom_receiver_baseline_abandoned")
+        (normalizeEntryType(entry.customType) === "parley_receiver_baseline_recorded"
+          || normalizeEntryType(entry.customType) === "parley_receiver_baseline_abandoned")
         && typeof data.token === "string"
       ) {
         pendingReceiverBaselineTokens.delete(data.token);
       }
       if (typeof data.eventId !== "string" || data.eventId.length === 0) continue;
-      if (entry.customType === "intercom_compaction_pending") {
+      if (normalizeEntryType(entry.customType) === "parley_compaction_pending") {
         pendingCompactionReports.set(
           data.eventId,
           typeof data.compactedAt === "number" ? data.compactedAt : 0,
         );
-      } else if (entry.customType === "intercom_compaction_recorded") {
+      } else if (normalizeEntryType(entry.customType) === "parley_compaction_recorded") {
         pendingCompactionReports.delete(data.eventId);
       }
     }
@@ -1423,7 +1426,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         try {
           const recorded = await activeClient.reportCompactionCompleted(eventId);
           if (expectedGeneration !== runtimeGeneration || activeClient !== client) return;
-          pi.appendEntry("intercom_compaction_recorded", {
+          pi.appendEntry("parley_compaction_recorded", {
             eventId,
             compactedAt,
             generation: recorded.generation,
@@ -1465,25 +1468,25 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     signal?.addEventListener("abort", () => finishCompactionStatus(ctx, generation), { once: true });
     syncPresenceStatus();
   }
-  function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: IntercomClient): boolean {
+  function currentSessionTargetMatches(to: string, resolvedTo?: string | null, activeClient?: ParleyClient): boolean {
     const targets = new Set<string>();
     const addTarget = (target: string | undefined | null) => {
       const trimmed = target?.trim();
       if (trimmed) targets.add(trimmed.toLowerCase());
     };
     addTarget(currentSessionId);
-    addTarget(currentIntercomSessionId);
+    addTarget(currentParleySessionId);
     addTarget(activeClient?.sessionId);
     addTarget(pi.getSessionName());
-    if (currentSessionId) addTarget(buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId).name);
+    if (currentSessionId) addTarget(buildPresenceIdentity(pi, currentParleySessionId ?? currentSessionId).name);
     return Boolean(resolvedTo && activeClient?.sessionId && resolvedTo === activeClient.sessionId)
       || targets.has(to.trim().toLowerCase());
   }
-  function buildOutboxResult(request: OutboxRequestTrace, status: IntercomOutboxResultStatus, options: {
-    code?: IntercomOutboxResultCode;
+  function buildOutboxResult(request: OutboxRequestTrace, status: ParleyOutboxResultStatus, options: {
+    code?: ParleyOutboxResultCode;
     detail?: string;
     messageId?: string;
-  } = {}): IntercomOutboxResultV1 {
+  } = {}): ParleyOutboxResultV1 {
     return {
       version: 1,
       requestId: request.requestId,
@@ -1495,17 +1498,17 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ...(options.detail ? { detail: options.detail } : {}),
     };
   }
-  function emitOutboxResult(result: IntercomOutboxResultV1, request: OutboxRequestTrace): void {
-    recordConversationEntry("intercom_outbox_result", {
+  function emitOutboxResult(result: ParleyOutboxResultV1, request: OutboxRequestTrace): void {
+    recordConversationEntry("parley_outbox_result", {
       ...result,
       ...(request.to ? { to: request.to } : {}),
       ...(request.message ? { message: { text: request.message } } : {}),
       timestamp: Date.now(),
     });
-    pi.events.emit(INTERCOM_OUTBOX_RESULT_EVENT, result);
+    pi.events.emit(PARLEY_OUTBOX_RESULT_EVENT, result);
   }
-  function settleOutboxRequest(requestId: string, status: IntercomOutboxResultStatus, options: {
-    code?: IntercomOutboxResultCode;
+  function settleOutboxRequest(requestId: string, status: ParleyOutboxResultStatus, options: {
+    code?: ParleyOutboxResultCode;
     detail?: string;
     messageId?: string;
   } = {}): boolean {
@@ -1517,7 +1520,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     emitOutboxResult(buildOutboxResult(pending.request, status, options), pending.request);
     return true;
   }
-  function failPendingOutboxRequests(generation: number, code: IntercomOutboxResultCode, detail: string): void {
+  function failPendingOutboxRequests(generation: number, code: ParleyOutboxResultCode, detail: string): void {
     for (const [requestId, pending] of [...pendingOutboxRequests]) {
       if (pending.generation === generation) {
         settleOutboxRequest(requestId, "failed", { code, detail });
@@ -1576,7 +1579,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     void (async () => {
       const liveContext = getLiveContext(runtimeContext, outboxGeneration);
       if (!liveContext) {
-        settleOutboxRequest(request.requestId, "failed", { code: "session_unavailable", detail: "Intercom session is not active" });
+        settleOutboxRequest(request.requestId, "failed", { code: "session_unavailable", detail: "Parley session is not active" });
         return;
       }
       if (config.confirmSend && !liveContext.hasUI) {
@@ -1584,7 +1587,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
 
-      let activeClient: IntercomClient;
+      let activeClient: ParleyClient;
       try {
         activeClient = await ensureConnected("background");
       } catch (error) {
@@ -1664,7 +1667,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           return;
         }
         surfaceBackgroundPeerCompaction(activeClient, target.label, result, outboxGeneration, target.id);
-        recordConversationEntry("intercom_sent", {
+        recordConversationEntry("parley_sent", {
           to: target.label,
           targetId: result.recipient?.id ?? target.id,
           message: { text: request.message },
@@ -1705,7 +1708,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const targetDisplay = from.name || from.id.slice(0, 8);
     const original = findOutgoingTopic(receipt.messageId);
     const topic = original ? `\nOriginal message: ${JSON.stringify(previewText(original.message?.text ?? original.preview, 240))}` : "";
-    pi.appendEntry("intercom_delivery_failed", {
+    pi.appendEntry("parley_delivery_failed", {
       to: targetDisplay,
       messageId: receipt.messageId,
       detail: receipt.detail ?? "Mailbox delivery expired",
@@ -1713,8 +1716,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     });
     pi.sendMessage(
       {
-        customType: "intercom_delivery_notice",
-        content: `**Intercom delivery failed:** queued message to ${targetDisplay} (${from.cwd}) expired before delivery.\nMessage ID: ${receipt.messageId}${topic}\nReason: ${receipt.detail ?? "mailbox entry expired"}.`,
+        customType: "parley_delivery_notice",
+        content: `**Parley delivery failed:** queued message to ${targetDisplay} (${from.cwd}) expired before delivery.\nMessage ID: ${receipt.messageId}${topic}\nReason: ${receipt.detail ?? "mailbox entry expired"}.`,
         display: true,
         details: { to: targetDisplay, messageId: receipt.messageId, expired: true, ...(receipt.detail ? { detail: receipt.detail } : {}) },
       },
@@ -1723,7 +1726,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
 
   function surfaceBackgroundPeerCompaction(
-    sourceClient: IntercomClient,
+    sourceClient: ParleyClient,
     peerDisplay: string,
     result: Pick<SendResult, "id" | "peerCompaction" | "contactToken">,
     generation = runtimeGeneration,
@@ -1733,8 +1736,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const notice = formatPeerCompactionNotice(peerDisplay, result.peerCompaction, expectedPeerSessionId);
     pi.sendMessage(
       {
-        customType: "intercom_compaction_awareness",
-        content: `**Intercom compaction awareness**\n\n${notice}`,
+        customType: "parley_compaction_awareness",
+        content: `**Parley compaction awareness**\n\n${notice}`,
         display: true,
         details: { messageId: result.id, peerCompaction: result.peerCompaction },
       },
@@ -1761,10 +1764,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     receiverBaselineRetryTimer.unref?.();
   }
 
-  function acknowledgeInboundMessageContact(sourceClient: IntercomClient | null, message: Message): void {
+  function acknowledgeInboundMessageContact(sourceClient: ParleyClient | null, message: Message): void {
     if (!message.contactToken || !sourceClient) return;
     if (message.contactBaseline) {
-      recordConversationEntry("intercom_receiver_baseline_pending", {
+      recordConversationEntry("parley_receiver_baseline_pending", {
         token: message.contactToken,
         messageId: message.id,
         timestamp: Date.now(),
@@ -1779,7 +1782,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const entries = getLiveContext()?.sessionManager.getEntries() ?? [];
     for (let index = entries.length - 1; index >= 0; index--) {
       const entry = entries[index];
-      if (entry?.type !== "custom" || (entry.customType !== "intercom_ask_pending" && entry.customType !== "intercom_sent")) continue;
+      if (entry?.type !== "custom" || (normalizeEntryType(entry.customType) !== "parley_ask_pending" && normalizeEntryType(entry.customType) !== "parley_sent")) continue;
       const data = entry.data as { messageId?: string; to?: string; targetId?: string; message?: Message["content"] } | undefined;
       const recipient = data?.targetId ?? data?.to;
       if (data?.messageId === messageId && recipient && data.message) return { to: recipient, preview: data.message.text, message: data.message };
@@ -1809,7 +1812,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ? `\n\n${formatPeerCompactionNotice(senderDisplay, injectedMessage.peerCompaction, entry.from.id)}`
       : "";
     const envelope = {
-      customType: "intercom_message",
+      customType: "parley_message",
       content: `**From ${senderDisplay}**${focus}${request}${topic}\n\n${entry.bodyText}\n\n${formatInboundDeliveryMetadata(injectedMessage)}\nSession: ${entry.from.id} · ${entry.from.cwd}${origin}${compactionNotice}`,
       display: true,
       details: deliveredEntry,
@@ -1832,8 +1835,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const senderDisplay = from.name || from.id.slice(0, 8);
     pi.sendMessage(
       {
-        customType: "intercom_compaction_awareness",
-        content: `**Intercom compaction awareness**\n\n${formatPeerCompactionNotice(senderDisplay, message.peerCompaction, from.id)}`,
+        customType: "parley_compaction_awareness",
+        content: `**Parley compaction awareness**\n\n${formatPeerCompactionNotice(senderDisplay, message.peerCompaction, from.id)}`,
         display: true,
         details: { messageId: message.id, peerCompaction: message.peerCompaction },
       },
@@ -1862,7 +1865,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const fromMatches = waiter && ((from.name || from.id).toLowerCase() === waiter.from.toLowerCase() || from.id === waiter.from);
     const matchedWaiter = fromMatches && receivedMessage.replyTo === waiter.replyTo && receivedMessage.completesAsk !== false && !receivedMessage.expectsReply;
     replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
-    recordConversationEntry("intercom_inbound_received", {
+    recordConversationEntry("parley_inbound_received", {
       from, message: receivedMessage, receivedAt: receiverReceivedAt,
       ...(matchedWaiter ? { delivery: "tool_result" } : {}),
     });
@@ -1894,7 +1897,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
     })();
   }
-  function attachClientHandlers(nextClient: IntercomClient): void {
+  function attachClientHandlers(nextClient: ParleyClient): void {
     nextClient.onBrokerMessage((message: BrokerMessage) => {
       if (client !== nextClient) return;
       switch (message.type) {
@@ -1916,7 +1919,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         case "direct_contact_recorded":
           if (pendingReceiverBaselineTokens.delete(message.token)) {
             if (pendingReceiverBaselineTokens.size === 0) clearReceiverBaselineRetryTimer();
-            recordConversationEntry("intercom_receiver_baseline_recorded", {
+            recordConversationEntry("parley_receiver_baseline_recorded", {
               token: message.token,
               timestamp: Date.now(),
             });
@@ -1925,7 +1928,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         case "direct_contact_unknown":
           if (pendingReceiverBaselineTokens.delete(message.token)) {
             if (pendingReceiverBaselineTokens.size === 0) clearReceiverBaselineRetryTimer();
-            recordConversationEntry("intercom_receiver_baseline_abandoned", {
+            recordConversationEntry("parley_receiver_baseline_abandoned", {
               token: message.token,
               timestamp: Date.now(),
               reason: "Broker no longer retains the bounded staged baseline token",
@@ -2044,12 +2047,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       });
     }, getReconnectDelayMs());
   }
-  async function ensureConnected(reason: "startup" | "background" | "tool" | "overlay"): Promise<IntercomClient> {
+  async function ensureConnected(reason: "startup" | "background" | "tool" | "overlay"): Promise<ParleyClient> {
     if (!config.enabled) {
-      throw new Error("Intercom disabled");
+      throw new Error("Parley disabled");
     }
     if (disposed || shuttingDown) {
-      throw new Error("Intercom shutting down");
+      throw new Error("Parley shutting down");
     }
     if (client && client.isConnected()) {
       return client;
@@ -2057,23 +2060,24 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const contextAtStart = getLiveContext();
     const generationAtStart = runtimeGeneration;
     if (!contextAtStart || !currentSessionId || sessionStartedAt === null) {
-      throw new Error("Intercom runtime not initialized");
+      throw new Error("Parley runtime not initialized");
     }
     clearReconnectTimer();
     if (reconnectPromise && reconnectPromiseGeneration === generationAtStart) {
       return reconnectPromise;
     }
-    let nextReconnectPromise!: Promise<IntercomClient>;
+    let nextReconnectPromise!: Promise<ParleyClient>;
+    let retryAfterFailure = false
     nextReconnectPromise = (async () => {
-      const nextClient = new IntercomClient();
+      const nextClient = new ParleyClient();
       client = nextClient;
       attachClientHandlers(nextClient);
       try {
         await spawnBrokerIfNeeded(config.brokerCommand, config.brokerArgs);
-        await nextClient.connect(buildRegistration(), currentIntercomSessionId ?? currentSessionId);
+        await nextClient.connect(buildRegistration(), currentParleySessionId ?? currentSessionId);
         if (!getLiveContext(contextAtStart, generationAtStart)) {
           await nextClient.disconnect();
-          throw new Error("Intercom runtime no longer active");
+          throw new Error("Parley runtime no longer active");
         }
         client = nextClient;
         reconnectAttempt = 0;
@@ -2086,14 +2090,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (client === nextClient) {
           client = null;
         }
-        if (reason === "background" && getLiveContext(contextAtStart, generationAtStart)) {
-          scheduleReconnect();
-        }
+        retryAfterFailure = getLiveContext(contextAtStart, generationAtStart) !== null;
         throw toError(error);
       } finally {
         if (reconnectPromise === nextReconnectPromise) {
           reconnectPromise = null;
           reconnectPromiseGeneration = null;
+        }
+        // Schedule only after the owned promise is cleared: scheduleReconnect
+        // drops calls made while a reconnect attempt is still in flight, and
+        // a legacy-broker cutover must keep retrying after it idles out.
+        if (retryAfterFailure) {
+          scheduleReconnect();
         }
       }
     })();
@@ -2126,10 +2134,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return null;
   }
-  async function resolveSessionTarget(activeClient: IntercomClient, nameOrId: string): Promise<string | null> {
+  async function resolveSessionTarget(activeClient: ParleyClient, nameOrId: string): Promise<string | null> {
     return resolveSessionFromRoster(await activeClient.listSessions(), nameOrId)?.id ?? null;
   }
-  async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
+  async function resolveSupervisorTarget(activeClient: ParleyClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
     if (metadata.orchestratorSessionId) {
       const bySessionId = await resolveSessionTarget(activeClient, metadata.orchestratorSessionId);
       if (bySessionId) {
@@ -2138,7 +2146,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return resolveSessionTarget(activeClient, metadata.orchestratorTarget);
   }
-  async function resolveCwdDeliveryTarget(activeClient: IntercomClient, options: {
+  async function resolveCwdDeliveryTarget(activeClient: ParleyClient, options: {
     to?: string;
     cwd: string;
     openProjectPaneIfMissing?: boolean;
@@ -2200,7 +2208,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
 
   async function sendBatchMessages(
-    activeClient: IntercomClient,
+    activeClient: ParleyClient,
     targets: BatchDeliveryTarget[],
     options: {
       message: string;
@@ -2285,7 +2293,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           ...(result.peerCompaction ? { peerCompaction: result.peerCompaction } : {}),
         };
         if (result.delivered) {
-          recordConversationEntry("intercom_sent", {
+          recordConversationEntry("parley_sent", {
             to: target.label,
             targetId: result.recipient?.id ?? target.session?.id,
             message: { text: options.message, attachments: options.attachments },
@@ -2400,8 +2408,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     runtimeContext = ctx;
     currentSessionId = ctx.sessionManager.getSessionId();
-    currentIntercomSessionId = resolveConfiguredIntercomSessionId(currentSessionId, config);
-    publishIntercomSessionId(currentIntercomSessionId);
+    currentParleySessionId = resolveConfiguredParleySessionId(currentSessionId, config);
+    publishParleySessionId(currentParleySessionId);
     currentModel = ctx.model?.id ?? "unknown";
     sessionStartedAt = Date.now();
     restoreConversations(ctx);
@@ -2426,19 +2434,19 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function emitResultDelivery(requestId: string | undefined, delivered: boolean, error?: unknown): void {
     if (!requestId) return;
-    pi.events.emit(SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT, {
+    pi.events.emit(SUBAGENT_RESULT_PARLEY_DELIVERY_EVENT, {
       requestId,
       delivered,
       ...(error ? { error: getErrorMessage(error) } : {}),
     });
   }
-  function relaySubagentIntercomPayload(payload: unknown, options: {
+  function relaySubagentParleyPayload(payload: unknown, options: {
     sender: "subagent-control" | "subagent-result";
     status: string;
     errorEntryType: string;
     acknowledge?: boolean;
   }): void {
-    const parsed = parseSubagentIntercomPayload(payload);
+    const parsed = parseSubagentParleyPayload(payload);
     if (!parsed) return;
 
     const relayGeneration = runtimeGeneration;
@@ -2453,7 +2461,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
 
-      let activeClient: IntercomClient;
+      let activeClient: ParleyClient;
       let target: string;
       try {
         activeClient = await ensureConnected("background");
@@ -2492,9 +2500,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
     })();
   }
-  const unsubscribeExtensionRegister = pi.events.on(INTERCOM_EXTENSION_REGISTER_EVENT, (payload) => {
+  const unsubscribeExtensionRegister = pi.events.on(PARLEY_EXTENSION_REGISTER_EVENT, (payload) => {
     if (!payload || typeof payload !== "object") return;
-    const registration = payload as Partial<IntercomExtensionRegistration>;
+    const registration = payload as Partial<ParleyExtensionRegistration>;
     if (
       typeof registration.namespace !== "string"
       || typeof registration.ownerEligible !== "boolean"
@@ -2503,25 +2511,25 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     ) {
       return;
     }
-    registerLocalExtension(registration as IntercomExtensionRegistration);
+    registerLocalExtension(registration as ParleyExtensionRegistration);
   });
-  pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, { version: 1 });
-  const unsubscribeSubagentControlIntercom = pi.events.on(SUBAGENT_CONTROL_INTERCOM_EVENT, (payload) => {
-    relaySubagentIntercomPayload(payload, {
+  pi.events.emit(PARLEY_EXTENSION_REGISTRY_READY_EVENT, { version: 1 });
+  const unsubscribeSubagentControlParley = pi.events.on(SUBAGENT_CONTROL_PARLEY_EVENT, (payload) => {
+    relaySubagentParleyPayload(payload, {
       sender: "subagent-control",
       status: "needs_attention",
-      errorEntryType: "intercom_control_error",
+      errorEntryType: "parley_control_error",
     });
   });
-  const unsubscribeSubagentResultIntercom = pi.events.on(SUBAGENT_RESULT_INTERCOM_EVENT, (payload) => {
-    relaySubagentIntercomPayload(payload, {
+  const unsubscribeSubagentResultParley = pi.events.on(SUBAGENT_RESULT_PARLEY_EVENT, (payload) => {
+    relaySubagentParleyPayload(payload, {
       sender: "subagent-result",
       status: "result",
-      errorEntryType: "intercom_result_error",
+      errorEntryType: "parley_result_error",
       acknowledge: true,
     });
   });
-  const unsubscribeOutboxRequest = pi.events.on(INTERCOM_OUTBOX_REQUEST_EVENT, handleOutboxRequest);
+  const unsubscribeOutboxRequest = pi.events.on(PARLEY_OUTBOX_REQUEST_EVENT, handleOutboxRequest);
   pi.on("session_start", (_event, ctx) => {
     if (!config.enabled) {
       return;
@@ -2531,8 +2539,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   
   pi.on("session_shutdown", async () => {
     unsubscribeExtensionRegister();
-    unsubscribeSubagentControlIntercom();
-    unsubscribeSubagentResultIntercom();
+    unsubscribeSubagentControlParley();
+    unsubscribeSubagentResultParley();
     unsubscribeOutboxRequest();
     shuttingDown = true;
     disposed = true;
@@ -2544,7 +2552,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     clearStartupConnectTimer();
     clearReconnectTimer();
     clearSessionNameCompatibilityTimer();
-    restoreIntercomSessionId();
+    restoreParleySessionId();
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
     outstandingAsks.clear();
@@ -2564,7 +2572,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     runtimeContext = null;
     currentSessionId = null;
-    currentIntercomSessionId = null;
+    currentParleySessionId = null;
     currentSessionDescription = undefined;
     profileManagedName = undefined;
     currentAdvertisedName = undefined;
@@ -2595,7 +2603,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (getLiveContext(ctx)) {
       const eventId = randomUUID();
       const compactedAt = Date.now();
-      pi.appendEntry("intercom_compaction_pending", { eventId, compactedAt });
+      pi.appendEntry("parley_compaction_pending", { eventId, compactedAt });
       pendingCompactionReports.set(eventId, compactedAt);
       flushPendingCompactionReports();
     }
@@ -2618,7 +2626,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const seen = new Set<string>();
     const messages = event.messages.filter((message) => {
       if (message.role !== "custom") return true;
-      if (message.customType === "intercom_persistence_notice") return !conversationPersistenceWarning;
+      if (normalizeEntryType(message.customType) === "parley_persistence_notice") return !conversationPersistenceWarning;
       const key = inboundEnvelopeKey(message);
       if (!key) return true;
       if (seen.has(key)) return false;
@@ -2634,7 +2642,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       else contextFallbackEnvelopes.delete(key);
     }
     if (conversationPersistenceWarning) messages.push({
-      role: "custom", customType: "intercom_persistence_notice", content: conversationPersistenceWarning, display: true, timestamp: Date.now(),
+      role: "custom", customType: "parley_persistence_notice", content: conversationPersistenceWarning, display: true, timestamp: Date.now(),
     });
     replyTracker.activateContexts([...freshModelContexts.values()]);
     freshModelContexts.clear();
@@ -2694,14 +2702,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     currentModel = event.model.id;
     if (client) {
       client.updatePresence({
-        ...buildPresenceIdentity(pi, currentIntercomSessionId ?? ctx.sessionManager.getSessionId()),
+        ...buildPresenceIdentity(pi, currentParleySessionId ?? ctx.sessionManager.getSessionId()),
         model: event.model.id,
         status: currentStatus(),
       });
     }
   });
 
-  pi.registerMessageRenderer("intercom_message", (message, options, theme) => {
+  pi.registerMessageRenderer("parley_message", (message, options, theme) => {
     const details = message.details as { from: SessionInfo; message: Message; replyCommand?: string; bodyText?: string } | undefined;
     if (!details) return undefined;
     return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded);
@@ -2781,12 +2789,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         const supervisorInterview = interviewValidation?.ok === true ? interviewValidation.interview : undefined;
 
-        let connectedClient: IntercomClient;
+        let connectedClient: ParleyClient;
         try {
           connectedClient = await ensureConnected("tool");
         } catch (error) {
           return {
-            content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }],
+            content: [{ type: "text", text: `Parley not connected: ${getErrorMessage(error)}` }],
             details: { error: true },
           };
         }
@@ -2845,7 +2853,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
                 details: deliveryDetails(result),
               };
             }
-            recordActionEntry("intercom_sent", {
+            recordActionEntry("parley_sent", {
               to: metadata.orchestratorTarget,
               targetId: result.recipient?.id ?? sendTo,
               as: senderIdentity,
@@ -2924,7 +2932,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               details: { error: true, ...deliveryDetails(sendResult) },
             };
           }
-          recordActionEntry("intercom_sent", {
+          recordActionEntry("parley_sent", {
             to: metadata.orchestratorTarget,
             targetId: sendResult.recipient?.id ?? sendTo,
             as: senderIdentity,
@@ -2944,7 +2952,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             ? formatAttachments(replyMessage.content.attachments)
             : "";
           const structuredReply = reason === "interview_request" ? parseStructuredSupervisorReply(replyText, supervisorInterview!) : undefined;
-          recordActionEntry("intercom_received", {
+          recordActionEntry("parley_received", {
             from: metadata.orchestratorTarget,
             message: { text: replyText, attachments: replyMessage.content.attachments },
             messageId: replyMessage.id,
@@ -3105,7 +3113,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       try {
         // Stage durable intent before changing Pi's canonical name. Recovery
         // promotes it only when Pi persisted the same required name.
-        pi.appendEntry("intercom_profile_pending", {
+        pi.appendEntry("parley_profile_pending", {
           ...profileState,
           updateId,
           requiredName: requestedName,
@@ -3119,7 +3127,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       } catch (error) {
         profileNameMutationTarget = undefined;
         try {
-          pi.appendEntry("intercom_profile_abandoned", { updateId, timestamp: Date.now() });
+          pi.appendEntry("parley_profile_abandoned", { updateId, timestamp: Date.now() });
         } catch {
           // The pending entry is conditional on Pi having persisted the new
           // canonical name, so it remains inert if abandonment cannot journal.
@@ -3131,7 +3139,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       profileManagedName = requestedName;
       currentSessionDescription = nextDescription;
       try {
-        pi.appendEntry("intercom_profile_updated", { ...profileState, updateId });
+        pi.appendEntry("parley_profile_updated", { ...profileState, updateId });
         profileOwnershipRevocationPending = false;
       } catch {
         // The synchronously durable pending entry plus Pi's matching canonical
@@ -3141,7 +3149,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       try {
         // Description-only changes are journaled before publication so a throw
         // cannot leave an undurable focus visible to peers.
-        pi.appendEntry("intercom_profile_updated", profileState);
+        pi.appendEntry("parley_profile_updated", profileState);
         profileOwnershipRevocationPending = false;
       } catch (error) {
         return `Unable to persist self profile; no changes were applied: ${getErrorMessage(error)}`;
@@ -3156,17 +3164,17 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   function currentSelfProfile(): {
     name: string;
     description?: string;
-    intercomName?: string;
+    parleyName?: string;
     descriptionPublished: boolean;
   } {
     const requestedName = pi.getSessionName()?.trim() || observedSessionName;
-    const fallbackId = currentIntercomSessionId ?? currentSessionId;
-    const name = requestedName || (fallbackId ? resolveIntercomPresenceName(undefined, fallbackId) : "unnamed");
+    const fallbackId = currentParleySessionId ?? currentSessionId;
+    const name = requestedName || (fallbackId ? resolveParleyPresenceName(undefined, fallbackId) : "unnamed");
     const effectiveName = currentAdvertisedName ?? client?.getSelfSession()?.name;
     return {
       name,
       ...(currentSessionDescription ? { description: currentSessionDescription } : {}),
-      ...(effectiveName ? { intercomName: effectiveName } : {}),
+      ...(effectiveName ? { parleyName: effectiveName } : {}),
       descriptionPublished: currentSessionDescription === undefined || client?.supportsFeature(SESSION_PROFILE_FEATURE) === true,
     };
   }
@@ -3177,11 +3185,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ? result.details as Record<string, unknown>
       : {};
     const identityAlreadyShown = !profileUpdated && existingDetails.delivered === true
-      && existingDetails.senderIdentity === profile.name && profile.intercomName === profile.name
+      && existingDetails.senderIdentity === profile.name && profile.parleyName === profile.name
       && profile.descriptionPublished;
-    const intercomProjection = profile.intercomName && profile.intercomName !== profile.name
-      ? ` (intercom: ${profile.intercomName})`
-      : profile.intercomName
+    const parleyProjection = profile.parleyName && profile.parleyName !== profile.name
+      ? ` (parley: ${profile.parleyName})`
+      : profile.parleyName
         ? ""
         : " (parley name awaiting broker confirmation)";
     const publication = profile.description && !profile.descriptionPublished
@@ -3189,7 +3197,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       : "";
     if (!identityAlreadyShown) result.content.push({
       type: "text",
-      text: `Self profile: ${profile.name}${intercomProjection}${profile.description ? ` — ${profile.description}` : ""}${publication}`,
+      text: `Self profile: ${profile.name}${parleyProjection}${profile.description ? ` — ${profile.description}` : ""}${publication}`,
     });
     result.details = { ...existingDetails, selfProfile: profile };
     return result;
@@ -3228,12 +3236,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 Receipts include sender/recipient identity, exact message IDs, delivery state, and nearby conversation context. Endpoint acceptance is not an acknowledgement from the colleague.`,
     promptSnippet: "Communicate with other Pi sessions.",
     promptGuidelines: [
-      "Intercom messages can wake colleagues; broadcasts reach every visible local peer.",
+      "Parley messages can wake colleagues; broadcasts reach every visible local peer.",
     ],
 
     parameters: Type.Object({
       action: StringEnum(["list", "list-cwd", "send", "broadcast", "ask", "reply", "pending", "status", "cancel", "advertise", "rename", "read"] as const, {
-        description: "Intercom operation.",
+        description: "Parley operation.",
       }),
       profile: Type.Optional(Type.Object({
         name: Type.Optional(Type.String({
@@ -3305,7 +3313,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
         if (!params.supersedes) return;
         outstandingAsks.delete(params.supersedes);
         rejectOwnedReplyWaiter(params.supersedes, new Error(`Request ${params.supersedes} was superseded.`));
-        recordActionEntry("intercom_ask_settled", { messageId: params.supersedes, reason: "superseded", timestamp: Date.now() });
+        recordActionEntry("parley_ask_settled", { messageId: params.supersedes, reason: "superseded", timestamp: Date.now() });
       };
       const toolResult = await (async (): Promise<AgentToolResult<unknown>> => {
       const profile = normalizeToolProfilePlaceholders(params.profile);
@@ -3317,12 +3325,12 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
         };
       }
 
-      let connectedClient: IntercomClient;
+      let connectedClient: ParleyClient;
       try {
         connectedClient = await ensureConnected("tool");
       } catch (error) {
         return {
-          content: [{ type: "text", text: `Intercom not connected: ${getErrorMessage(error)}` }],
+          content: [{ type: "text", text: `Parley not connected: ${getErrorMessage(error)}` }],
           details: { error: true },
         };
       }
@@ -3330,7 +3338,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
       const requestedPresenceName = buildPresenceIdentity(
         pi,
-        currentIntercomSessionId ?? ctx.sessionManager.getSessionId(),
+        currentParleySessionId ?? ctx.sessionManager.getSessionId(),
       ).name;
       const selfProjection = connectedClient.getSelfSession();
       const projectionMayChange = currentAdvertisedName === undefined
@@ -3421,7 +3429,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
           currentAdvertisedName = result.name;
 
           // Best-effort, non-blocking notice to the supervisor -- same ordinary
-          // message pipeline as any other intercom send, delivered exactly once
+          // message pipeline as any other parley send, delivered exactly once
           // per session regardless of how many times this child re-advertises
           // under a different name afterward.
           if (metadata && !hasNotifiedSupervisorOfAdvertise) {
@@ -3550,7 +3558,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
             if (result.delivered && result.outcomeKnown) {
               outstandingAsks.delete(messageId);
               rejectOwnedReplyWaiter(messageId, new Error(`Request ${messageId} was withdrawn.`));
-              recordActionEntry("intercom_ask_settled", { messageId, reason: "withdrawn", timestamp: Date.now() });
+              recordActionEntry("parley_ask_settled", { messageId, reason: "withdrawn", timestamp: Date.now() });
             }
             return {
               content: [{ type: "text", text: formatCancellationResult(result) }],
@@ -3871,7 +3879,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
               };
             }
             settleSupersededQuestion();
-            recordActionEntry("intercom_sent", {
+            recordActionEntry("parley_sent", {
               to: targetDisplay,
               targetId: result.recipient?.id ?? sendTo,
               as: sendIdentity!,
@@ -3939,11 +3947,11 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
           const rememberQuestion = (id: string, target: string, label: string): void => {
             const sentAt = Date.now();
             outstandingAsks.set(id, { to: target, targetDisplay: label, preview: previewText(message, 120) ?? message, sentAt, message: { text: message, attachments } });
-            recordActionEntry("intercom_ask_pending", { messageId: id, to: target, targetDisplay: label, message: { text: message, attachments }, sentAt });
+            recordActionEntry("parley_ask_pending", { messageId: id, to: target, targetDisplay: label, message: { text: message, attachments }, sentAt });
           };
           const settleQuestion = (id: string, reason: string): void => {
             outstandingAsks.delete(id);
-            recordActionEntry("intercom_ask_settled", { messageId: id, reason, timestamp: Date.now() });
+            recordActionEntry("parley_ask_settled", { messageId: id, reason, timestamp: Date.now() });
           };
 
           try {
@@ -4015,7 +4023,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
                 };
               }
               settleSupersededQuestion();
-              recordActionEntry("intercom_sent", {
+              recordActionEntry("parley_sent", {
                 to: targetDisplay,
                 targetId: sendResult.recipient?.id ?? sendTo,
                 as: sendIdentity!,
@@ -4078,7 +4086,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
               };
             }
             settleSupersededQuestion();
-            recordActionEntry("intercom_sent", {
+            recordActionEntry("parley_sent", {
               to: targetDisplay,
               targetId: sendResult.recipient?.id ?? sendTo,
               as: sendIdentity!,
@@ -4094,7 +4102,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
             const replyAttachments = replyMessage.content.attachments?.length
               ? formatAttachments(replyMessage.content.attachments)
               : "";
-            recordActionEntry("intercom_received", {
+            recordActionEntry("parley_received", {
               from: targetDisplay,
               message: { text: replyText, attachments: replyMessage.content.attachments },
               messageId: replyMessage.id,
@@ -4183,7 +4191,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
               };
             }
             dismissIncomingAsk(target.message.id);
-            recordActionEntry("intercom_sent", {
+            recordActionEntry("parley_sent", {
               to: target.from.name || target.from.id,
               targetId: result.recipient?.id ?? target.from.id,
               as: sendIdentity!,
@@ -4242,7 +4250,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
             return {
               content: [{
                 type: "text",
-                text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nVisible connected sessions: ${sessions.length} (including this session; scope and permissions apply)${outstandingText}`,
+                text: `**Parley Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nVisible connected sessions: ${sessions.length} (including this session; scope and permissions apply)${outstandingText}`,
               }],
               details: {
                 outstandingAsks: [...outstandingAsks.entries()].map(([id, ask]) => ({
@@ -4323,7 +4331,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
         }
       }
       if (isPartial) {
-        return new Text(theme.fg("warning", details?.senderIdentity ? `Intercom working as ${details.senderIdentity}…` : "Intercom working..."), 0, 0);
+        return new Text(theme.fg("warning", details?.senderIdentity ? `Parley working as ${details.senderIdentity}…` : "Parley working..."), 0, 0);
       }
       const failed = Boolean(context.isError || details?.error === true || details?.delivered === false);
       const uncertain = details?.outcomeKnown === false || (details?.unknownCount ?? 0) > 0;
@@ -4348,11 +4356,11 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     return true;
   }
 
-  async function insertIntercomId(ctx: ExtensionContext): Promise<void> {
+  async function insertParleyId(ctx: ExtensionContext): Promise<void> {
     const commandGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, commandGeneration);
     if (!liveContext) return;
-    let contactClient: IntercomClient;
+    let contactClient: ParleyClient;
     try {
       contactClient = await ensureConnected("tool");
     } catch (error) {
@@ -4361,7 +4369,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     }
     const sessionId = contactClient.sessionId;
     if (!sessionId || !getLiveContext(liveContext, commandGeneration)) return;
-    const snippet = formatIntercomContactSnippet(sessionId);
+    const snippet = formatParleyContactSnippet(sessionId);
     if (insertIntoEditor(liveContext, snippet)) {
       notifyIfLive(liveContext, `Inserted parley contact target: ${sessionId}`, "info", commandGeneration);
       return;
@@ -4369,7 +4377,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     notifyIfLive(liveContext, `Parley contact target: ${sessionId}`, "info", commandGeneration);
   }
 
-  async function setIntercomAlias(args: string, ctx: ExtensionContext): Promise<void> {
+  async function setParleyAlias(args: string, ctx: ExtensionContext): Promise<void> {
     const commandGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, commandGeneration);
     if (!liveContext) return;
@@ -4423,12 +4431,12 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     notifyAliasCommand(liveContext, `Session alias set: ${alias}`, "info", commandGeneration);
   }
 
-  async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
+  async function openParleyOverlay(ctx: ExtensionContext): Promise<void> {
     const overlayGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, overlayGeneration);
     if (!liveContext?.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") return;
 
-    let overlayClient: IntercomClient;
+    let overlayClient: ParleyClient;
     try {
       overlayClient = await ensureConnected("overlay");
     } catch (error) {
@@ -4482,7 +4490,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     ).catch(() => undefined);
 
     if (result?.sent && result.messageId && result.text && getLiveContext(ctx, overlayGeneration)) {
-      recordConversationEntry("intercom_sent", {
+      recordConversationEntry("parley_sent", {
         to: selectedSession.name || selectedSession.id,
         targetId: selectedSession.id,
         as: currentSendIdentity(overlayClient),
@@ -4508,21 +4516,21 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
 
   pi.registerCommand("parley", {
     description: "Open session parley overlay to browse active sessions and send messages",
-    handler: async (_args, ctx) => openIntercomOverlay(ctx),
+    handler: async (_args, ctx) => openParleyOverlay(ctx),
   });
 
   pi.registerCommand("parley-id", {
     description: "Insert a stable parley contact target snippet for this session into the editor",
-    handler: async (_args, ctx) => insertIntercomId(ctx),
+    handler: async (_args, ctx) => insertParleyId(ctx),
   });
 
   pi.registerCommand("alias", {
     description: "Set or inspect this session's alias (usage: /alias <name> or /alias menu)",
-    handler: async (args, ctx) => setIntercomAlias(args, ctx),
+    handler: async (args, ctx) => setParleyAlias(args, ctx),
   });
 
   pi.registerShortcut("alt+m", {
     description: "Open session parley",
-    handler: async (ctx) => openIntercomOverlay(ctx),
+    handler: async (ctx) => openParleyOverlay(ctx),
   });
 }

@@ -11,7 +11,7 @@ import {
 } from "./federation-origin.ts";
 
 test("canonical origins persist durably and round-trip across broker restarts", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-intercom-federation-origin-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-parley-federation-origin-"));
   try {
     assert.equal(loadPersistedFederationOrigin(dir), undefined, "nothing is persisted before first federation use");
 
@@ -30,7 +30,7 @@ test("canonical origins persist durably and round-trip across broker restarts", 
 });
 
 test("a corrupt or hostile origin file never blocks the broker", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-intercom-federation-origin-corrupt-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-parley-federation-origin-corrupt-"));
   try {
     mkdirSync(dir, { recursive: true });
     for (const [name, content] of [
@@ -57,7 +57,7 @@ test("a corrupt or hostile origin file never blocks the broker", () => {
 });
 
 test("persisted origin files carry restrictive permissions and no temp leftovers", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-intercom-federation-origin-perms-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-parley-federation-origin-perms-"));
   try {
     persistFederationOrigin(dir, { originId: "host:penguin", mintedAt: 1 }, "darwin");
     const raw = readFileSync(join(dir, FEDERATION_ORIGIN_FILE), "utf8");

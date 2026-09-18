@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { IntercomClient } from "./client.ts";
+import { ParleyClient } from "./client.ts";
 import net from "node:net";
 import path from "node:path";
 import { once } from "node:events";
@@ -14,7 +14,7 @@ import { encodeOriginQualifiedSessionIdentity } from "./federation-protocol.ts";
 import { isSessionId } from "./protocol.ts";
 
 test("validated session lifecycle messages reach broker-message subscribers", () => {
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   (client as any)._sessionId = "session-1";
   const received: unknown[] = [];
   client.onBrokerMessage((message) => received.push(message));
@@ -39,7 +39,7 @@ test("validated session lifecycle messages reach broker-message subscribers", ()
 });
 
 test("federated session lifecycle metadata is accepted only for canonical provenance", () => {
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   (client as any)._sessionId = "session-1";
   const federation = {
     originId: "host:penguin",
@@ -83,7 +83,7 @@ test("local registration IDs cannot collide with the federated identity namespac
 });
 
 test("registered feature negotiation rejects non-string feature entries", () => {
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   assert.throws(
     () => (client as any).handleBrokerMessage({ type: "registered", sessionId: "session-1", features: ["valid", 123] }),
     /Invalid registered features/,
@@ -91,7 +91,7 @@ test("registered feature negotiation rejects non-string feature entries", () => 
 });
 
 test("registered handshake exposes the broker-owned self projection", () => {
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   const session = {
     id: "session-1",
     name: "worker-2",
@@ -112,7 +112,7 @@ test("registered handshake exposes the broker-owned self projection", () => {
   assert.deepEqual(client.getSelfSession(), session);
   assert.equal(client.supportsFeature("session-profile-v1"), true);
 
-  const invalidClient = new IntercomClient();
+  const invalidClient = new ParleyClient();
   assert.throws(
     () => (invalidClient as any).handleBrokerMessage({
       type: "registered",
@@ -124,7 +124,7 @@ test("registered handshake exposes the broker-owned self projection", () => {
 });
 
 test("malformed extension broker messages are rejected", () => {
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   (client as any)._sessionId = "session-1";
 
   assert.throws(
@@ -172,7 +172,7 @@ test("malformed extension broker messages are rejected", () => {
 });
 
 test("cancelAsk ignores synchronous socket write failures", () => {
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   (client as any)._sessionId = "session-1";
   (client as any).socket = {
     destroyed: false,
@@ -190,7 +190,7 @@ test("cancelAsk ignores synchronous socket write failures", () => {
 async function withScriptedBroker(
   features: string[],
   handle: (socket: net.Socket, frame: ClientMessage) => boolean | void,
-  run: (client: IntercomClient) => Promise<void>,
+  run: (client: ParleyClient) => Promise<void>,
 ): Promise<void> {
   const agentDir = mkdtempSync(path.join(process.platform === "win32" ? tmpdir() : "/tmp", "pi-wire-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -214,7 +214,7 @@ async function withScriptedBroker(
     }, error => socket.destroy(error)));
     socket.on("error", () => undefined);
   });
-  const client = new IntercomClient();
+  const client = new ParleyClient();
   try {
     server.listen(socketPath);
     await once(server, "listening");

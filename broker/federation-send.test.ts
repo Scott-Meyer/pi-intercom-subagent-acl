@@ -11,7 +11,7 @@ import {
 function validRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     type: "peer_send",
-    protocol: "pi-intercom-peer",
+    protocol: "pi-parley-peer",
     version: 1,
     originId: "host:penguin",
     sendId: "send_0001_ABCDEFGH",
@@ -31,7 +31,7 @@ function validRequest(overrides: Record<string, unknown> = {}): Record<string, u
 function validResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     type: "peer_send_result",
-    protocol: "pi-intercom-peer",
+    protocol: "pi-parley-peer",
     version: 1,
     originId: "host:penguin",
     sendId: "send_0001_ABCDEFGH",

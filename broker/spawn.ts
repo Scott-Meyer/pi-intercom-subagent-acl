@@ -7,21 +7,22 @@ import net from "net";
 import { randomUUID } from "crypto";
 import { createMessageReader, writeMessage } from "./framing.ts";
 import {
-  ensureIntercomRuntimeDir,
+  ensureParleyRuntimeDir,
   getAgentDirPath,
   getBrokerConnectTarget,
-  getIntercomDirPath,
-  INTERCOM_PROTOCOL_NAME,
-  INTERCOM_PROTOCOL_VERSION,
-  INTERCOM_RUNTIME_FILE_MODE,
-  restrictIntercomRuntimeFile,
+  getParleyDirPath,
+  migrateLegacyRuntimeDir,
+  PARLEY_PROTOCOL_NAME,
+  PARLEY_PROTOCOL_VERSION,
+  PARLEY_RUNTIME_FILE_MODE,
+  restrictParleyRuntimeFile,
   type BrokerConnectTarget,
 } from "./paths.ts";
 
-const INTERCOM_DIR = getIntercomDirPath();
+const PARLEY_DIR = getParleyDirPath();
 const EXTENSION_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
-const BROKER_PID = join(INTERCOM_DIR, "broker.pid");
-const BROKER_SPAWN_LOCK = join(INTERCOM_DIR, "broker.spawn.lock");
+const BROKER_PID = join(PARLEY_DIR, "broker.pid");
+const BROKER_SPAWN_LOCK = join(PARLEY_DIR, "broker.spawn.lock");
 const BROKER_STARTUP_STDERR_LIMIT = 4_000;
 
 type BrokerLaunchSpec =
@@ -68,8 +69,8 @@ function quoteWindowsArg(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
-export function getWindowsHiddenLauncherPath(intercomDir: string = INTERCOM_DIR): string {
-  return join(intercomDir, "broker-launch.vbs");
+export function getWindowsHiddenLauncherPath(parleyDir: string = PARLEY_DIR): string {
+  return join(parleyDir, "broker-launch.vbs");
 }
 
 function usesDefaultBrokerCommand(brokerCommand: string, brokerArgs: string[]): boolean {
@@ -116,20 +117,20 @@ export function isBrokerHealthOkMessage(message: unknown, requestId: string): bo
   const response = message as Record<string, unknown>;
   return response.type === "health_ok"
     && response.requestId === requestId
-    && response.protocol === INTERCOM_PROTOCOL_NAME
-    && response.version === INTERCOM_PROTOCOL_VERSION;
+    && response.protocol === PARLEY_PROTOCOL_NAME
+    && response.version === PARLEY_PROTOCOL_VERSION;
 }
 
 export function writeWindowsHiddenLauncher(
   commandLine: string,
   launcherPath: string = getWindowsHiddenLauncherPath(),
 ): string {
-  ensureIntercomRuntimeDir(dirname(launcherPath));
+  ensureParleyRuntimeDir(dirname(launcherPath));
   writeFileSync(launcherPath, `\uFEFF${getWindowsHiddenLauncherScript(commandLine)}`, {
     encoding: "utf16le",
-    mode: INTERCOM_RUNTIME_FILE_MODE,
+    mode: PARLEY_RUNTIME_FILE_MODE,
   });
-  restrictIntercomRuntimeFile(launcherPath);
+  restrictParleyRuntimeFile(launcherPath);
   return launcherPath;
 }
 
@@ -139,11 +140,11 @@ export function getBrokerLaunchSpec(
   brokerArgs: string[],
   extensionDir: string = EXTENSION_DIR,
   platform: NodeJS.Platform = process.platform,
-  intercomDir: string = INTERCOM_DIR,
+  parleyDir: string = PARLEY_DIR,
   nodePath: string = process.execPath,
 ): BrokerLaunchSpec {
   if (platform === "win32") {
-    const launcherPath = getWindowsHiddenLauncherPath(intercomDir);
+    const launcherPath = getWindowsHiddenLauncherPath(parleyDir);
     return {
       kind: "windows-launcher",
       command: "wscript.exe",
@@ -195,8 +196,28 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+// Parley 1.1.0 relocated the runtime dir; spawn refuses while a legacy
+// intercom broker is still running so the roster never splits. The client's
+// reconnect loop retries after the legacy broker idles out.
+function assertRuntimeCutoverComplete(): void {
+  const migration = migrateLegacyRuntimeDir();
+  if (migration.status === "blocked") {
+    throw new Error(
+      "parley: a legacy intercom broker is still running from the intercom/ runtime dir. Restart Pi sessions so it drains; if a federation peer link (e.g. a FlightDeck bridge) holds it open, disconnect the link or stop the drained broker — its state migrates on the next start.",
+    );
+  }
+  if (migration.status === "conflict") {
+    throw new Error(
+      `parley: both ${migration.legacyDir} and ${migration.targetDir} hold runtime state; resolve manually (remove or merge one) before starting.`,
+    );
+  }
+}
+
 export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: string[]): Promise<void> {
-  ensureIntercomRuntimeDir(INTERCOM_DIR);
+  // The spawn lock opens parley/broker.spawn.lock, so the directory must
+  // exist first. A fresh parley/ dir with no state entries lets the legacy
+  // migration adopt intercom/ state wholesale.
+  ensureParleyRuntimeDir(PARLEY_DIR);
 
   if (await isBrokerRunning()) {
     return;
@@ -209,6 +230,9 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
   }
 
   try {
+    // Inside the spawn lock: concurrent first starts serialize here, so the
+    // one-time legacy runtime migration cannot race a competing rename.
+    assertRuntimeCutoverComplete();
     if (await isBrokerRunning()) {
       return;
     }
@@ -242,7 +266,7 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
 
       const onError = (error: Error) => {
         cleanup();
-        reject(brokerStartupError(`Failed to spawn intercom broker: ${error.message}`, error));
+        reject(brokerStartupError(`Failed to spawn parley broker: ${error.message}`, error));
       };
 
       const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
@@ -251,10 +275,10 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
         }
         cleanup();
         if (signal) {
-          reject(brokerStartupError(`Intercom broker exited before startup with signal ${signal}`));
+          reject(brokerStartupError(`Parley broker exited before startup with signal ${signal}`));
           return;
         }
-        reject(brokerStartupError(`Intercom broker exited before startup with code ${code ?? "unknown"}`));
+        reject(brokerStartupError(`Parley broker exited before startup with code ${code ?? "unknown"}`));
       };
 
       child.once("error", onError);
@@ -351,9 +375,9 @@ function acquireSpawnLock(): boolean {
     try {
       writeFileSync(BROKER_SPAWN_LOCK, `${process.pid}\n${Date.now()}\n`, {
         flag: "wx",
-        mode: INTERCOM_RUNTIME_FILE_MODE,
+        mode: PARLEY_RUNTIME_FILE_MODE,
       });
-      restrictIntercomRuntimeFile(BROKER_SPAWN_LOCK);
+      restrictParleyRuntimeFile(BROKER_SPAWN_LOCK);
       return true;
     } catch (error) {
       if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "EEXIST") {

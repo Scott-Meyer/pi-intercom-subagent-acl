@@ -37,7 +37,7 @@ export function createMessageReader(
       msg = JSON.parse(framePayload.toString("utf-8"));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      onError(new Error(`Failed to parse intercom message: ${message}`, { cause: error }));
+      onError(new Error(`Failed to parse parley message: ${message}`, { cause: error }));
       return false;
     }
 
@@ -46,7 +46,7 @@ export function createMessageReader(
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      onError(new Error(`Failed to handle intercom message: ${message}`, { cause: error }));
+      onError(new Error(`Failed to handle parley message: ${message}`, { cause: error }));
       return false;
     }
   }
@@ -67,7 +67,7 @@ export function createMessageReader(
         payloadLength = header.readUInt32BE(0);
         if (payloadLength > maxFrameBytes) {
           headerBytes = 0;
-          onError(new Error(`Intercom frame length ${payloadLength} exceeds maximum ${maxFrameBytes} bytes`));
+          onError(new Error(`Parley frame length ${payloadLength} exceeds maximum ${maxFrameBytes} bytes`));
           return;
         }
       }

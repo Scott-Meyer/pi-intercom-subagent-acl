@@ -1,31 +1,31 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { getIntercomDirPath } from "./broker/paths.ts";
+import { getParleyDirPath } from "./broker/paths.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
-const INTERCOM_SCOPE_ID_ENV = "PI_INTERCOM_SCOPE_ID";
+const PARLEY_SCOPE_ID_ENV = "PI_PARLEY_SCOPE_ID";
 
 export function getAskTimeoutMs(): number {
-  const raw = process.env.PI_INTERCOM_ASK_TIMEOUT_MS;
+  const raw = process.env.PI_PARLEY_ASK_TIMEOUT_MS;
   if (raw === undefined || raw.trim() === "") {
     return DEFAULT_ASK_TIMEOUT_MS;
   }
 
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error("PI_INTERCOM_ASK_TIMEOUT_MS must be a positive integer number of milliseconds");
+    throw new Error("PI_PARLEY_ASK_TIMEOUT_MS must be a positive integer number of milliseconds");
   }
   return value;
 }
 
-export function getIntercomScopeId(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const scopeId = env[INTERCOM_SCOPE_ID_ENV]?.trim();
+export function getParleyScopeId(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const scopeId = env[PARLEY_SCOPE_ID_ENV]?.trim();
   return scopeId ? scopeId : undefined;
 }
 
 export type InboundTriggerPolicy = "always" | "replies" | "never";
 
-export interface IntercomConfig {
+export interface ParleyConfig {
   /** Broker command used to spawn the broker process (e.g. "npx" or "bun") */
   brokerCommand: string;
 
@@ -41,26 +41,55 @@ export interface IntercomConfig {
   /** Optional custom status suffix shown after automatic lifecycle status */
   status?: string;
 
-  /** Optional stable intercom session ID for restart-stable addressing */
+  /** Optional stable parley session ID for restart-stable addressing */
   stableId?: string;
 
   /** Optional default project launch command for openProjectPaneIfMissing
    * (e.g. `tmux new-window -c "{root}" pi`). No built-in default; a live
-   * mesh provider advertising pi-intercom/project-launch-v1 is preferred. */
+   * mesh provider advertising pi-parley/project-launch-v1 is preferred. */
   projectLauncher?: string;
   
-  /** Enable/disable intercom (default: true) */
+  /** Enable/disable parley (default: true) */
   enabled: boolean;
   
   /** Show reply hint in incoming messages (default: true) */
   replyHint: boolean;
 }
 
-export function getConfigPath(intercomDir: string = getIntercomDirPath()): string {
-  return join(intercomDir, "config.json");
+export function getConfigPath(parleyDir: string = getParleyDirPath()): string {
+  return join(parleyDir, "config.json");
 }
 
-const defaults: IntercomConfig = {
+/** Parley 1.1.0 relocated the runtime dir; until the broker-side cutover
+ * moves intercom/, a legacy config still governs. Read-only fallback — the
+ * runtime migration owns the move. A concurrent migration can delete either
+ * file between the check and the read, so every read tolerates ENOENT and
+ * the primary is reread after a legacy miss (the mover may have just landed
+ * it there). */
+function tryReadConfig(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function readConfigRaw(): string | undefined {
+  const primary = getConfigPath();
+  const primaryRaw = tryReadConfig(primary);
+  if (primaryRaw !== undefined) {
+    return primaryRaw;
+  }
+  const legacy = join(getParleyDirPath(), "..", "intercom", "config.json");
+  const legacyRaw = tryReadConfig(legacy);
+  if (legacyRaw !== undefined) {
+    return legacyRaw;
+  }
+  return tryReadConfig(primary);
+}
+
+const defaults: ParleyConfig = {
   brokerCommand: "npx",
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
@@ -69,21 +98,20 @@ const defaults: IntercomConfig = {
   replyHint: true,
 };
 
-export function loadConfig(): IntercomConfig {
-  const configPath = getConfigPath();
-  if (!existsSync(configPath)) {
+export function loadConfig(): ParleyConfig {
+  const raw = readConfigRaw();
+  if (raw === undefined) {
     return { ...defaults };
   }
-  
+
   try {
-    const raw = readFileSync(configPath, "utf-8");
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw new Error("Config must be a JSON object");
     }
 
     const parsedConfig = parsed as Record<string, unknown>;
-    const config: IntercomConfig = { ...defaults };
+    const config: ParleyConfig = { ...defaults };
 
     if (Object.hasOwn(parsedConfig, "brokerCommand")) {
       if (typeof parsedConfig.brokerCommand !== "string") {
@@ -177,6 +205,6 @@ export function loadConfig(): IntercomConfig {
     return config;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to load intercom config at ${configPath}: ${message}`, { cause: error });
+    throw new Error(`Failed to load parley config: ${message}`, { cause: error });
   }
 }

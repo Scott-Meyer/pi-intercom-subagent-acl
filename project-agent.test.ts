@@ -144,7 +144,7 @@ test("launch request text round-trips through the documented provider contract",
 });
 
 test("openProjectPane reports transport acceptance and the provider request handle, not session creation", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-intercom-project-launch-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-parley-project-launch-"));
   const project = join(root, "project");
   mkdirSync(project);
   const provider = session("provider-1", "flightdeck", "/anywhere", {
@@ -179,13 +179,13 @@ test("openProjectPane reports transport acceptance and the provider request hand
 });
 
 test("openProjectPane falls back to the configured launch command when no provider is registered", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-intercom-command-launch-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-parley-command-launch-"));
   const project = join(root, "project");
   mkdirSync(project);
   const commandLines: string[] = [];
   const spawnImpl: LaunchCommandSpawn = (commandLine, options) => {
     commandLines.push(commandLine);
-    assert.equal(options.cwd, options.env.PI_INTERCOM_PROJECT_ROOT);
+    assert.equal(options.cwd, options.env.PI_PARLEY_PROJECT_ROOT);
     return {
       on: (event: string, listener: (code: number) => void) => {
         if (event === "close") setTimeout(() => listener(0), 1);
@@ -217,7 +217,7 @@ test("openProjectPane falls back to the configured launch command when no provid
 });
 
 test("openProjectPane fails standalone with both generic integration paths when nothing is available", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-intercom-no-launcher-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-parley-no-launcher-"));
   const project = join(root, "project");
   mkdirSync(project);
   try {
@@ -232,7 +232,7 @@ test("openProjectPane fails standalone with both generic integration paths when 
         assert.ok(error instanceof ProjectLaunchError);
         assert.equal(error.stage, "launch");
         assert.equal(error.launch, undefined);
-        assert.match(error.message, /No project launcher is available[\s\S]*project-launch-v1[\s\S]*PI_INTERCOM_PROJECT_LAUNCHER/);
+        assert.match(error.message, /No project launcher is available[\s\S]*project-launch-v1[\s\S]*PI_PARLEY_PROJECT_LAUNCHER/);
         assert.match(error.message, /No launch was attempted/);
         assert.doesNotMatch(error.message, /tmux|new-window|for example|\{root\}/);
         return true;
@@ -281,7 +281,7 @@ test("launch commands substitute {root}, fail on early non-zero exit, and treat 
   // A command that exits zero resolved the launch.
   await launchProjectCommand("open-terminal {root}", "/repo", { spawnImpl: exitAfter(5, 0) });
   // A command still running past the failure window launched fine; its later
-  // exit (or lifetime) is not pi-intercom's to manage.
+  // exit (or lifetime) is not pi-parley's to manage.
   await launchProjectCommand("open-terminal {root}", "/repo", {
     spawnImpl: exitAfter(80, 1),
     failureWindowMs: 50,
@@ -298,10 +298,10 @@ test("launch commands substitute {root}, fail on early non-zero exit, and treat 
 });
 
 test("launcher command resolution prefers the environment over config and has no built-in default", () => {
-  assert.equal(resolveProjectLauncherCommand({ PI_INTERCOM_PROJECT_LAUNCHER: "tmux new-window -c {root} pi" }), "tmux new-window -c {root} pi");
+  assert.equal(resolveProjectLauncherCommand({ PI_PARLEY_PROJECT_LAUNCHER: "tmux new-window -c {root} pi" }), "tmux new-window -c {root} pi");
   assert.equal(resolveProjectLauncherCommand({}, "config-command"), "config-command");
   assert.equal(resolveProjectLauncherCommand({}, undefined), undefined);
-  assert.equal(resolveProjectLauncherCommand({ PI_INTERCOM_PROJECT_LAUNCHER: "   " }, "config-command"), "config-command");
+  assert.equal(resolveProjectLauncherCommand({ PI_PARLEY_PROJECT_LAUNCHER: "   " }, "config-command"), "config-command");
 });
 
 test("waitForProjectSession returns the new project-pane session when no target is named", async () => {
@@ -327,7 +327,7 @@ test("waitForProjectSession returns the new project-pane session when no target 
 });
 
 test("a missing named target can launch a generically named local session without adopting a remote same-path peer", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-intercom-project-workflow-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-parley-project-workflow-"));
   const provider = session("provider", "terminal-service", "/elsewhere", {
     extensions: [{ namespace: PROJECT_LAUNCH_NAMESPACE, ownerEligible: false }],
   });
@@ -380,7 +380,7 @@ test("a missing named target can launch a generically named local session withou
 });
 
 test("provider rejection and lost acknowledgement preserve whether a launch could already exist, without command fallback", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-intercom-launch-receipts-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-parley-launch-receipts-"));
   const provider = session("provider", "terminal-service", "/elsewhere", {
     extensions: [{ namespace: PROJECT_LAUNCH_NAMESPACE, ownerEligible: false }],
   });
@@ -422,7 +422,7 @@ test("provider rejection and lost acknowledgement preserve whether a launch coul
 });
 
 test("registration failures preserve the accepted launch, and a late session can be observed without relaunching", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-intercom-registration-receipts-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-parley-registration-receipts-"));
   const provider = session("provider", "terminal-service", "/elsewhere", {
     extensions: [{ namespace: PROJECT_LAUNCH_NAMESPACE, ownerEligible: false }],
   });
@@ -489,7 +489,7 @@ test("registration failures preserve the accepted launch, and a late session can
 });
 
 test("a real launcher can create resources and still fail; cancellation before launch creates none", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-intercom-command-side-effects-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-parley-command-side-effects-"));
   const launchScript = join(root, "launcher.cjs");
   writeFileSync(launchScript, "require('node:fs').writeFileSync('created-resource', 'exists'); process.exit(7);\n");
   const command = `"${process.execPath}" launcher.cjs`;

@@ -17,5 +17,5 @@ export function assertNoLiveBroker(pidPath: string): void {
     if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
     throw error;
   }
-  throw new Error(`Refusing to replace live intercom broker process ${pid}`);
+  throw new Error(`Refusing to replace live parley broker process ${pid}`);
 }

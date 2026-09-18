@@ -2,6 +2,24 @@
 
 All notable changes to the `pi-parley` extension will be documented in this file.
 
+## [1.1.0] - 2026-09-17
+
+### Changed
+
+The intercom legacy is fully retired from runtime surfaces. Coordinated cutover, not a live move:
+
+- Runtime dir moves from `~/.pi/agent/intercom/` to `~/.pi/agent/parley/`. A stopped legacy runtime migrates automatically on first start (state adopted wholesale); a live legacy broker — or an in-flight legacy startup holding the old spawn lock — blocks a second broker from starting until the legacy one drains. If a federation peer link (e.g. a FlightDeck bridge) holds the legacy broker open, disconnect the link or stop the drained broker. Dual populated runtimes are an explicit conflict, never silently merged.
+- Wire protocol renamed (`pi-intercom` v1 → `pi-parley`; `pi-intercom-peer` → `pi-parley-peer`). All brokers and federation peers must run 1.1.0 together.
+- Extension-API events renamed: `intercom:*` → `parley:*`. Subagent relay events renamed: `subagent:*intercom*` → `subagent:*parley*`. The project-launch capability namespace is now `pi-parley/project-launch-v1`. Consumers (coord-observer, pi-subagents, FlightDeck) must update in step.
+- Env vars renamed `PI_INTERCOM_*` → `PI_PARLEY_*`.
+- Windows named pipe renamed `pi-intercom-*` → `pi-parley-*`.
+
+### Fixed
+
+- Pre-1.1 journals stay recoverable: session history replays legacy `intercom_*` entry types while writing `parley_*`.
+- A legacy `intercom/config.json` still governs until the cutover completes; config reads tolerate a concurrent migration.
+- Reconnect retries keep firing while a legacy broker blocks startup, including after interactive `/parley` attempts and a first failed retry.
+
 ## [1.0.1] - 2026-09-17
 
 ### Fixed

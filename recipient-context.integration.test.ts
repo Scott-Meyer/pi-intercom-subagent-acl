@@ -12,9 +12,9 @@ const home = mkdtempSync(path.join(tmpdir(), "ic-r-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
 for (const key of Object.keys(process.env)) {
-  if (key.startsWith("PI_SUBAGENT_") || key === "PI_INTERCOM_SESSION_ID" || key === "PI_INTERCOM_STABLE_ID" || key === "PI_CODING_AGENT_DIR") delete process.env[key];
+  if (key.startsWith("PI_SUBAGENT_") || key === "PI_PARLEY_SESSION_ID" || key === "PI_PARLEY_STABLE_ID" || key === "PI_CODING_AGENT_DIR") delete process.env[key];
 }
-const { IntercomClient } = await import("./broker/client.ts");
+const { ParleyClient } = await import("./broker/client.ts");
 const { getTsxCliPath } = await import("./broker/spawn.ts");
 const { default: extension } = await import("./index.ts");
 const broker = spawn(process.execPath, [getTsxCliPath(), path.resolve("broker/broker.ts")], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -22,7 +22,7 @@ let brokerErrors = "";
 broker.stderr.on("data", (data) => { brokerErrors = (brokerErrors + String(data)).slice(-4000); });
 const ready = new Promise<void>((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("Recipient test broker startup timed out")), 10_000);
-  broker.stdout.on("data", (data) => { if (String(data).includes("Intercom broker started")) { clearTimeout(timer); resolve(); } });
+  broker.stdout.on("data", (data) => { if (String(data).includes("Parley broker started")) { clearTimeout(timer); resolve(); } });
   broker.once("exit", () => { clearTimeout(timer); reject(new Error(`Broker exited: ${brokerErrors}`)); });
 });
 test.before(() => ready);
@@ -39,11 +39,11 @@ async function until(check: () => boolean | Promise<boolean>, label: string) {
   }
 }
 async function colleague(name: string) {
-  const peer = new IntercomClient();
+  const peer = new ParleyClient();
   await peer.connect({ name, cwd: process.cwd(), model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now(), description: "coordinating the database migration review" });
   return peer;
 }
-async function start(harness: ReturnType<typeof createExtensionHarness>, peer: InstanceType<typeof IntercomClient>, name: string) {
+async function start(harness: ReturnType<typeof createExtensionHarness>, peer: InstanceType<typeof ParleyClient>, name: string) {
   extension(harness.pi as never);
   await harness.emitLifecycle("session_start");
   let target: SessionInfo | undefined;
@@ -94,7 +94,7 @@ test("busy headless answers retain correlation and survive fire-and-forget host 
     assert.match(answer, /coordinating the database migration/);
     assert.match(answer, /snapshot/i);
     assert.match(answer, /CREATE INDEX CONCURRENTLY example ON records \(id\);/);
-    assert.doesNotMatch(answer, /To reply, use|intercom\(\{|broker delivered|receiver received|seq \d/);
+    assert.doesNotMatch(answer, /To reply, use|parley\(\{|broker delivered|receiver received|seq \d/);
     const afterModel = text(await call(harness, { action: "status" }));
     assert.ok(!afterModel.includes(first!.id));
     assert.ok(afterModel.includes(second!.id));
@@ -117,7 +117,7 @@ test("a busy headless recipient learns a withdrawal even when its host drops the
     assert.match(request, /Reply requested · async ask/);
     assert.match(request, /Start the migration after review/);
     assert.equal((await peer.cancelMessage(sent.id)).delivered, true);
-    await until(() => harness.sentMessages.some((item) => item.message.customType === "intercom_message_control"), "withdrawal steering");
+    await until(() => harness.sentMessages.some((item) => item.message.customType === "parley_message_control"), "withdrawal steering");
     const withdrawal = (await modelContext(harness)).find((item) => item.content.includes("withdrawn by its sender"))!.content;
     assert.ok(withdrawal.includes(sent.id));
     assert.match(withdrawal, /Start the migration after review/);
@@ -148,7 +148,7 @@ test("restart recovers full pending snapshots, unsurfaced answers and outstandin
     await until(() => first.sentMessages.length === 2, "answer received but not persisted");
     second.entries.push(...structuredClone(first.entries));
     // Resume a journal whose broker reply window has since elapsed: the work is still unresolved.
-    const oldRequest = second.entries.find((entry) => entry.type === "intercom_inbound_received" && (entry.data as { message: Message }).message.id === request.id)!;
+    const oldRequest = second.entries.find((entry) => entry.type === "parley_inbound_received" && (entry.data as { message: Message }).message.id === request.id)!;
     (oldRequest.data as { message: Message }).message.replyDeadline = Date.now() - 1;
     await first.emitLifecycle("session_shutdown");
     await start(second, peer, "recovery-worker");
@@ -163,8 +163,8 @@ test("restart recovers full pending snapshots, unsurfaced answers and outstandin
     assert.ok(pending.includes(request.id));
     assert.match(pending, /reply window elapsed, not withdrawn/);
     await call(second, { action: "reply", replyTo: request.id, message: "Reviewed the migration and recovery protocol" });
-    // Older sessions have only nested intercom_sent.message.replyTo, not a separate settlement event.
-    legacy.entries.push(...structuredClone(second.entries.filter((entry) => entry.type !== "intercom_inbound_settled")));
+    // Older sessions have only nested parley_sent.message.replyTo, not a separate settlement event.
+    legacy.entries.push(...structuredClone(second.entries.filter((entry) => entry.type !== "parley_inbound_settled")));
     await start(legacy, peer, "legacy-worker");
     assert.ok(!text(await call(legacy, { action: "pending" })).includes(request.id), "legacy answered requests do not resurrect");
     await start(fresh, peer, "fresh-worker");
@@ -283,7 +283,7 @@ test("history write failures preserve live messages, withdrawals, answer settlem
     assert.match(context.map((item) => item.content).join("\n"), /history was not fully persisted.*recovery after restart may be incomplete/s);
     assert.ok(failedWrites > 0, "the scenario actually exercised failing host history writes");
     assert.equal((await peer.cancelMessage(request.id)).delivered, true);
-    await until(() => harness.sentMessages.some((item) => item.message.customType === "intercom_message_control"), "withdrawal despite history failure");
+    await until(() => harness.sentMessages.some((item) => item.message.customType === "parley_message_control"), "withdrawal despite history failure");
     const cancelled = await modelContext(harness);
     assert.match(cancelled.map((item) => item.content).join("\n"), /withdrawn by its sender/);
     assert.ok(!text(await call(harness, { action: "pending" })).includes(request.id));
@@ -324,7 +324,7 @@ test("blocking answers retain full snapshots for exact-ID read and follow-up acr
     const answerId = text(answer).match(/Reply message ID: ([^\n]+)/)?.[1];
     assert.equal(answerId, response.id, "the model-visible answer identifies the retained reply");
     assert.match(text(await call(first, { action: "read", messageId: answerId })), /Restore writes to the original table, then remove the new index/);
-    assert.equal(first.sentMessages.filter((item) => item.message.customType === "intercom_message").length, 0, "blocking tool result is the only answer delivery");
+    assert.equal(first.sentMessages.filter((item) => item.message.customType === "parley_message").length, 0, "blocking tool result is the only answer delivery");
 
     restored.entries.push(...structuredClone(first.entries));
     restored.toolResults.push(...structuredClone(first.toolResults));
@@ -334,7 +334,7 @@ test("blocking answers retain full snapshots for exact-ID read and follow-up acr
     assert.match(recovered, /blocking-context-planner/);
     assert.ok(recovered.includes(question.id), "reply correlation survives reload");
     assert.match(recovered, /Restore writes to the original table, then remove the new index/);
-    assert.equal(restored.sentMessages.filter((item) => item.message.customType === "intercom_message").length, 0, "reload does not inject a second copy of a blocking answer");
+    assert.equal(restored.sentMessages.filter((item) => item.message.customType === "parley_message").length, 0, "reload does not inject a second copy of a blocking answer");
     const followUpReceived = once(peer, "message", { signal: AbortSignal.timeout(8_000) }) as Promise<[SessionInfo, Message]>;
     const followUp = await call(restored, { action: "reply", replyTo: answerId, message: "Thanks; how long should we retain the original index?" });
     assert.equal(followUp.details?.delivered, true, text(followUp));
@@ -378,9 +378,9 @@ test("a persisted withdrawal survives reload even when custom history writes fai
     const target = await start(first, peer, "persisted-withdrawal-worker");
     brokenHistory = true;
     const request = await peer.send(target.id, { text: "Prepare the release checklist", expectsReply: true });
-    await until(() => first.persistedMessages.some((item) => item.customType === "intercom_message"), "host-persisted request");
+    await until(() => first.persistedMessages.some((item) => item.customType === "parley_message"), "host-persisted request");
     await peer.cancelMessage(request.id);
-    await until(() => first.persistedMessages.some((item) => item.customType === "intercom_message_control"), "host-persisted withdrawal");
+    await until(() => first.persistedMessages.some((item) => item.customType === "parley_message_control"), "host-persisted withdrawal");
     restored.entries.push(...structuredClone(first.entries));
     restored.persistedMessages.push(...structuredClone(first.persistedMessages));
     await first.emitLifecycle("session_shutdown");
@@ -404,7 +404,7 @@ test("an interrupted blocking answer is recovered when the host never persisted 
     await peer.send(asker.id, { text: "Use the verified Sunday backup", replyTo: question.id, completesAsk: true });
     await answerResult;
     // Keep the durable received answer, but model a crash before its final tool-result/settlement persistence.
-    restored.entries.push(...structuredClone(first.entries.filter((entry) => entry.type !== "intercom_ask_settled")));
+    restored.entries.push(...structuredClone(first.entries.filter((entry) => entry.type !== "parley_ask_settled")));
     await first.emitLifecycle("session_shutdown");
     await start(restored, peer, "interrupted-answer-worker");
     assert.ok(text(await call(restored, { action: "status" })).includes(question.id));

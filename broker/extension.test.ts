@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { BrokerMessage, SessionRegistration } from "../types.ts";
-import { IntercomClient } from "./client.ts";
+import { ParleyClient } from "./client.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 
 const repoDir = process.cwd();
@@ -52,7 +52,7 @@ async function startBroker(agentDir: string): Promise<ChildProcessWithoutNullStr
   const ready = new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Broker startup timed out")), 10_000);
     broker.stdout.on("data", (chunk: Buffer) => {
-      if (chunk.toString().includes("Intercom broker started")) {
+      if (chunk.toString().includes("Parley broker started")) {
         clearTimeout(timeout);
         resolve();
       }
@@ -66,20 +66,20 @@ async function startBroker(agentDir: string): Promise<ChildProcessWithoutNullStr
   return broker;
 }
 
-async function withIntercomScope<T>(scopeId: string | undefined, fn: () => T | Promise<T>): Promise<T> {
-  const previous = process.env.PI_INTERCOM_SCOPE_ID;
-  if (scopeId === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
-  else process.env.PI_INTERCOM_SCOPE_ID = scopeId;
+async function withParleyScope<T>(scopeId: string | undefined, fn: () => T | Promise<T>): Promise<T> {
+  const previous = process.env.PI_PARLEY_SCOPE_ID;
+  if (scopeId === undefined) delete process.env.PI_PARLEY_SCOPE_ID;
+  else process.env.PI_PARLEY_SCOPE_ID = scopeId;
   try {
     return await fn();
   } finally {
-    if (previous === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
-    else process.env.PI_INTERCOM_SCOPE_ID = previous;
+    if (previous === undefined) delete process.env.PI_PARLEY_SCOPE_ID;
+    else process.env.PI_PARLEY_SCOPE_ID = previous;
   }
 }
 
-async function connectScoped(client: IntercomClient, scopeId: string | undefined, session: SessionRegistration, sessionId: string): Promise<void> {
-  await withIntercomScope(scopeId, () => client.connect(session, sessionId));
+async function connectScoped(client: ParleyClient, scopeId: string | undefined, session: SessionRegistration, sessionId: string): Promise<void> {
+  await withParleyScope(scopeId, () => client.connect(session, sessionId));
 }
 
 async function stopBroker(broker: ChildProcessWithoutNullStreams): Promise<void> {
@@ -89,14 +89,14 @@ async function stopBroker(broker: ChildProcessWithoutNullStreams): Promise<void>
 }
 
 test("extension bus negotiates, routes, elects an owner, and persists state", { concurrency: false, timeout: 30_000 }, async () => {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-extension-"));
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-parley-extension-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const broker = await startBroker(agentDir);
-  const clients: IntercomClient[] = [];
+  const clients: ParleyClient[] = [];
 
   try {
-    const invalidNamespace = new IntercomClient();
+    const invalidNamespace = new ParleyClient();
     await assert.rejects(
       invalidNamespace.connect({
         ...registration("invalid", Date.now()),
@@ -104,7 +104,7 @@ test("extension bus negotiates, routes, elects an owner, and persists state", { 
       }),
     );
 
-    const tooManyExtensions = new IntercomClient();
+    const tooManyExtensions = new ParleyClient();
     await assert.rejects(
       tooManyExtensions.connect({
         ...registration("too-many", Date.now()),
@@ -115,12 +115,12 @@ test("extension bus negotiates, routes, elects an owner, and persists state", { 
       }),
     );
 
-    const owner = new IntercomClient();
-    const peer = new IntercomClient();
-    const legacy = new IntercomClient();
-    const late = new IntercomClient();
-    const peerOnlyA = new IntercomClient();
-    const peerOnlyB = new IntercomClient();
+    const owner = new ParleyClient();
+    const peer = new ParleyClient();
+    const legacy = new ParleyClient();
+    const late = new ParleyClient();
+    const peerOnlyA = new ParleyClient();
+    const peerOnlyB = new ParleyClient();
     clients.push(owner, peer, legacy, late, peerOnlyA, peerOnlyB);
 
     const ownerMessages: BrokerMessage[] = [];
@@ -145,7 +145,7 @@ test("extension bus negotiates, routes, elects an owner, and persists state", { 
     const now = Date.now();
     await owner.connect(registration("owner", now - 1000, true), "owner-id");
 
-    const invalidReplacement = new IntercomClient();
+    const invalidReplacement = new ParleyClient();
     await assert.rejects(invalidReplacement.connect({
       ...registration("invalid-replacement", now),
       extensions: [{ namespace: "Invalid Namespace", ownerEligible: true }],
@@ -326,7 +326,7 @@ test("extension bus negotiates, routes, elects an owner, and persists state", { 
     );
     assert.equal(noOwner.type, "extension_owner");
 
-    const replacement = new IntercomClient();
+    const replacement = new ParleyClient();
     clients.push(replacement);
     const replacementMessages: BrokerMessage[] = [];
     replacement.onBrokerMessage((message) => replacementMessages.push(message));
@@ -348,17 +348,17 @@ test("extension bus negotiates, routes, elects an owner, and persists state", { 
 });
 
 test("extension bus owners, publish, and state are scoped", { concurrency: false, timeout: 30_000 }, async () => {
-  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-extension-scope-"));
+  const agentDir = mkdtempSync(path.join(tmpdir(), "pi-parley-extension-scope-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const broker = await startBroker(agentDir);
-  const clients: IntercomClient[] = [];
+  const clients: ParleyClient[] = [];
 
   try {
-    const alphaOwner = new IntercomClient();
-    const alphaPeer = new IntercomClient();
-    const betaOwner = new IntercomClient();
-    const betaPeer = new IntercomClient();
+    const alphaOwner = new ParleyClient();
+    const alphaPeer = new ParleyClient();
+    const betaOwner = new ParleyClient();
+    const betaPeer = new ParleyClient();
     clients.push(alphaOwner, alphaPeer, betaOwner, betaPeer);
 
     const alphaOwnerMessages: BrokerMessage[] = [];
@@ -431,7 +431,7 @@ test("extension bus owners, publish, and state are scoped", { concurrency: false
 });
 
 test("extension state compare-and-swap rejects stale and invalid revisions", () => {
-  const runtimeDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-state-cas-"));
+  const runtimeDir = mkdtempSync(path.join(tmpdir(), "pi-parley-state-cas-"));
   try {
     const manager = new ExtensionStateManager(runtimeDir);
     assert.deepEqual(manager.commitState("test/v1", 0, { version: 1 }), { committed: true, revision: 1 });
@@ -465,7 +465,7 @@ test("extension state compare-and-swap rejects stale and invalid revisions", () 
 });
 
 test("extension state falls back to a valid backup", () => {
-  const runtimeDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-state-"));
+  const runtimeDir = mkdtempSync(path.join(tmpdir(), "pi-parley-state-"));
   try {
     const manager = new ExtensionStateManager(runtimeDir);
     assert.equal(manager.commitState("test/v1", 0, { version: 1 }).committed, true);

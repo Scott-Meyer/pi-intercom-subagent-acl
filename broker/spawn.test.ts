@@ -26,10 +26,10 @@ test("getTsxCliPath resolves tsx cli via module resolution", () => {
 });
 
 test("getTsxCliPath falls back to a flat sibling tsx install", () => {
-  const storeDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-store-"));
+  const storeDir = mkdtempSync(path.join(tmpdir(), "pi-parley-store-"));
 
   try {
-    const extensionDir = path.join(storeDir, "node_modules", "pi-intercom");
+    const extensionDir = path.join(storeDir, "node_modules", "pi-parley");
     const cliPath = path.join(storeDir, "node_modules", "tsx", "dist", "cli.mjs");
     mkdirSync(extensionDir, { recursive: true });
     mkdirSync(path.dirname(cliPath), { recursive: true });
@@ -42,10 +42,10 @@ test("getTsxCliPath falls back to a flat sibling tsx install", () => {
 });
 
 test("getTsxCliPath keeps the nested fallback when no sibling tsx cli exists", () => {
-  const storeDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-store-"));
+  const storeDir = mkdtempSync(path.join(tmpdir(), "pi-parley-store-"));
 
   try {
-    const extensionDir = path.join(storeDir, "pi-intercom");
+    const extensionDir = path.join(storeDir, "pi-parley");
     mkdirSync(extensionDir, { recursive: true });
 
     assert.equal(
@@ -58,8 +58,8 @@ test("getTsxCliPath keeps the nested fallback when no sibling tsx cli exists", (
 });
 
 test("getWindowsHiddenLauncherPath points at the broker launcher script", () => {
-  const launcherPath = getWindowsHiddenLauncherPath("C:/tmp/intercom");
-  assert.equal(launcherPath, path.join("C:/tmp/intercom", "broker-launch.vbs"));
+  const launcherPath = getWindowsHiddenLauncherPath("C:/tmp/parley");
+  assert.equal(launcherPath, path.join("C:/tmp/parley", "broker-launch.vbs"));
 });
 
 test("getWindowsBrokerCommandLine wraps node, resolved tsx cli, and broker path", () => {
@@ -82,8 +82,8 @@ test("getWindowsHiddenLauncherScript runs the broker command without showing a c
 });
 
 test("writeWindowsHiddenLauncher writes a UTF-16LE script with a BOM", () => {
-  const intercomDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-用户-"));
-  const launcherPath = path.join(intercomDir, "broker-launch.vbs");
+  const parleyDir = mkdtempSync(path.join(tmpdir(), "pi-parley-用户-"));
+  const launcherPath = path.join(parleyDir, "broker-launch.vbs");
   const commandLine = '"C:/Users/用户/node.exe" "C:/repo/用户/broker.ts"';
 
   try {
@@ -92,12 +92,12 @@ test("writeWindowsHiddenLauncher writes a UTF-16LE script with a BOM", () => {
     assert.deepEqual([...contents.subarray(0, 2)], [0xff, 0xfe]);
     assert.equal(contents.toString("utf16le"), `\uFEFF${getWindowsHiddenLauncherScript(commandLine)}`);
   } finally {
-    rmSync(intercomDir, { recursive: true, force: true });
+    rmSync(parleyDir, { recursive: true, force: true });
   }
 });
 
 test("getBrokerLaunchSpec uses wscript launcher on Windows without writing files", () => {
-  const intercomDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-"));
+  const parleyDir = mkdtempSync(path.join(tmpdir(), "pi-parley-"));
 
   try {
     const spec = getBrokerLaunchSpec(
@@ -106,23 +106,23 @@ test("getBrokerLaunchSpec uses wscript launcher on Windows without writing files
       ["--no-install", "tsx"],
       "C:/repo",
       "win32",
-      intercomDir,
+      parleyDir,
       "C:/Program Files/nodejs/node.exe",
     );
     assert.equal(spec.command, "wscript.exe");
-    assert.deepEqual(spec.args, ["//E:VBScript", path.join(intercomDir, "broker-launch.vbs")]);
+    assert.deepEqual(spec.args, ["//E:VBScript", path.join(parleyDir, "broker-launch.vbs")]);
     assert.equal(spec.kind, "windows-launcher");
     const expectedTsxPath = getTsxCliPath("C:/repo");
     assert.equal(spec.launcherCommandLine, `"C:/Program Files/nodejs/node.exe" "${expectedTsxPath}" "C:/repo/broker.ts"`);
     assert.equal(spec.captureStartupStderr, false);
-    assert.equal(existsSync(path.join(intercomDir, "broker-launch.vbs")), false);
+    assert.equal(existsSync(path.join(parleyDir, "broker-launch.vbs")), false);
   } finally {
-    rmSync(intercomDir, { recursive: true, force: true });
+    rmSync(parleyDir, { recursive: true, force: true });
   }
 });
 
 test("getBrokerLaunchSpec falls back to PATH node for a standalone Pi executable on Windows", () => {
-  const intercomDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-"));
+  const parleyDir = mkdtempSync(path.join(tmpdir(), "pi-parley-"));
 
   try {
     const spec = getBrokerLaunchSpec(
@@ -131,32 +131,32 @@ test("getBrokerLaunchSpec falls back to PATH node for a standalone Pi executable
       ["--no-install", "tsx"],
       "C:/repo",
       "win32",
-      intercomDir,
+      parleyDir,
       "C:/Program Files/Pi/pi.exe",
     );
     assert.equal(spec.kind, "windows-launcher");
     assert.equal(spec.launcherCommandLine, `"node" "${getTsxCliPath("C:/repo")}" "C:/repo/broker.ts"`);
   } finally {
-    rmSync(intercomDir, { recursive: true, force: true });
+    rmSync(parleyDir, { recursive: true, force: true });
   }
 });
 
 test("getBrokerLaunchSpec uses custom broker command on Windows", () => {
-  const intercomDir = mkdtempSync(path.join(tmpdir(), "pi-intercom-"));
+  const parleyDir = mkdtempSync(path.join(tmpdir(), "pi-parley-"));
 
   try {
-    const spec = getBrokerLaunchSpec("C:/repo/broker.ts", "bun", ["--smol"], "C:/repo", "win32", intercomDir, "C:/Program Files/nodejs/node.exe");
+    const spec = getBrokerLaunchSpec("C:/repo/broker.ts", "bun", ["--smol"], "C:/repo", "win32", parleyDir, "C:/Program Files/nodejs/node.exe");
     assert.equal(spec.command, "wscript.exe");
-    assert.deepEqual(spec.args, ["//E:VBScript", path.join(intercomDir, "broker-launch.vbs")]);
+    assert.deepEqual(spec.args, ["//E:VBScript", path.join(parleyDir, "broker-launch.vbs")]);
     assert.equal(spec.kind, "windows-launcher");
     assert.equal(spec.launcherCommandLine, `"bun" "--smol" "C:/repo/broker.ts"`);
   } finally {
-    rmSync(intercomDir, { recursive: true, force: true });
+    rmSync(parleyDir, { recursive: true, force: true });
   }
 });
 
 test("getBrokerLaunchSpec uses node + resolved tsx for the default non-Windows launch", () => {
-  const spec = getBrokerLaunchSpec("C:/repo/broker.ts", "npx", ["--no-install", "tsx"], "C:/repo", "linux", "/tmp/intercom", "/usr/bin/node");
+  const spec = getBrokerLaunchSpec("C:/repo/broker.ts", "npx", ["--no-install", "tsx"], "C:/repo", "linux", "/tmp/parley", "/usr/bin/node");
   assert.equal(spec.command, "/usr/bin/node");
   assert.deepEqual(spec.args, [
     getTsxCliPath("C:/repo"),
@@ -173,7 +173,7 @@ test("getBrokerLaunchSpec falls back to PATH node for a standalone Pi executable
     ["--no-install", "tsx"],
     "/repo",
     "darwin",
-    "/tmp/intercom",
+    "/tmp/parley",
     "/Applications/Pi.app/Contents/MacOS/pi",
   );
   assert.equal(spec.command, "node");
@@ -185,7 +185,7 @@ test("getBrokerLaunchSpec falls back to PATH node for a standalone Pi executable
 });
 
 test("getBrokerLaunchSpec uses custom broker command on non-Windows", () => {
-  const spec = getBrokerLaunchSpec("/repo/broker.ts", "bun", [], "/repo", "linux", "/tmp/intercom", "/usr/bin/node");
+  const spec = getBrokerLaunchSpec("/repo/broker.ts", "bun", [], "/repo", "linux", "/tmp/parley", "/usr/bin/node");
   assert.equal(spec.command, "bun");
   assert.deepEqual(spec.args, ["/repo/broker.ts"]);
   assert.equal(spec.kind, "direct");
@@ -221,8 +221,8 @@ test("getBrokerSpawnOptions passes an absolute PI_CODING_AGENT_DIR to the broker
 });
 
 test("spawnBrokerIfNeeded includes stderr from default broker startup failures", async () => {
-  const root = mkdtempSync(path.join(tmpdir(), "pi-intercom-spawn-"));
-  const extensionDir = path.join(root, "pi-intercom");
+  const root = mkdtempSync(path.join(tmpdir(), "pi-parley-spawn-"));
+  const extensionDir = path.join(root, "pi-parley");
   const brokerDir = path.join(extensionDir, "broker");
   const fakeTsxCli = path.join(extensionDir, "node_modules", "tsx", "dist", "cli.mjs");
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -246,7 +246,7 @@ test("spawnBrokerIfNeeded includes stderr from default broker startup failures",
       () => imported.spawnBrokerIfNeeded("npx", ["--no-install", "tsx"]),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(error.message, /Intercom broker exited before startup with code 1/);
+        assert.match(error.message, /Parley broker exited before startup with code 1/);
         assert.match(error.message, /Broker stderr:\nfake tsx failed/);
         return true;
       },
@@ -258,9 +258,9 @@ test("spawnBrokerIfNeeded includes stderr from default broker startup failures",
   }
 });
 
-test("isBrokerHealthOkMessage requires the intercom protocol marker", () => {
-  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1", protocol: "pi-intercom", version: 1 }, "req-1"), true);
+test("isBrokerHealthOkMessage requires the parley protocol marker", () => {
+  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1", protocol: "pi-parley", version: 1 }, "req-1"), true);
   assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1" }, "req-1"), false);
-  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-2", protocol: "pi-intercom", version: 1 }, "req-1"), false);
+  assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-2", protocol: "pi-parley", version: 1 }, "req-1"), false);
   assert.equal(isBrokerHealthOkMessage("ok", "req-1"), false);
 });

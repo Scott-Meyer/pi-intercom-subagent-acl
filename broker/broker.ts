@@ -5,15 +5,16 @@ import { createHash, randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
 import { isAuthoredMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
 import {
-  ensureIntercomRuntimeDir,
+  ensureParleyRuntimeDir,
   getBrokerListenTarget,
   getBrokerPortFilePath,
-  getIntercomDirPath,
-  INTERCOM_DIR_MODE,
-  INTERCOM_PROTOCOL_NAME,
-  INTERCOM_PROTOCOL_VERSION,
-  INTERCOM_RUNTIME_FILE_MODE,
-  restrictIntercomRuntimeFile,
+  getParleyDirPath,
+  migrateLegacyRuntimeDir,
+  PARLEY_DIR_MODE,
+  PARLEY_PROTOCOL_NAME,
+  PARLEY_PROTOCOL_VERSION,
+  PARLEY_RUNTIME_FILE_MODE,
+  restrictParleyRuntimeFile,
   type BrokerConnectTarget,
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
@@ -69,11 +70,28 @@ import {
   type FederationOrigin,
 } from "./federation-types.ts";
 
-const INTERCOM_DIR = getIntercomDirPath();
+// Parley 1.1.0 relocated the runtime dir; a broker must never start beside a
+// live legacy one (split roster) or over unresolved dual state. A competing
+// first start that completes the migration first is success, not an error.
+const legacyRuntimeMigration = migrateLegacyRuntimeDir();
+if (legacyRuntimeMigration.status === "blocked") {
+  console.error(
+    "parley: a legacy intercom broker is still running from the intercom/ runtime dir. Restart Pi sessions so it drains; if a federation peer link (e.g. a FlightDeck bridge) holds it open, disconnect the link or stop the drained broker — its state migrates on the next start.",
+  );
+  process.exit(1);
+}
+if (legacyRuntimeMigration.status === "conflict") {
+  console.error(
+    `parley: both ${legacyRuntimeMigration.legacyDir} and ${legacyRuntimeMigration.targetDir} hold runtime state; resolve manually (remove or merge one) before starting.`,
+  );
+  process.exit(1);
+}
+
+const PARLEY_DIR = getParleyDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
-const PID_PATH = join(INTERCOM_DIR, "broker.pid");
-const PORT_PATH = getBrokerPortFilePath(INTERCOM_DIR);
-const PENDING_ASKS_DIR = join(INTERCOM_DIR, "pending-asks");
+const PID_PATH = join(PARLEY_DIR, "broker.pid");
+const PORT_PATH = getBrokerPortFilePath(PARLEY_DIR);
+const PENDING_ASKS_DIR = join(PARLEY_DIR, "pending-asks");
 const BROKER_STATE_ID = randomUUID();
 const MAX_SESSIONS = 128;
 const MAX_UNREGISTERED_CONNECTIONS = 32;
@@ -262,7 +280,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // Matching is (supervisorSessionId matches) OR (supervisorName matches),
 // never strict ID-then-name precedence. pi-subagents passes the parent's raw
 // pi session ID as PI_SUBAGENT_ORCHESTRATOR_SESSION_ID, but the parent may be
-// registered with pi-intercom under a different id (PI_INTERCOM_STABLE_ID /
+// registered with pi-parley under a different id (PI_PARLEY_STABLE_ID /
 // config.stableId). In that case the ID never matches even though this is
 // genuinely the child's supervisor, and only the name fallback saves it —
 // mirroring resolveSupervisorTarget's own id-then-name resolution intent, but
@@ -324,13 +342,13 @@ function pendingAskRecordPath(messageId: string): string {
 }
 
 function ensurePendingAskRecordDir(): void {
-  mkdirSync(PENDING_ASKS_DIR, { recursive: true, mode: INTERCOM_DIR_MODE });
+  mkdirSync(PENDING_ASKS_DIR, { recursive: true, mode: PARLEY_DIR_MODE });
   if (process.platform !== "win32") {
-    chmodSync(PENDING_ASKS_DIR, INTERCOM_DIR_MODE);
+    chmodSync(PENDING_ASKS_DIR, PARLEY_DIR_MODE);
   }
 }
 
-class IntercomBroker {
+class ParleyBroker {
   private sessions = new Map<string, ConnectedSession>();
   private askEdges = new Map<string, AskEdge>();
   private messageReceiptRoutes = new Map<string, MessageReceiptRoute>();
@@ -357,13 +375,13 @@ class IntercomBroker {
   private federationSendSweepTimer: NodeJS.Timeout | null = null;
 
   constructor() {
-    ensureIntercomRuntimeDir(INTERCOM_DIR);
-    this.federationOrigin = loadPersistedFederationOrigin(INTERCOM_DIR);
+    ensureParleyRuntimeDir(PARLEY_DIR);
+    this.federationOrigin = loadPersistedFederationOrigin(PARLEY_DIR);
     assertNoLiveBroker(PID_PATH);
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
-    this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
-    this.collaborationState = new CollaborationStateStore(INTERCOM_DIR);
+    this.extensionStateManager = new ExtensionStateManager(PARLEY_DIR);
+    this.collaborationState = new CollaborationStateStore(PARLEY_DIR);
     this.peerLinks = new PeerLinkManager({
       onSocketOpened: (socket) => this.connections.add(socket),
       onSocketClosed: (socket) => this.connections.delete(socket),
@@ -538,11 +556,11 @@ class IntercomBroker {
   start(): void {
     const onListening = () => {
       if (typeof LISTEN_TARGET === "string") {
-        restrictIntercomRuntimeFile(LISTEN_TARGET);
+        restrictParleyRuntimeFile(LISTEN_TARGET);
       } else {
         const address = this.server.address();
         if (!address || typeof address === "string") {
-          throw new Error("Intercom TCP broker started without a TCP address");
+          throw new Error("Parley TCP broker started without a TCP address");
         }
         const endpoint: BrokerConnectTarget = {
           transport: "tcp",
@@ -550,12 +568,12 @@ class IntercomBroker {
           port: address.port,
           stateId: BROKER_STATE_ID,
         };
-        writeFileSync(PORT_PATH, `${JSON.stringify(endpoint)}\n`, { mode: INTERCOM_RUNTIME_FILE_MODE });
-        restrictIntercomRuntimeFile(PORT_PATH);
+        writeFileSync(PORT_PATH, `${JSON.stringify(endpoint)}\n`, { mode: PARLEY_RUNTIME_FILE_MODE });
+        restrictParleyRuntimeFile(PORT_PATH);
       }
-      writeFileSync(PID_PATH, String(process.pid), { mode: INTERCOM_RUNTIME_FILE_MODE });
-      restrictIntercomRuntimeFile(PID_PATH);
-      console.log(`Intercom broker started (pid: ${process.pid})`);
+      writeFileSync(PID_PATH, String(process.pid), { mode: PARLEY_RUNTIME_FILE_MODE });
+      restrictParleyRuntimeFile(PID_PATH);
+      console.log(`Parley broker started (pid: ${process.pid})`);
     };
 
     if (typeof LISTEN_TARGET === "string") {
@@ -615,8 +633,8 @@ class IntercomBroker {
         && "type" in msg
         && msg.type === "direct_contact_seen";
       if (!(isDirectContactAck ? this.consumeAckToken(connection) : this.consumeToken(connection))) {
-        writeMessage(socket, { type: "error", error: "Intercom broker rate limit exceeded" });
-        socket.destroy(new Error("Intercom broker rate limit exceeded"));
+        writeMessage(socket, { type: "error", error: "Parley broker rate limit exceeded" });
+        socket.destroy(new Error("Parley broker rate limit exceeded"));
         return;
       }
 
@@ -681,7 +699,7 @@ class IntercomBroker {
         clearRegistrationTimeout();
         const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";
         if (requiresEndpointAuth && record?.stateId !== BROKER_STATE_ID) {
-          throw new Error("Invalid intercom TCP endpoint credentials");
+          throw new Error("Invalid parley TCP endpoint credentials");
         }
         const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
         if (!isBrokerDialPeerRequest(msg)) {
@@ -704,7 +722,7 @@ class IntercomBroker {
         clearRegistrationTimeout();
         const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";
         if (requiresEndpointAuth && record?.stateId !== BROKER_STATE_ID) {
-          throw new Error("Invalid intercom TCP endpoint credentials");
+          throw new Error("Invalid parley TCP endpoint credentials");
         }
         const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
         if (!isBrokerListScopesRequest(msg)) {
@@ -741,7 +759,7 @@ class IntercomBroker {
         clearRegistrationTimeout();
         const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";
         if (requiresEndpointAuth && record?.stateId !== BROKER_STATE_ID) {
-          throw new Error("Invalid intercom TCP endpoint credentials");
+          throw new Error("Invalid parley TCP endpoint credentials");
         }
         const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
         if (!isBrokerAcceptPeerRequest(msg)) {
@@ -767,7 +785,7 @@ class IntercomBroker {
 
       if (connectionRole === "unregistered" && claimedType === "peer_hello") {
         if (typeof LISTEN_TARGET !== "string") {
-          throw new Error("Invalid intercom TCP endpoint credentials");
+          throw new Error("Invalid parley TCP endpoint credentials");
         }
         connectionRole = "control";
         clearRegistrationTimeout();
@@ -910,7 +928,7 @@ class IntercomBroker {
       : mintFederationOriginId();
     this.federationOrigin = { originId, mintedAt: Date.now() };
     try {
-      persistFederationOrigin(INTERCOM_DIR, this.federationOrigin);
+      persistFederationOrigin(PARLEY_DIR, this.federationOrigin);
     } catch (error) {
       // Fail closed: the dial is refused, and because no identity persisted,
       // the next first use mints a fresh one. The in-process identity stays
@@ -1288,19 +1306,19 @@ class IntercomBroker {
         throw new Error("Invalid health message");
       }
       if (requiresEndpointAuth && !hasEndpointAuth) {
-        throw new Error("Invalid intercom TCP endpoint credentials");
+        throw new Error("Invalid parley TCP endpoint credentials");
       }
       writeMessage(socket, {
         type: "health_ok",
         requestId: clientMessage.requestId,
-        protocol: INTERCOM_PROTOCOL_NAME,
-        version: INTERCOM_PROTOCOL_VERSION,
+        protocol: PARLEY_PROTOCOL_NAME,
+        version: PARLEY_PROTOCOL_VERSION,
       });
       return;
     }
 
     if (requiresEndpointAuth && clientMessage.type === "register" && !hasEndpointAuth) {
-      throw new Error("Invalid intercom TCP endpoint credentials");
+      throw new Error("Invalid parley TCP endpoint credentials");
     }
 
     if (currentKey === null && clientMessage.type !== "register") {
@@ -1355,7 +1373,7 @@ class IntercomBroker {
         this.pruneMailboxMessages();
         const previous = this.sessions.get(key);
         if (!previous && this.sessions.size >= MAX_SESSIONS) {
-          writeMessage(socket, { type: "error", error: "Too many registered intercom sessions" });
+          writeMessage(socket, { type: "error", error: "Too many registered parley sessions" });
           socket.destroy();
           break;
         }
@@ -2052,7 +2070,7 @@ class IntercomBroker {
           // ACL fork: once advertised, the public name/alias-ness is a
           // deliberate, uniqueness-checked identity claim made through the
           // dedicated "advertise" exchange. Routine presence syncs (which fire
-          // on every intercom tool call and normally just re-report the live
+          // on every parley tool call and normally just re-report the live
           // runtime identity) must not silently revert it back to the
           // pre-advertise fallback name behind the caller's back.
           const identityLocked = session.info.advertised === true;
@@ -2533,8 +2551,8 @@ class IntercomBroker {
       expiresAt: createdAt + this.askTimeoutMs,
     };
     const filePath = scopedPendingAskRecordPath(from.scopeId, message.id);
-    writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { mode: INTERCOM_RUNTIME_FILE_MODE });
-    restrictIntercomRuntimeFile(filePath);
+    writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { mode: PARLEY_RUNTIME_FILE_MODE });
+    restrictParleyRuntimeFile(filePath);
   }
 
   private removePendingAskRecord(messageId: string, scopeId?: string): void {
@@ -3131,4 +3149,4 @@ class IntercomBroker {
   }
 }
 
-new IntercomBroker().start();
+new ParleyBroker().start();

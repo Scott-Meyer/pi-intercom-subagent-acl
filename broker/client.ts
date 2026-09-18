@@ -4,7 +4,7 @@ import { randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isPeerCompactionNotice, isSessionInfo } from "./protocol.ts";
-import { getIntercomScopeId } from "../config.ts";
+import { getParleyScopeId } from "../config.ts";
 import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
@@ -73,12 +73,12 @@ function toError(error: unknown): Error {
  * the existing onClose -> "disconnected" path drive reconnection.
  */
 function getLivenessIntervalMs(): number {
-  const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_INTERVAL_MS ?? "", 10);
+  const raw = Number.parseInt(process.env.PI_PARLEY_LIVENESS_INTERVAL_MS ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
 }
 
 function getLivenessTimeoutMs(): number {
-  const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_TIMEOUT_MS ?? "", 10);
+  const raw = Number.parseInt(process.env.PI_PARLEY_LIVENESS_TIMEOUT_MS ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, getLivenessIntervalMs()) : 5_000;
 }
 
@@ -88,7 +88,7 @@ function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
     : net.connect({ host: target.host, port: target.port });
 }
 
-export class IntercomClient extends EventEmitter {
+export class ParleyClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
   private _selfSession: SessionInfo | null = null;
@@ -300,7 +300,7 @@ export class IntercomClient extends EventEmitter {
       };
 
       const onReaderError = (error: Error) => {
-        const protocolError = new Error(`Intercom protocol error: ${error.message}`, { cause: error });
+        const protocolError = new Error(`Parley protocol error: ${error.message}`, { cause: error });
         if (!connectionEstablished) {
           onError(protocolError);
           return;
@@ -334,7 +334,7 @@ export class IntercomClient extends EventEmitter {
       this.once("_registered", onRegistered);
       
       try {
-        const scopeId = getIntercomScopeId();
+        const scopeId = getParleyScopeId();
         writeMessage(socket, {
           type: "register",
           session,

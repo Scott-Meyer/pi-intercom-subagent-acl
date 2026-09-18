@@ -3868,7 +3868,7 @@ test("Parley journal replay and model context ignore unrelated custom entry type
     assert.deepEqual(harness.entries.filter((entry) => entry.type === "parley_receiver_baseline_abandoned")
       .map((entry) => (entry.data as { token: string }).token), ["current-token"]);
 
-    const current = { role: "custom", ...envelope("parley_message", "context-id") };
+    const current = { role: "custom", ...envelope("parley_message", "context-id"), timestamp: 999 };
     const unrelated = { role: "custom", ...envelope("unrelated_message", "context-id") };
     const other = { role: "custom", ...envelope("other_message", "context-id") };
     const foreignNotice = { role: "custom", customType: "unrelated_persistence_notice", content: "Foreign notice" };
@@ -3876,8 +3876,8 @@ test("Parley journal replay and model context ignore unrelated custom entry type
       messages: [current, current, unrelated, unrelated, other, other, foreignNotice],
     });
     assert.deepEqual((result as { messages: unknown[] }).messages,
-      [current, unrelated, unrelated, other, other, foreignNotice],
-      "only Parley messages are deduplicated; foreign entries remain untouched");
+      [{ ...current, timestamp: 1 }, unrelated, unrelated, other, other, foreignNotice],
+      "only Parley messages are deduplicated and normalized to arrival timing; foreign entries remain untouched");
   } finally {
     await harness.emitLifecycle("session_shutdown").catch(() => undefined);
     await cleanup();

@@ -14,6 +14,7 @@ import {
   encodeOriginQualifiedSessionIdentity,
   isCanonicalFederationOriginId,
   isCanonicalFederationScopeAlias,
+  isFederationCorrelationId,
 } from "./federation-protocol.ts";
 
 import { PARLEY_PROTOCOL_NAME, PARLEY_PROTOCOL_VERSION } from "./paths.ts";
@@ -253,7 +254,9 @@ export function isSessionInfo(value: unknown): value is SessionInfo {
   if (value.federation !== undefined) {
     if (!isRecord(value.federation)) return false;
     const keys = Object.keys(value.federation);
-    if (!keys.every((key) => ["originId", "originLabel", "remoteScopeAlias", "remoteStableSessionId"].includes(key))) return false;
+    if (!keys.every((key) => ["originId", "originLabel", "remoteScopeAlias", "remoteStableSessionId", "conversation", "originEpoch"].includes(key))) return false;
+    if (value.federation.conversation !== undefined && typeof value.federation.conversation !== "boolean") return false;
+    if (value.federation.originEpoch !== undefined && !isFederationCorrelationId(value.federation.originEpoch)) return false;
     if (!isCanonicalFederationOriginId(value.federation.originId)
       || !isCanonicalFederationScopeAlias(value.federation.remoteScopeAlias)
       || typeof value.federation.remoteStableSessionId !== "string"

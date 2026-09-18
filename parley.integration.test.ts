@@ -47,11 +47,11 @@ process.on("exit", () => {
   rmSync(sharedHomeDir, { recursive: true, force: true });
 });
 
-async function withParleyConfig<T>(config: Record<string, unknown>, fn: () => T | Promise<T>): Promise<T> {
+async function withParleyConfig<T>(config: Record<string, unknown> | string, fn: () => T | Promise<T>): Promise<T> {
   const configPath = getConfigPath();
   const previous = existsSync(configPath) ? readFileSync(configPath, "utf-8") : undefined;
   mkdirSync(path.dirname(configPath), { recursive: true });
-  writeFileSync(configPath, JSON.stringify(config));
+  writeFileSync(configPath, typeof config === "string" ? config : JSON.stringify(config));
   try {
     return await fn();
   } finally {
@@ -2429,12 +2429,14 @@ test("extension outbox sends notify-only messages with trace and provenance", { 
 
     const [result] = await waitForOutboxResults(results, 1);
     assert.equal(result?.status, "sent");
-    assert.equal(result?.messageId, "outbox-success-1");
+    assert.equal(result?.requestId, "outbox-success-1");
+    assert.ok(result?.messageId);
+    assert.notEqual(result.messageId, result.requestId);
     const [, message] = await Promise.race([
       delivered,
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Timed out waiting for outbox delivery")), 3000)),
     ]);
-    assert.equal(message.id, "outbox-success-1");
+    assert.equal(message.id, result.messageId);
     assert.equal(message.content.text, "Outbox hello.");
     assert.deepEqual(message.provenance, {
       type: "extension_outbox",
@@ -2482,7 +2484,9 @@ test("extension outbox rejects duplicate request ids without duplicate delivery"
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(duplicate?.status, "rejected");
     assert.equal(duplicate?.code, "duplicate_request");
-    assert.equal(deliveredMessages.filter((message) => message.id === "outbox-duplicate-1").length, 1);
+    assert.equal(deliveredMessages.length, 1);
+    assert.equal(deliveredMessages[0]?.id, results[0]?.messageId);
+    assert.equal(deliveredMessages[0]?.provenance?.requestId, "outbox-duplicate-1");
   } finally {
     await harness.emitLifecycle("session_shutdown");
     await cleanup();
@@ -2617,6 +2621,12 @@ test("parley tool result hook marks failed details as errors", async () => {
   });
   assert.deepEqual(deliveryResults.filter(Boolean), [{ isError: true }]);
 
+  const invalidAnswerResults = await harness.emitLifecycleResults("tool_result", {
+    toolName: "contact_supervisor",
+    details: { error: true, delivered: false, outcomeKnown: false, replyMessageId: "received-invalid-answer" },
+  });
+  assert.deepEqual(invalidAnswerResults.filter(Boolean), [{ isError: true }], "a received answer does not erase an explicit structured-answer validation failure");
+
   const okResults = await harness.emitLifecycleResults("tool_result", {
     toolName: "parley",
     details: { delivered: true },
@@ -2721,6 +2731,14 @@ test("contact supervisor tool renders reason and reply state", async () => {
       details: { error: true },
     }, { isPartial: false }, renderTheme, { isError: false }));
     assert.match(failureText, /✗ Invalid reason/);
+
+    const invalidAnswer = renderToText(supervisorTool.renderResult({
+      content: [{ type: "text", text: "The received answer could not be validated" }],
+      details: { error: true, delivered: false, outcomeKnown: false, replyMessageId: "received-invalid-answer",
+        structuredReplyParseError: "reply JSON must include a responses array" },
+    }, { isPartial: false }, renderTheme, { isError: true }));
+    assert.match(invalidAnswer, /✗ The received answer could not be validated/);
+    assert.match(invalidAnswer, /Structured reply parse issue/);
   });
 });
 
@@ -5889,4 +5907,202 @@ test("known failed notification delivery preserves the pending ask", { concurren
     await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
+});
+
+test("parley command and shortcut open upstream UI contexts without a mode field", { concurrency: false }, async () => {
+  const { default: extension } = await import("./index.ts");
+  const { cleanup } = await setupClients();
+  let pickerCalls = 0;
+  const harness = createExtensionHarness("upstream-overlay", {
+    hasUI: true,
+    ui: {
+      custom: async (_factory: unknown, options: { overlay?: boolean }) => {
+        assert.equal(options.overlay, true);
+        pickerCalls++;
+        return undefined;
+      },
+      notify: () => undefined,
+    },
+  });
+  try {
+    assert.equal("mode" in harness.ctx, false);
+    extension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await harness.commands.get("parley")!("", harness.ctx);
+    await harness.shortcuts.get("alt+m")!(harness.ctx);
+    assert.equal(pickerCalls, 2);
+    await harness.commands.get("parley")!("", { ...harness.ctx, hasUI: false });
+    await harness.shortcuts.get("alt+m")!({ ...harness.ctx, mode: "rpc" });
+    assert.equal(pickerCalls, 2, "headless and explicitly non-TUI contexts do not open overlays");
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("independent outboxes can reuse request ids without losing reply or cancellation routes", { concurrency: false }, async () => {
+  const { default: extension } = await import("./index.ts");
+  const { planner, orchestrator, cleanup } = await setupClients();
+  const first = createExtensionHarness("outbox-first", { sessionId: "outbox-first-id" });
+  const second = createExtensionHarness("outbox-second", { sessionId: "outbox-second-id" });
+  const firstResults: ParleyOutboxResultV1[] = [];
+  const secondResults: ParleyOutboxResultV1[] = [];
+  const request = {
+    version: 1, requestId: "reused-request", extensionId: "example", extensionName: "Example",
+    message: "Independent notification.",
+  };
+  try {
+    first.pi.events.on(PARLEY_OUTBOX_RESULT_EVENT, (result) => firstResults.push(result as ParleyOutboxResultV1));
+    second.pi.events.on(PARLEY_OUTBOX_RESULT_EVENT, (result) => secondResults.push(result as ParleyOutboxResultV1));
+    extension(first.pi as never);
+    extension(second.pi as never);
+    await first.emitLifecycle("session_start");
+    await second.emitLifecycle("session_start");
+    const firstDelivery = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    first.pi.events.emit(PARLEY_OUTBOX_REQUEST_EVENT, { ...request, to: "planner" });
+    await waitForOutboxResults(firstResults, 1);
+    const [firstSender, firstMessage] = await firstDelivery;
+    const secondDelivery = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    second.pi.events.emit(PARLEY_OUTBOX_REQUEST_EVENT, { ...request, to: "orchestrator" });
+    await waitForOutboxResults(secondResults, 1);
+    const [secondSender, secondMessage] = await secondDelivery;
+    assert.equal(firstResults[0]?.status, "sent");
+    assert.equal(secondResults[0]?.status, "sent");
+    assert.equal(firstMessage.id, firstResults[0]?.messageId);
+    assert.equal(secondMessage.id, secondResults[0]?.messageId);
+    assert.notEqual(firstMessage.id, secondMessage.id);
+    assert.equal(firstMessage.provenance?.requestId, request.requestId);
+    assert.equal(secondMessage.provenance?.requestId, request.requestId);
+    assert.equal((await planner.send(firstSender.id, { text: "First reply.", replyTo: firstMessage.id })).delivered, true);
+    assert.equal((await orchestrator.send(secondSender.id, { text: "Second reply.", replyTo: secondMessage.id })).delivered, true);
+    await waitForVisibleText(first, "First reply.");
+    await waitForVisibleText(second, "Second reply.");
+    const controls: string[] = [];
+    planner.onBrokerMessage((message) => {
+      if (message.type === "message_control") controls.push(message.control.messageId);
+    });
+    const tool = first.tools.find((tool) => tool.name === "parley")!;
+    const cancelled = await tool.execute("cancel-first", { action: "cancel", messageId: firstMessage.id }, new AbortController().signal, undefined, first.ctx);
+    assert.equal(cancelled.details?.delivered, true);
+    const deadline = Date.now() + 3000;
+    while (!controls.includes(firstMessage.id) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(controls, [firstMessage.id]);
+  } finally {
+    await first.emitLifecycle("session_shutdown");
+    await second.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("never policy wakes only for outstanding completing answers, not ordinary or progress threads", { concurrency: false }, async () => {
+  await withParleyConfig({ inboundTrigger: "never" }, async () => {
+    const { default: extension } = await import("./index.ts");
+    const { planner, cleanup } = await setupClients();
+    const harness = createExtensionHarness("quiet-asker");
+    try {
+      extension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      const tool = harness.tools.find((tool) => tool.name === "parley")!;
+      const call = (params: Record<string, unknown>) => tool.execute("quiet-call", params, new AbortController().signal, undefined, harness.ctx);
+      const notify = await call({ action: "send", to: "planner", message: "Ordinary notice." });
+      const noticeId = visibleMessageId(modelText(notify));
+      const self = await waitForSessionByName(planner, "quiet-asker");
+      await planner.send(self.id, { text: "Ordinary threaded reply.", replyTo: noticeId });
+      await waitForVisibleText(harness, "Ordinary threaded reply.");
+      assert.equal(harness.sentMessages.at(-1)?.options?.deliverAs, "steer");
+      const ask = await call({ action: "ask", to: "planner", message: "Can I release?", blocking: false });
+      const askId = visibleMessageId(modelText(ask));
+      await planner.send(self.id, { text: "Still investigating.", replyTo: askId, completesAsk: false });
+      await waitForVisibleText(harness, "Still investigating.");
+      assert.equal(harness.sentMessages.at(-1)?.options?.deliverAs, "steer");
+      await planner.send(self.id, { text: "Which region?", replyTo: askId, expectsReply: true });
+      await waitForVisibleText(harness, "Which region?");
+      assert.equal(harness.sentMessages.at(-1)?.options?.deliverAs, "steer");
+      assert.deepEqual(((await call({ action: "status" })).details?.outstandingAsks as Array<{ messageId: string }>).map((ask) => ask.messageId), [askId],
+        "progress and clarification leave the question outstanding");
+      await planner.send(self.id, { text: "Approved.", replyTo: askId });
+      await waitForVisibleText(harness, "Approved.");
+      assert.equal(harness.sentMessages.at(-1)?.options?.triggerTurn, true);
+      assert.deepEqual((await call({ action: "status" })).details?.outstandingAsks, []);
+      await planner.send(self.id, { text: "Additional follow-up.", replyTo: askId });
+      await waitForVisibleText(harness, "Additional follow-up.");
+      assert.equal(harness.sentMessages.at(-1)?.options?.deliverAs, "steer", "settled asks do not keep bypassing the policy");
+    } finally {
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
+});
+
+test("invalid configuration logs and preserves answers and control delivery without unsolicited wakeups", { concurrency: false }, async () => {
+  for (const config of ["{invalid JSON", { confirmSend: true, inboundTrigger: "invalid" }]) {
+    await withParleyConfig(config, async () => {
+      const { default: extension } = await import("./index.ts");
+      const { planner, cleanup } = await setupClients();
+      const harness = createExtensionHarness("config-fallback");
+      const errors: string[] = [];
+      const previousError = console.error;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+      try {
+        extension(harness.pi as never);
+        assert.equal(errors.length, 1);
+        assert.match(errors[0]!, /Failed to load parley config/);
+        await harness.emitLifecycle("session_start");
+        const self = await waitForSessionByName(planner, "config-fallback");
+        const unsolicited = await planner.send(self.id, { text: "Unsolicited notice." });
+        await waitForVisibleText(harness, "Unsolicited notice.");
+        assert.equal(harness.sentMessages.at(-1)?.options?.deliverAs, "steer");
+        const results: ParleyOutboxResultV1[] = [];
+        harness.pi.events.on(PARLEY_OUTBOX_RESULT_EVENT, (result) => results.push(result as ParleyOutboxResultV1));
+        harness.pi.events.emit(PARLEY_OUTBOX_REQUEST_EVENT, {
+          version: 1, requestId: "fallback-outbox", extensionId: "example", extensionName: "Example",
+          to: "planner", message: "Do not bypass consent.",
+        });
+        await waitForOutboxResults(results, 1);
+        assert.equal(results[0]?.status, "blocked");
+        assert.equal(results[0]?.code, "confirmation_unavailable");
+        const tool = harness.tools.find((tool) => tool.name === "parley")!;
+        const ask = await tool.execute("fallback-ask", { action: "ask", to: "planner", message: "Requested answer?", blocking: false }, new AbortController().signal, undefined, harness.ctx);
+        const askId = visibleMessageId(modelText(ask));
+        await planner.send(self.id, { text: "Requested answer.", replyTo: askId });
+        await waitForVisibleText(harness, "Requested answer.");
+        assert.equal(harness.sentMessages.at(-1)?.options?.triggerTurn, true);
+        assert.equal((await planner.cancelMessage(unsolicited.id)).delivered, true);
+        const deadline = Date.now() + 3000;
+        while (!harness.sentMessages.some((entry) => entry.message.customType === "parley_message_control") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+        const control = harness.sentMessages.find((entry) => entry.message.customType === "parley_message_control");
+        assert.ok(control);
+        assert.equal(control.options?.triggerTurn, true);
+      } finally {
+        console.error = previousError;
+        await harness.emitLifecycle("session_shutdown");
+        await cleanup();
+      }
+    });
+  }
+});
+
+test("invalid unrelated configuration cannot enable an explicitly disabled extension", { concurrency: false }, async () => {
+  await withParleyConfig({ enabled: false, inboundTrigger: "invalid" }, async () => {
+    const { default: extension } = await import("./index.ts");
+    const { planner, cleanup } = await setupClients();
+    const harness = createExtensionHarness("disabled-fallback");
+    const errors: string[] = [];
+    const previousError = console.error;
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(" ")); };
+    try {
+      extension(harness.pi as never);
+      await harness.emitLifecycle("session_start");
+      await harness.emitLifecycle("turn_start");
+      const tool = harness.tools.find((tool) => tool.name === "parley")!;
+      const result = await tool.execute("disabled-list", { action: "list" }, new AbortController().signal, undefined, harness.ctx);
+      assert.match(modelText(result), /Parley disabled/);
+      assert.equal((await planner.listSessions()).some((session) => session.name === "disabled-fallback"), false);
+      assert.equal(errors.length, 1);
+    } finally {
+      console.error = previousError;
+      await harness.emitLifecycle("session_shutdown");
+      await cleanup();
+    }
+  });
 });

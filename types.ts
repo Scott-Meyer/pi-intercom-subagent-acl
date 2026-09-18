@@ -2,9 +2,18 @@ export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
 export const COMPACTION_AWARENESS_FEATURE = "compaction-awareness-v1";
 export const SESSION_PROFILE_FEATURE = "session-profile-v1";
+/** Local-client projection/preflight for negotiated single-hop remote text conversations. */
+export const FEDERATED_CONVERSATION_FEATURE = "federated-conversation-text-v1";
 /** Explicit ask completion, historical reply threading, supersession cleanup,
  * and requestId-correlated cancellation acknowledgements. */
 export const CONVERSATION_CONTRACT_FEATURE = "conversation-contract-v1";
+
+/** Broker preflight for a retained conversation identity; no delivery has occurred. */
+export interface PreparedConversation {
+  messageId: string;
+  author: SessionInfo;
+  recipient: SessionInfo;
+}
 
 export type DeliveryState = "socket_delivered" | "queued" | "failed" | "unknown";
 
@@ -107,6 +116,9 @@ export interface SessionInfo {
    *  The tuple is the canonical remote routing identity; labels remain display-only. */
   federation?: {
     originId: string;
+    /** Broker-authored negotiated capability, never a remote session claim. */
+    conversation?: boolean;
+    originEpoch?: string;
     originLabel?: string;
     remoteScopeAlias: string;
     remoteStableSessionId: string;
@@ -188,11 +200,12 @@ export type SessionRegistration = Omit<SessionInfo, "id" | "endpointEpoch" | "pe
 
 export type ClientMessage =
   | { type: "register"; session: SessionRegistration; sessionId?: string; stateId?: string; scopeId?: string; clientFeatures?: string[] }
+  | { type: "prepare_conversation"; requestId: string; to: string; messageId?: string; targetEpoch?: string }
   | { type: "unregister" }
   | { type: "extension_capabilities_update"; extensions: ExtensionCapability[] }
   | { type: "list"; requestId: string }
   | { type: "advertise"; requestId: string; name: string }
-  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string; contactKind?: "direct" | "broadcast" }
+  | { type: "send"; to: string; message: Message; targetId?: string; targetEpoch?: string; targetMode?: "resolved" | "snapshot"; contactKind?: "direct" | "broadcast" }
   | { type: "compaction_completed"; eventId: string }
   | { type: "direct_contact_seen"; token: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
@@ -217,6 +230,8 @@ export type ClientMessage =
 
 export type BrokerMessage =
   | { type: "registered"; sessionId: string; features: string[]; session?: SessionInfo }
+  | { type: "conversation_prepared"; requestId: string; prepared: PreparedConversation }
+  | { type: "conversation_prepare_failed"; requestId: string; code: string; error: string; outcomeKnown?: boolean }
   | { type: "direct_contact_recorded"; token: string }
   | { type: "direct_contact_unknown"; token: string }
   | { type: "compaction_recorded"; eventId: string; generation: number; compactedAt: number }

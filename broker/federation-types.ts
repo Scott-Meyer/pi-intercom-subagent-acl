@@ -13,6 +13,10 @@ export const FEDERATION_IDENTITY_FEATURE = "peer-identity-v1" as const;
 export const FEDERATION_SINGLE_HOP_FEATURE = "peer-single-hop-v1" as const;
 export const FEDERATION_ROSTER_FEATURE = "peer-roster-v1" as const;
 export const FEDERATION_SEND_FEATURE = "peer-send-v1" as const;
+/** Optional extension: endpoint-pinned sends and structured rebound failures. */
+export const FEDERATION_EXACT_SEND_FEATURE = "peer-send-exact-v1" as const;
+/** Optional single-hop text asks/replies with authenticated retained identity. */
+export const FEDERATION_CONVERSATION_FEATURE = "peer-conversation-text-v1" as const;
 export const FEDERATION_CAPABILITY_MIN_LENGTH = 32;
 export const FEDERATION_CAPABILITY_MAX_LENGTH = 128;
 export const FEDERATION_CORRELATION_ID_MAX_LENGTH = 128;
@@ -33,6 +37,8 @@ export const FEDERATION_SUPPORTED_FEATURES = [
   ...FEDERATION_REQUIRED_FEATURES,
   FEDERATION_ROSTER_FEATURE,
   FEDERATION_SEND_FEATURE,
+  FEDERATION_EXACT_SEND_FEATURE,
+  FEDERATION_CONVERSATION_FEATURE,
 ] as const;
 
 export type FederationRequiredFeature = typeof FEDERATION_REQUIRED_FEATURES[number];

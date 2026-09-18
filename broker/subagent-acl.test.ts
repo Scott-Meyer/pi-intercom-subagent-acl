@@ -184,6 +184,14 @@ test("subagent ACL: list/send scoping by supervisorSessionId and supervisorName 
     assert.equal(controlCharRejected.ok, false);
     assert.equal(controlCharRejected.code, "E_INVALID_NAME");
 
+    // Reserved federation identities are invalid public names, including
+    // after advertise's trimming. Rejection must not poison any live roster.
+    const reservedRejected = await childOfA.advertise("  oqs1.claimed-remote  ");
+    assert.equal(reservedRejected.ok, false);
+    assert.equal(reservedRejected.code, "E_INVALID_NAME");
+    assert.equal((await mainA.listSessions()).find((session) => session.id === childOfA.sessionId)?.advertised, undefined);
+    assert.ok(idsOf(await mainB.listSessions()).has(mainAId), "unrelated clients remain connected after rejected advertise");
+
     // Successful advertise: childOfA self-promotes.
     const advertised = await childOfA.advertise("child-a-public");
     assert.equal(advertised.ok, true);

@@ -2,7 +2,7 @@ import net from "net";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { createHash, randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.ts";
+import { writeMessage, createMessageReader, MAX_FRAME_BYTES } from "./framing.ts";
 import { isAuthoredMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
 import {
   getBrokerListenTarget,
@@ -17,7 +17,7 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, FEDERATED_CONVERSATION_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "../types.ts";
 import type { CancellationState, DeliveryDetails, DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, PeerCompactionNotice } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { BROKER_RUNTIME_OCCUPIED_EXIT_CODE, BrokerRuntimeOccupiedError, claimBrokerRuntime } from "./runtime-claim.ts";
@@ -46,6 +46,8 @@ import {
   persistFederationOrigin,
   type PersistedFederationOrigin,
 } from "./federation-origin.ts";
+import { FederationConversations, ConversationStoreError, decodeConversationMessageId, sameConversationEndpoint,
+  conversationCompletesAsk, type ConversationEndpoint } from "./federation-conversation.ts";
 import {
   FEDERATION_SEND_TEXT_MAX_LENGTH,
   isPeerSendRequest,
@@ -63,6 +65,8 @@ import {
   FEDERATION_REQUIRED_FEATURES,
   FEDERATION_ROSTER_FEATURE,
   FEDERATION_SEND_FEATURE,
+  FEDERATION_EXACT_SEND_FEATURE,
+  FEDERATION_CONVERSATION_FEATURE,
   type BrokerDialPeerRequest,
   type BrokerListScopesResult,
   type BrokerScopeSummary,
@@ -124,6 +128,8 @@ interface ConnectedSession {
 }
 
 interface DeliveryRecord {
+  senderKey: string;
+  messageId: string;
   fingerprint: string;
   recipient?: SessionInfo;
   cancellation?: CancellationState;
@@ -353,6 +359,8 @@ class ParleyBroker {
   private collaborationState: CollaborationStateStore;
   private peerLinks: PeerLinkManager;
   private federationRoster: FederationRosterState;
+  private readonly federationOriginEpoch = randomUUID();
+  private readonly federationConversations = new FederationConversations(join(PARLEY_DIR, "conversation-dispatches"));
   private federationOrigin: PersistedFederationOrigin | undefined;
   private federationSendDedup = new Map<string, PeerSendDedup>();
   private federationPendingSends = new PendingPeerSendTracker();
@@ -383,9 +391,9 @@ class ParleyBroker {
       onPeerMessage: (link, value) => this.handleFederationPeerMessage(link, value),
     });
     this.federationRoster = new FederationRosterState({
-      originEpoch: randomUUID(),
+      originEpoch: this.federationOriginEpoch,
       listLocalSessions: () => this.listLocallyOwnedFederationSessions(),
-      send: (link, frame) => writeMessage(link.socket, frame),
+      send: (link, frame) => this.writeBrokerFrame(link.socket, frame),
       onImportedChange: (change) => this.handleImportedRosterChange(change),
       onLinkError: (link, error) => link.socket.destroy(error),
     });
@@ -397,6 +405,32 @@ class ParleyBroker {
       }
     }
     this.server = net.createServer(this.handleConnection.bind(this));
+  }
+
+  /** New provenance metadata is opt-in for local clients: older validators
+   * accept only the original strict federation tuple. Peer roster frames never
+   * carry these local projection fields. */
+  private writeBrokerFrame(socket: net.Socket, value: unknown): void {
+    const client = [...this.sessions.values()].find(session => session.socket === socket);
+    if (client && !client.clientFeatures.has(FEDERATED_CONVERSATION_FEATURE) && isRecord(value)) {
+      const project = (session: unknown): unknown => {
+        if (!isRecord(session) || !isRecord(session.federation)) return session;
+        const { conversation: _conversation, originEpoch: _originEpoch, ...federation } = session.federation;
+        return { ...session, federation };
+      };
+      value = { ...value,
+        ...(value.session ? { session: project(value.session) } : {}),
+        ...(value.from ? { from: project(value.from) } : {}),
+        ...(value.recipient ? { recipient: project(value.recipient) } : {}),
+        ...(Array.isArray(value.sessions) ? { sessions: value.sessions.map(project) } : {}),
+      };
+    }
+    writeMessage(socket, value);
+  }
+
+  private supportsRemoteConversations(session: ConnectedSession): boolean {
+    return [FEDERATED_CONVERSATION_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE]
+      .every(feature => session.clientFeatures.has(feature));
   }
 
   private supportsCompactionAwareness(session: ConnectedSession): boolean {
@@ -432,14 +466,13 @@ class ParleyBroker {
     };
   }
 
-  private trackDirectContact(observerKey: string, plan: DirectContactPlan): string {
+  private trackDirectContact(observerKey: string, plan: DirectContactPlan, token = randomUUID()): string {
     this.prunePendingDirectContacts();
     while (this.pendingDirectContacts.size >= MAX_PENDING_DIRECT_CONTACTS) {
       const oldest = this.pendingDirectContacts.keys().next().value;
       if (oldest === undefined) break;
       this.pendingDirectContacts.delete(oldest);
     }
-    const token = randomUUID();
     if (plan.durableBaseline) {
       this.collaborationState.stageFirstContactBaseline(
         plan.scopeId,
@@ -621,7 +654,7 @@ class ParleyBroker {
         && "type" in msg
         && msg.type === "direct_contact_seen";
       if (!(isDirectContactAck ? this.consumeAckToken(connection) : this.consumeToken(connection))) {
-        writeMessage(socket, { type: "error", error: "Parley broker rate limit exceeded" });
+        this.writeBrokerFrame(socket, { type: "error", error: "Parley broker rate limit exceeded" });
         socket.destroy(new Error("Parley broker rate limit exceeded"));
         return;
       }
@@ -650,7 +683,7 @@ class ParleyBroker {
             : FEDERATION_REQUIRED_FEATURES.some((feature) => !features.includes(feature))
               ? "E_FEATURE_UNSUPPORTED"
               : "E_INVALID_REQUEST";
-          writeMessage(socket, {
+          this.writeBrokerFrame(socket, {
             type: "peer_hello_ack",
             protocol: FEDERATION_PROTOCOL_NAME,
             version: FEDERATION_PROTOCOL_VERSION,
@@ -670,7 +703,7 @@ class ParleyBroker {
         }
         const accepted = this.peerLinks.acceptInbound(socket, msg, preparedPeer);
         preparedPeer = null;
-        writeMessage(socket, accepted.ack);
+        this.writeBrokerFrame(socket, accepted.ack);
         if (!accepted.link) {
           connectionRole = "control";
           socket.end();
@@ -691,8 +724,8 @@ class ParleyBroker {
         }
         const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
         if (!isBrokerDialPeerRequest(msg)) {
-          if (requestId) writeMessage(socket, { type: "broker_dial_peer_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker dial peer request" });
-          else writeMessage(socket, { type: "error", error: "Invalid broker dial peer request" });
+          if (requestId) this.writeBrokerFrame(socket, { type: "broker_dial_peer_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker dial peer request" });
+          else this.writeBrokerFrame(socket, { type: "error", error: "Invalid broker dial peer request" });
           socket.end();
           return;
         }
@@ -714,8 +747,8 @@ class ParleyBroker {
         }
         const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
         if (!isBrokerListScopesRequest(msg)) {
-          if (requestId) writeMessage(socket, { type: "broker_list_scopes_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker list scopes request" });
-          else writeMessage(socket, { type: "error", error: "Invalid broker list scopes request" });
+          if (requestId) this.writeBrokerFrame(socket, { type: "broker_list_scopes_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker list scopes request" });
+          else this.writeBrokerFrame(socket, { type: "error", error: "Invalid broker list scopes request" });
           socket.end();
           return;
         }
@@ -737,7 +770,7 @@ class ParleyBroker {
             error: error instanceof Error ? error.message : String(error),
           };
         }
-        writeMessage(socket, result);
+        this.writeBrokerFrame(socket, result);
         socket.end();
         return;
       }
@@ -751,8 +784,8 @@ class ParleyBroker {
         }
         const requestId = record && isFederationCorrelationId(record.requestId) ? record.requestId : undefined;
         if (!isBrokerAcceptPeerRequest(msg)) {
-          if (requestId) writeMessage(socket, { type: "broker_accept_peer_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker accept peer request" });
-          else writeMessage(socket, { type: "error", error: "Invalid broker accept peer request" });
+          if (requestId) this.writeBrokerFrame(socket, { type: "broker_accept_peer_result", requestId, ok: false, code: "E_INVALID_REQUEST", error: "Invalid broker accept peer request" });
+          else this.writeBrokerFrame(socket, { type: "error", error: "Invalid broker accept peer request" });
           socket.end();
           return;
         }
@@ -762,10 +795,10 @@ class ParleyBroker {
           connectionRole = "peer-prepared";
           this.cancelShutdownTimer();
           armRegistrationTimeout(PEER_PREPARED_TIMEOUT_MS);
-          writeMessage(socket, { type: "broker_accept_peer_result", requestId: msg.requestId, ok: true, linkId: msg.linkId });
+          this.writeBrokerFrame(socket, { type: "broker_accept_peer_result", requestId: msg.requestId, ok: true, linkId: msg.linkId });
         } catch (error) {
           const failure = error instanceof FederationPeerError ? error : new FederationPeerError("E_INVALID_REQUEST", "Peer preparation failed", { cause: error });
-          writeMessage(socket, { type: "broker_accept_peer_result", requestId: msg.requestId, ok: false, code: failure.code, error: failure.message });
+          this.writeBrokerFrame(socket, { type: "broker_accept_peer_result", requestId: msg.requestId, ok: false, code: failure.code, error: failure.message });
           socket.end();
         }
         return;
@@ -778,7 +811,7 @@ class ParleyBroker {
         connectionRole = "control";
         clearRegistrationTimeout();
         if (record && isFederationCorrelationId(record.linkId)) {
-          writeMessage(socket, {
+          this.writeBrokerFrame(socket, {
             type: "peer_hello_ack",
             protocol: FEDERATION_PROTOCOL_NAME,
             version: FEDERATION_PROTOCOL_VERSION,
@@ -898,6 +931,7 @@ class ParleyBroker {
     return [...this.sessions.values()].map((session) => ({
       ownership: "local" as const,
       exportEligible: !isRestrictedSubagent(session.info),
+      conversationCapable: this.supportsRemoteConversations(session),
       localScopeId: session.scopeId ?? null,
       info: session.info,
     }));
@@ -965,6 +999,18 @@ class ParleyBroker {
     }
   }
 
+  private conversationEndpoints(link: FederationPeerLink, local: ConnectedSession, imported: ImportedFederatedSession): { local: ConversationEndpoint; remote: ConversationEndpoint } | undefined {
+    const tuple = this.federationRoster.findExportedTuple(link.linkId, local.scopeId ?? null, local.info.id);
+    if (!tuple || !this.supportsRemoteConversations(local) || !local.info.endpointEpoch || !imported.info.endpointEpoch) return;
+    return {
+      local: { originId: link.localOrigin.id, originEpoch: this.federationOriginEpoch,
+        scopeAlias: tuple.scopeAlias, stableSessionId: tuple.stableSessionId, endpointEpoch: local.info.endpointEpoch },
+      remote: { originId: link.remoteOrigin.id, originEpoch: imported.originEpoch,
+        scopeAlias: imported.info.federation.remoteScopeAlias, stableSessionId: imported.info.federation.remoteStableSessionId,
+        endpointEpoch: imported.info.endpointEpoch },
+    };
+  }
+
   /** Destination side: resolve a peer send against broker-authoritative state and deliver. */
   private handleFederationPeerSend(link: FederationPeerLink, frame: PeerSendRequest): void {
     if (!link.features.includes(FEDERATION_SEND_FEATURE) || !link.features.includes(FEDERATION_ROSTER_FEATURE)) {
@@ -974,7 +1020,7 @@ class ParleyBroker {
       throw new FederationPeerError("E_ORIGIN_MISMATCH", "Routed send origin does not match the peer link");
     }
     const fail = (code: PeerSendFailureCode, error: string): void => {
-      writeMessage(link.socket, this.peerSendResultFrame(link, frame.sendId, false, code, error));
+      this.writeBrokerFrame(link.socket, this.peerSendResultFrame(link, frame.sendId, false, code, error));
     };
     let dedup = this.federationSendDedup.get(link.linkId);
     if (!dedup) {
@@ -1006,19 +1052,69 @@ class ParleyBroker {
       fail("E_SEND_TARGET_NOT_FOUND", "Target session is not visible to the sending session on this broker");
       return;
     }
+    if (frame.targetEndpointEpoch !== undefined) {
+      if (!link.features.includes(FEDERATION_EXACT_SEND_FEATURE)) {
+        fail("E_SEND_UNSUPPORTED", "Endpoint-pinned delivery was not negotiated on this link");
+        return;
+      }
+      if (target.info.endpointEpoch !== frame.targetEndpointEpoch) {
+        fail("E_SEND_TARGET_REBOUND", "Target endpoint changed before delivery");
+        return;
+      }
+    }
+    const conversation = frame.senderOriginEpoch !== undefined;
+    if (!conversation && sender.info.federation.conversation && this.supportsRemoteConversations(target)) {
+      fail("E_SEND_INVALID", "Capable endpoints require an author-qualified conversation envelope"); return;
+    }
+    let endpoints: ReturnType<ParleyBroker["conversationEndpoints"]>;
+    if (conversation) {
+      if (!sender.info.federation.conversation || !this.supportsRemoteConversations(target)) {
+        fail("E_SEND_UNSUPPORTED", "Text conversations are not supported by both endpoints"); return;
+      }
+      endpoints = this.conversationEndpoints(link, target, sender);
+      const identity = decodeConversationMessageId(frame.message.id);
+      if (!endpoints || !identity || !sameConversationEndpoint(identity, endpoints.remote)
+        || frame.senderOriginEpoch !== endpoints.remote.originEpoch
+        || frame.senderEndpointEpoch !== endpoints.remote.endpointEpoch) {
+        fail("E_SEND_UNAUTHORIZED", "Conversation author incarnation does not match the sending endpoint"); return;
+      }
+      if (frame.targetOriginEpoch !== endpoints.local.originEpoch) {
+        fail("E_SEND_TARGET_REBOUND", "Target broker incarnation changed before delivery"); return;
+      }
+      if (frame.message.replyTo && !this.federationConversations.permitsReply(frame.message.replyTo, endpoints.remote, endpoints.local)) {
+        fail("E_SEND_UNAUTHORIZED", "Reply does not reverse a recorded conversation edge at these endpoint incarnations"); return;
+      }
+    }
     const now = Date.now();
-    writeMessage(target.socket, {
-      type: "message",
-      from: sender.info,
-      message: {
-        id: frame.message.id,
-        timestamp: frame.message.timestamp,
-        brokerReceivedAt: now,
-        brokerDeliveredAt: now,
-        content: { text: frame.message.text },
-      },
-    });
-    writeMessage(link.socket, this.peerSendResultFrame(link, frame.sendId, true, undefined, undefined, now));
+    const deliveredMessage: Message = {
+      id: frame.message.id,
+      timestamp: frame.message.timestamp,
+      brokerReceivedAt: now,
+      brokerDeliveredAt: now,
+      content: { text: frame.message.text },
+      ...(conversation ? {
+        ...(frame.message.replyTo ? { replyTo: frame.message.replyTo, completesAsk: conversationCompletesAsk(frame.message) } : {}),
+        ...(frame.message.expectsReply !== undefined ? { expectsReply: frame.message.expectsReply } : {}),
+        ...(frame.message.senderWaitMode ? { senderWaitMode: frame.message.senderWaitMode } : {}),
+        ...(frame.message.expectsReply ? { replyDeadline: now + this.askTimeoutMs } : {}),
+      } : {}),
+    };
+    if (!this.deliveryEnvelopeFits(sender.info, deliveredMessage)) {
+      fail("E_SEND_INVALID", "Message exceeds the enriched delivery frame limit");
+      return;
+    }
+    {
+      const dispatchId = conversation ? frame.message.id : JSON.stringify(["incoming", frame.originId, frame.senderScopeAlias, frame.senderStableSessionId, frame.message.id]);
+      try {
+        if (this.federationConversations.beginDispatch(dispatchId) === "existing") {
+          fail("E_SEND_DUPLICATE", "This retained message may already have been delivered"); return;
+        }
+      } catch { fail("E_SEND_INVALID", "Could not persist the conversation dispatch barrier"); return; }
+      // Recorded before writing: a fast reply can arrive before delivery ACK.
+      if (conversation && endpoints) this.federationConversations.retain(frame.message.id, endpoints.remote, endpoints.local);
+    }
+    this.writeBrokerFrame(target.socket, { type: "message", from: sender.info, message: deliveredMessage });
+    this.writeBrokerFrame(link.socket, this.peerSendResultFrame(link, frame.sendId, true, undefined, undefined, now));
   }
 
   /** Origin side: a correlated result is the only acceptance of delivery. */
@@ -1045,11 +1141,18 @@ class ParleyBroker {
       if (session) this.writeDeliverySuccess(session.socket, pending.messageId, "socket_delivered", undefined, undefined, { recipient: pending.recipient });
       return;
     }
+    if (pending.dispatchId && frame.code !== "E_SEND_DUPLICATE") {
+      try { this.federationConversations.settleNotDelivered(pending.dispatchId, pending.dispatchAlias); }
+      catch {
+        this.failPendingFederatedSend(pending, "Destination confirmed nondelivery, but retry admission could not be persisted", "E_CONVERSATION_PERSISTENCE", false, true);
+        return;
+      }
+    }
     this.failPendingFederatedSend(
       pending,
       frame.error,
-      frame.code,
-      frame.code === "E_SEND_TARGET_DISCONNECTED",
+      frame.code === "E_SEND_TARGET_REBOUND" ? "E_TARGET_REBOUND" : frame.code,
+      frame.code === "E_SEND_TARGET_DISCONNECTED" || frame.code === "E_SEND_TARGET_REBOUND",
       frame.code !== "E_SEND_DUPLICATE",
     );
   }
@@ -1115,9 +1218,19 @@ class ParleyBroker {
     message: Message,
     contactKind: "direct" | "broadcast",
     imported: ImportedFederatedSession,
+    targetEndpointEpoch?: string,
+    allowLegacyResolution = false,
   ): void {
+    // A retained verdict belongs to the authored operation, not today's link
+    // capabilities. Consult it before current-route validation can overwrite it.
+    const fingerprint = this.deliveryFingerprint(message, qualifiedId, contactKind);
+    const inFlightKey = JSON.stringify([currentKey, message.id]);
+    if (this.federationInFlightMessageIds.has(inFlightKey)) {
+      this.writeDeliveryFailure(socket, message.id, "A delivery for this message id is already in flight; its outcome is not yet known", "E_MESSAGE_ID_REUSE", false, false, { recipient: imported.info });
+      return;
+    }
+    if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) return;
     const reject = (reason: string, code: string, retryable = false): void => {
-      const fingerprint = this.deliveryFingerprint(message, qualifiedId, contactKind);
       this.recordDelivery(currentKey, message.id, fingerprint, "failed", reason, code, retryable);
       this.writeDeliveryFailure(socket, message.id, reason, code, retryable);
     };
@@ -1125,8 +1238,8 @@ class ParleyBroker {
       reject("Broadcast remains host-local in federation v1", "E_INVALID_MESSAGE");
       return;
     }
-    if (message.expectsReply || message.replyTo || message.supersedes) {
-      reject("Remote asks, replies, and supersession arrive in a later federation slice", "E_INVALID_MESSAGE");
+    if (message.supersedes) {
+      reject("Remote supersession is not supported", "E_INVALID_MESSAGE");
       return;
     }
     if (message.content.attachments?.length) {
@@ -1142,6 +1255,16 @@ class ParleyBroker {
       reject("Remote session is roster-only on this link until both brokers negotiate routed delivery", "E_TARGET_NOT_FOUND");
       return;
     }
+    if (targetEndpointEpoch !== undefined && !link.features.includes(FEDERATION_EXACT_SEND_FEATURE)) {
+      if (!allowLegacyResolution) {
+        reject("Remote broker does not support endpoint-pinned delivery", "E_SEND_UNSUPPORTED");
+        return;
+      }
+      // Ordinary discovery remains compatible with peer-send-v1. Unlike a
+      // caller-owned snapshot, it permits re-resolution: origin validation
+      // above still applies, but legacy destinations cannot enforce the pin.
+      targetEndpointEpoch = undefined;
+    }
     // The sender must be exported on that link; restricted subagents and other
     // hidden sessions are not visible to remote peers.
     const senderTuple = this.federationRoster.findExportedTuple(link.linkId, fromSession.scopeId ?? null, fromSession.info.id);
@@ -1149,20 +1272,50 @@ class ParleyBroker {
       reject("This session is not visible to remote peers", "E_SEND_UNAUTHORIZED");
       return;
     }
-    const fingerprint = this.deliveryFingerprint(message, qualifiedId, contactKind);
-    const inFlightKey = JSON.stringify([currentKey, message.id]);
-    if (this.federationInFlightMessageIds.has(inFlightKey)) {
-      this.writeDeliveryFailure(socket, message.id, "A delivery for this message id is already in flight; its outcome is not yet known", "E_MESSAGE_ID_REUSE", false, false, { recipient: imported.info });
-      return;
-    }
-    if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
-      return;
+    const identity = decodeConversationMessageId(message.id);
+    const conversation = Boolean(identity || message.expectsReply || message.replyTo
+      || (this.supportsRemoteConversations(fromSession) && imported.info.federation.conversation));
+    const endpoints = conversation ? this.conversationEndpoints(link, fromSession, imported) : undefined;
+    if (conversation) {
+      if (!imported.info.federation.conversation) { reject("Remote peer does not support text conversations", "E_SEND_UNSUPPORTED"); return; }
+      if (!identity || !endpoints || !sameConversationEndpoint(identity, endpoints.local)) {
+        reject("Conversation ID does not authenticate this author incarnation; preflight is required", "E_CONVERSATION_AUTHOR"); return;
+      }
+      if (!this.federationConversations.isPrepared(message.id, endpoints.local, endpoints.remote)) {
+        reject("Conversation preparation does not match these author and recipient incarnations", "E_CONVERSATION_TARGET"); return;
+      }
+      if (message.replyTo && !this.federationConversations.permitsReply(message.replyTo, endpoints.local, endpoints.remote)) {
+        reject("Reply does not reverse a recorded conversation edge at these endpoint incarnations", "E_REPLY_TARGET"); return;
+      }
+      targetEndpointEpoch = endpoints.remote.endpointEpoch;
     }
     const sendId = randomUUID();
+    // The durable source owner is the authenticated local namespace, not a
+    // currently connected link's public alias. Recovery needs no live peer.
+    const dispatchId = JSON.stringify(["outgoing", currentKey, message.id]);
+    // A canonical recheck may follow edge eviction. Recover its immutable
+    // scalar association from the journal, not the prunable preparation map.
+    const aliasCandidate = conversation ? this.federationConversations.preparedScalarAlias(message.id) ?? identity?.nonce : undefined;
+    const candidateDispatchAlias = aliasCandidate !== undefined ? JSON.stringify(["outgoing", currentKey, aliasCandidate]) : undefined;
+    let dispatchAlias: string | undefined;
+    try {
+      if (candidateDispatchAlias !== undefined && this.federationConversations.hasDispatchAlias(dispatchId, candidateDispatchAlias)) {
+        dispatchAlias = candidateDispatchAlias;
+      }
+    } catch (error) {
+      this.writeDeliveryFailure(socket, message.id, (error as Error).message, "E_CONVERSATION_STATE_FAILURE", false, false); return;
+    }
+    const acceptedPartner = this.partnerDeliveryRecords(currentKey, message.id).some(([, record]) =>
+      record.state === "socket_delivered" || record.state === "queued");
+    if (acceptedPartner) {
+      reject("An associated caller identity was already accepted; it cannot be dispatched as a new operation", "E_MESSAGE_ID_REUSE"); return;
+    }
     const pending = this.federationPendingSends.add(sendId, {
       linkId: link.linkId,
       messageId: message.id,
       senderKey: currentKey,
+      dispatchId,
+      ...(dispatchAlias !== undefined ? { dispatchAlias } : {}),
       recipient: { ...imported.info },
       fingerprint,
     });
@@ -1180,10 +1333,18 @@ class ParleyBroker {
       senderStableSessionId: senderTuple.stableSessionId,
       targetScopeAlias: imported.info.federation.remoteScopeAlias,
       targetStableSessionId: imported.info.federation.remoteStableSessionId,
+      ...(targetEndpointEpoch !== undefined ? { targetEndpointEpoch } : {}),
+      ...(conversation && endpoints ? { senderEndpointEpoch: endpoints.local.endpointEpoch,
+        senderOriginEpoch: endpoints.local.originEpoch, targetOriginEpoch: endpoints.remote.originEpoch } : {}),
       message: {
         id: message.id,
         timestamp: message.timestamp,
         text: message.content.text,
+        ...(conversation ? {
+          ...(message.replyTo ? { replyTo: message.replyTo, completesAsk: conversationCompletesAsk(message) } : {}),
+          ...(message.expectsReply !== undefined ? { expectsReply: message.expectsReply } : {}),
+          ...(message.senderWaitMode ? { senderWaitMode: message.senderWaitMode } : {}),
+        } : {}),
       },
     };
     if (!isPeerSendRequest(frame)) {
@@ -1191,9 +1352,25 @@ class ParleyBroker {
       reject("Message cannot be represented safely for federated delivery", "E_INVALID_MESSAGE");
       return;
     }
+    {
+      try {
+        if (this.federationConversations.beginDispatch(dispatchId, dispatchAlias) === "existing") {
+          this.federationPendingSends.resolve(sendId);
+          this.failPendingFederatedSend(pending, "This retained message may already have been dispatched", "E_DELIVERY_UNKNOWN", false, false);
+          return;
+        }
+      } catch (error) {
+        this.federationPendingSends.resolve(sendId);
+        reject(error instanceof ConversationStoreError ? error.message : "Could not persist the conversation dispatch barrier; no peer frame was written",
+          error instanceof ConversationStoreError ? error.code : "E_CONVERSATION_PERSISTENCE"); return;
+      }
+      this.invalidatePartnerDeliveryRecords(currentKey, message.id);
+      if (conversation && endpoints) this.federationConversations.retain(message.id, endpoints.local, endpoints.remote);
+      this.recordDelivery(currentKey, message.id, fingerprint, "unknown", "Conversation was dispatched; acknowledgement is pending", "E_DELIVERY_UNKNOWN", false, undefined, undefined, undefined, imported.info);
+    }
     this.federationInFlightMessageIds.add(inFlightKey);
     try {
-      writeMessage(link.socket, frame);
+      this.writeBrokerFrame(link.socket, frame);
     } catch (error) {
       this.federationPendingSends.resolve(sendId);
       this.failPendingFederatedSend(pending, `Federation send write failed: ${error instanceof Error ? error.message : String(error)}; delivery may have occurred`, "E_DELIVERY_UNKNOWN", false, false);
@@ -1239,7 +1416,7 @@ class ParleyBroker {
       const link = await this.peerLinks.dial(request, signal);
       if (socket.writable && !socket.destroyed) {
         try {
-          writeMessage(socket, {
+          this.writeBrokerFrame(socket, {
             type: "broker_dial_peer_result",
             requestId: request.requestId,
             ok: true,
@@ -1258,7 +1435,7 @@ class ParleyBroker {
         : new FederationPeerError("E_DIAL_FAILED", "Peer dial failed", { cause: error });
       if (socket.writable && !socket.destroyed) {
         try {
-          writeMessage(socket, {
+          this.writeBrokerFrame(socket, {
             type: "broker_dial_peer_result",
             requestId: request.requestId,
             ok: false,
@@ -1296,7 +1473,7 @@ class ParleyBroker {
       if (requiresEndpointAuth && !hasEndpointAuth) {
         throw new Error("Invalid parley TCP endpoint credentials");
       }
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "health_ok",
         requestId: clientMessage.requestId,
         protocol: PARLEY_PROTOCOL_NAME,
@@ -1366,7 +1543,7 @@ class ParleyBroker {
         this.pruneMailboxMessages();
         const previous = this.sessions.get(key);
         if (!previous && this.sessions.size >= MAX_SESSIONS) {
-          writeMessage(socket, { type: "error", error: "Too many registered parley sessions" });
+          this.writeBrokerFrame(socket, { type: "error", error: "Too many registered parley sessions" });
           socket.destroy();
           break;
         }
@@ -1413,10 +1590,10 @@ class ParleyBroker {
 
         // Registration is the first response; clients validate their required
         // conversation capabilities before issuing operations.
-        writeMessage(socket, {
+        this.writeBrokerFrame(socket, {
           type: "registered",
           sessionId: id,
-          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, COMPACTION_AWARENESS_FEATURE, SESSION_PROFILE_FEATURE, CONVERSATION_CONTRACT_FEATURE],
+          features: [EXTENSION_BUS_FEATURE, EXACT_SEND_FEATURE, COMPACTION_AWARENESS_FEATURE, SESSION_PROFILE_FEATURE, CONVERSATION_CONTRACT_FEATURE, FEDERATED_CONVERSATION_FEATURE],
           session: info,
         });
         this.broadcastScoped({ type: "session_joined", session: info }, info, key, scopeId);
@@ -1428,14 +1605,14 @@ class ParleyBroker {
         if (extensions) {
           for (const ext of extensions) {
             const owner = this.namespaceOwners.get(scopedExtensionKey(scopeId, ext.namespace));
-            writeMessage(socket, {
+            this.writeBrokerFrame(socket, {
               type: "extension_owner",
               namespace: ext.namespace,
               ...(owner ? { ownerId: owner.sessionId, ownerEpoch: owner.epoch } : {}),
             });
             const state = this.extensionStateManager.loadState(scopedExtensionStateNamespace(scopeId, ext.namespace));
             if (state) {
-              writeMessage(socket, {
+              this.writeBrokerFrame(socket, {
                 type: "extension_state",
                 namespace: ext.namespace,
                 revision: state.revision,
@@ -1492,14 +1669,14 @@ class ParleyBroker {
         this.recomputeNamespaceOwners();
         for (const extension of extensions) {
           const owner = this.namespaceOwners.get(scopedExtensionKey(session.scopeId, extension.namespace));
-          writeMessage(socket, {
+          this.writeBrokerFrame(socket, {
             type: "extension_owner",
             namespace: extension.namespace,
             ...(owner ? { ownerId: owner.sessionId, ownerEpoch: owner.epoch } : {}),
           });
           const state = this.extensionStateManager.loadState(scopedExtensionStateNamespace(session.scopeId, extension.namespace));
           if (state) {
-            writeMessage(socket, {
+            this.writeBrokerFrame(socket, {
               type: "extension_state",
               namespace: extension.namespace,
               revision: state.revision,
@@ -1507,6 +1684,76 @@ class ParleyBroker {
             });
           }
         }
+        break;
+      }
+
+      case "prepare_conversation": {
+        const requester = currentKey ? this.sessions.get(currentKey) : undefined;
+        if (!requester || requester.socket !== socket) throw new Error("Conversation preflight requires registration");
+        if (typeof clientMessage.requestId !== "string") throw new Error("Invalid conversation preflight correlation");
+        const fail = (code: string, error: string, outcomeKnown = true) => this.writeBrokerFrame(socket, {
+          type: "conversation_prepare_failed", requestId: clientMessage.requestId as string, code, error, outcomeKnown,
+        });
+        if (!requester.clientFeatures.has(FEDERATED_CONVERSATION_FEATURE)) { fail("E_SEND_UNSUPPORTED", "Client did not negotiate remote conversation preflight"); break; }
+        if (typeof clientMessage.to !== "string" || (clientMessage.messageId !== undefined && typeof clientMessage.messageId !== "string")
+          || (clientMessage.targetEpoch !== undefined && typeof clientMessage.targetEpoch !== "string")) {
+          fail("E_INVALID_TARGET", "Invalid conversation preflight"); break;
+        }
+        let recipient: SessionInfo | undefined;
+        let messageId = clientMessage.messageId as string | undefined;
+        if (messageId !== undefined) {
+          // Preflight must not rename a retained scalar instruction into a new
+          // canonical identity and thereby bypass its prior-attempt barrier.
+          this.pruneDeliveryRecords();
+          const record = this.deliveryRecords.get(this.deliveryRecordKey(requester.key, messageId));
+          if (record?.state === "unknown") {
+            fail("E_DELIVERY_UNKNOWN", "Previous delivery outcome is unknown; its identity cannot be converted", false); break;
+          }
+          if (record && (record.state === "socket_delivered" || record.state === "queued") && !decodeConversationMessageId(messageId)) {
+            fail("E_MESSAGE_ID_REUSE", "An already-accepted scalar identity cannot be converted into a new conversation identity"); break;
+          }
+          try {
+            if (this.hasPriorOutgoingDispatch(requester.key, messageId)) {
+              if (record) {
+                if (!decodeConversationMessageId(messageId)) {
+                  fail("E_MESSAGE_ID_REUSE", "An already-dispatched scalar identity cannot be converted into a new conversation identity"); break;
+                }
+              } else {
+                fail("E_DELIVERY_UNKNOWN", "This retained message was dispatched before; its outcome is unknown and its identity cannot be converted", false); break;
+              }
+            }
+          } catch (error) {
+            fail("E_CONVERSATION_STATE_FAILURE", (error as Error).message, false); break;
+          }
+        }
+        const imported = this.federationRoster.findImportedByQualifiedId(clientMessage.to, requester.scopeId ?? null);
+        if (imported && canSeeSession(requester.info, imported.info)) {
+          recipient = imported.info;
+          if (clientMessage.targetEpoch !== undefined && recipient.endpointEpoch !== clientMessage.targetEpoch) {
+            fail("E_TARGET_REBOUND", "Target endpoint changed before preflight"); break;
+          }
+          const link = this.peerLinks.getLink(imported.linkId);
+          const endpoints = link ? this.conversationEndpoints(link, requester, imported) : undefined;
+          if (!recipient.federation?.conversation || !endpoints) { fail("E_SEND_UNSUPPORTED", "Remote peer does not support text conversations"); break; }
+          const scalarAlias = messageId !== undefined && !decodeConversationMessageId(messageId) ? messageId : undefined;
+          try {
+            messageId = this.federationConversations.prepare(endpoints.local, endpoints.remote, messageId);
+            if (scalarAlias !== undefined) this.federationConversations.bindDispatchAlias(
+              JSON.stringify(["outgoing", requester.key, messageId]), JSON.stringify(["outgoing", requester.key, scalarAlias]));
+          } catch (error) {
+            fail(error instanceof ConversationStoreError ? error.code : (error as Error).message.startsWith("E_") ? (error as Error).message : "E_CONVERSATION_ID",
+              error instanceof ConversationStoreError ? error.message : "Conversation identity or endpoint binding is invalid"); break;
+          }
+        } else {
+          const targets = this.findSessions(clientMessage.to, requester.scopeId, requester.key);
+          if (targets.length === 1) recipient = targets[0]!.info;
+          if (!recipient) { fail("E_TARGET_NOT_FOUND", "Conversation recipient is not visible or is ambiguous"); break; }
+          if (decodeConversationMessageId(messageId)) { fail("E_CONVERSATION_TARGET", "A remote conversation handle cannot be rebound to a local target"); break; }
+          if (clientMessage.targetEpoch !== undefined && recipient.endpointEpoch !== clientMessage.targetEpoch) { fail("E_TARGET_REBOUND", "Target endpoint changed before preflight"); break; }
+          messageId ??= randomUUID();
+        }
+        this.writeBrokerFrame(socket, { type: "conversation_prepared", requestId: clientMessage.requestId,
+          prepared: { messageId: messageId!, author: { ...requester.info }, recipient: { ...recipient } } });
         break;
       }
 
@@ -1525,7 +1772,7 @@ class ParleyBroker {
           .filter(session => sameScope(session.localScopeId ?? undefined, requester.scopeId)
             && canSeeSession(requester.info, session.info))
           .map(session => session.info);
-        writeMessage(socket, {
+        this.writeBrokerFrame(socket, {
           type: "sessions",
           requestId: clientMessage.requestId,
           sessions: [...localSessions, ...importedSessions],
@@ -1542,7 +1789,7 @@ class ParleyBroker {
           throw new Error("Invalid advertise message");
         }
         const respond = (ok: boolean, extra: { name?: string; error?: string; code?: string } = {}) => {
-          writeMessage(socket, { type: "advertise_result", requestId, ok, ...extra });
+          this.writeBrokerFrame(socket, { type: "advertise_result", requestId, ok, ...extra });
         };
 
         const self = this.sessions.get(currentKey);
@@ -1578,8 +1825,8 @@ class ParleyBroker {
         // roster rows, target strings, and error text on every client that can
         // see it; control characters (newlines especially) let a chosen name
         // forge extra fake roster lines or corrupt terminal rendering.
-        if (/[\p{Cc}\p{Cf}]/u.test(name)) {
-          respond(false, { error: "name must not contain control or formatting characters", code: "E_INVALID_NAME" });
+        if (!isValidSessionName(name)) {
+          respond(false, { error: "name must not contain control or formatting characters or use the reserved federation prefix", code: "E_INVALID_NAME" });
           break;
         }
 
@@ -1645,58 +1892,63 @@ class ParleyBroker {
           this.writeDeliveryFailure(socket, message.id, "Sender session not found", "E_SENDER_NOT_FOUND");
           break;
         }
-        if (clientMessage.to.startsWith(RESERVED_SESSION_NAME_PREFIX)) {
-          // Origin-qualified identities are imported federation rows. They
-          // route over the peer link only when routed delivery is negotiated;
-          // they never fall through to local name or mailbox resolution.
-          const fingerprint = this.deliveryFingerprint(message, clientMessage.to, contactKind);
-          if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) break;
-          const imported = this.federationRoster.findImportedByQualifiedId(clientMessage.to);
-          if (imported) {
-            this.attemptFederatedSend(socket, currentKey, fromSession, clientMessage.to, message, contactKind, imported);
-          } else {
-            const fingerprint = this.deliveryFingerprint(message, clientMessage.to, contactKind);
-            this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Remote federation session is not present in the federated roster", "E_TARGET_NOT_FOUND");
-            this.writeDeliveryFailure(socket, message.id, "Remote federation session is not present in the federated roster", "E_TARGET_NOT_FOUND");
-          }
-          break;
-        }
-
-        const brokerReceivedAt = Date.now();
-        this.pruneAskEdges();
-        this.pruneMessageReceiptRoutes(brokerReceivedAt);
-        const replyRoute = message.replyTo ? this.messageReceiptRoutes.get(message.replyTo) ?? this.askEdges.get(message.replyTo) : undefined;
-        const completesAsk = message.completesAsk ?? Boolean(message.replyTo && !message.expectsReply);
-
+        // Historical uncertainty belongs to this authored instruction, not to
+        // whichever routing class its name happens to resolve to after recovery.
+        this.pruneDeliveryRecords();
+        if (this.rejectRetainedUnknown(socket, currentKey, message.id)) break;
         const hasTargetId = clientMessage.targetId !== undefined;
         const hasTargetEpoch = clientMessage.targetEpoch !== undefined;
         if (
           hasTargetId !== hasTargetEpoch
+          || (clientMessage.targetMode !== undefined && (
+            !hasTargetId || !hasTargetEpoch
+            || (clientMessage.targetMode !== "resolved" && clientMessage.targetMode !== "snapshot")
+          ))
           || (hasTargetId && (typeof clientMessage.targetId !== "string" || clientMessage.targetId.length === 0))
           || (hasTargetEpoch && (typeof clientMessage.targetEpoch !== "string" || clientMessage.targetEpoch.length === 0))
         ) {
           this.writeDeliveryFailure(socket, message.id, "Exact target requires an id and endpoint epoch", "E_INVALID_TARGET");
           break;
         }
+        const routingTarget = hasTargetId ? clientMessage.targetId as string : clientMessage.to;
+        if (routingTarget.startsWith(RESERVED_SESSION_NAME_PREFIX)) {
+          // Resolve only rows visible in the sender's authorized namespace.
+          // Qualified IDs must not bypass the same visibility or exact-target
+          // checks that apply to ordinary roster recipients.
+          const fingerprint = this.deliveryFingerprint(message, routingTarget, contactKind);
+          if (this.federationInFlightMessageIds.has(JSON.stringify([currentKey, message.id]))) {
+            this.writeDeliveryFailure(socket, message.id, "A delivery for this message id is already in flight; its outcome is not yet known", "E_MESSAGE_ID_REUSE", false, false); break;
+          }
+          if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) break;
+          const imported = this.federationRoster.findImportedByQualifiedId(routingTarget, fromSession.scopeId ?? null);
+          if (!imported || !canSeeSession(fromSession.info, imported.info)) {
+            const reason = "Remote federation session is not present in the federated roster";
+            this.recordDelivery(currentKey, message.id, fingerprint, "failed", reason, "E_TARGET_NOT_FOUND");
+            this.writeDeliveryFailure(socket, message.id, reason, "E_TARGET_NOT_FOUND");
+            break;
+          }
+          if (hasTargetEpoch && imported.info.endpointEpoch !== clientMessage.targetEpoch) {
+            this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
+            this.writeDeliveryFailure(socket, message.id, "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
+            break;
+          }
+          this.attemptFederatedSend(socket, currentKey, fromSession, routingTarget, message, contactKind, imported,
+            hasTargetEpoch ? clientMessage.targetEpoch as string : undefined, clientMessage.targetMode === "resolved");
+          break;
+        }
+
+        if (decodeConversationMessageId(message.id) || decodeConversationMessageId(message.replyTo)) {
+          this.writeDeliveryFailure(socket, message.id, "Remote conversation handles cannot route through local scalar message tables", "E_CONVERSATION_TARGET"); break;
+        }
+        const brokerReceivedAt = Date.now();
+        this.pruneAskEdges();
+        this.pruneMessageReceiptRoutes(brokerReceivedAt);
+        const replyRoute = message.replyTo ? this.messageReceiptRoutes.get(message.replyTo) ?? this.askEdges.get(message.replyTo) : undefined;
+        const completesAsk = message.completesAsk ?? Boolean(message.replyTo && !message.expectsReply);
+
         if (hasTargetId && hasTargetEpoch) {
           const targetId = clientMessage.targetId as string;
           const targetEpoch = clientMessage.targetEpoch as string;
-          if (targetId.startsWith(RESERVED_SESSION_NAME_PREFIX)) {
-            const imported = this.federationRoster.findImportedByQualifiedId(targetId);
-            const fingerprint = this.deliveryFingerprint(message, targetId, contactKind);
-            if (!imported) {
-              this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Session not found", "E_TARGET_NOT_FOUND");
-              this.writeDeliveryFailure(socket, message.id, "Session not found", "E_TARGET_NOT_FOUND");
-              break;
-            }
-            if (imported.info.endpointEpoch !== targetEpoch) {
-              this.recordDelivery(currentKey, message.id, fingerprint, "failed", "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
-              this.writeDeliveryFailure(socket, message.id, "Target endpoint changed before delivery", "E_TARGET_REBOUND", true);
-              break;
-            }
-            this.attemptFederatedSend(socket, currentKey, fromSession, targetId, message, contactKind, imported);
-            break;
-          }
           const fingerprint = this.deliveryFingerprint(message, targetId, contactKind);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
@@ -1734,28 +1986,13 @@ class ParleyBroker {
             this.writeDeliveryFailure(socket, message.id, "Reply target does not match a previous message from this recipient", "E_REPLY_TARGET");
             break;
           }
-          if (message.expectsReply) {
-            this.writePendingAskRecord(message, fromSession, target.info, brokerReceivedAt);
-            this.askEdges.set(message.id, {
-              from: currentKey,
-              to: target.key,
-              ...(fromSession.scopeId ? { scopeId: fromSession.scopeId } : {}),
-              createdAt: brokerReceivedAt,
-            });
-          }
           const senderContact = contactKind === "direct" && this.supportsCompactionAwareness(fromSession)
             ? this.directContactPlan(fromSession.scopeId, fromSession.info, target.info)
             : undefined;
           const receiverContact = contactKind === "direct" && this.supportsCompactionAwareness(target)
             ? this.directContactPlan(fromSession.scopeId, target.info, fromSession.info)
             : undefined;
-          const {
-            clientToken: senderContactToken,
-            stagedBaselineToken: senderBaselineToken,
-          } = this.prepareSenderContact(currentKey, senderContact);
-          const receiverContactToken = receiverContact
-            ? this.trackDirectContact(target.key, receiverContact)
-            : undefined;
+          const receiverContactToken = receiverContact ? randomUUID() : undefined;
           const deliveredMessage: Message = {
             ...message,
             brokerReceivedAt,
@@ -1765,6 +2002,21 @@ class ParleyBroker {
             ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
             ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
           };
+          if (!this.checkDeliveryEnvelope(socket, currentKey, message.id, fingerprint, fromSession.info, deliveredMessage)) break;
+          if (message.expectsReply) {
+            this.writePendingAskRecord(message, fromSession, target.info, brokerReceivedAt);
+            this.askEdges.set(message.id, {
+              from: currentKey,
+              to: target.key,
+              ...(fromSession.scopeId ? { scopeId: fromSession.scopeId } : {}),
+              createdAt: brokerReceivedAt,
+            });
+          }
+          const {
+            clientToken: senderContactToken,
+            stagedBaselineToken: senderBaselineToken,
+          } = this.prepareSenderContact(currentKey, senderContact);
+          if (receiverContact && receiverContactToken) this.trackDirectContact(target.key, receiverContact, receiverContactToken);
           if (message.supersedes) {
             const control: MessageControl = {
               action: "supersede",
@@ -1772,14 +2024,14 @@ class ParleyBroker {
               supersededBy: message.id,
               timestamp: Date.now(),
             };
-            writeMessage(target.socket, {
+            this.writeBrokerFrame(target.socket, {
               type: "message_control",
               from: fromSession.info,
               control,
             });
             // Replacing an instruction does not undo its earlier delivery or its replay receipt.
           }
-          writeMessage(target.socket, {
+          this.writeBrokerFrame(target.socket, {
             type: "message",
             from: fromSession.info,
             message: deliveredMessage,
@@ -1862,26 +2114,29 @@ class ParleyBroker {
                 target.id,
               )
             : undefined;
+          // Preflight queued work as a delivered envelope too: its stored
+          // authored frame can fit while sender identity, timestamps, and
+          // receiver collaboration metadata put the eventual frame over budget.
+          const receiverContact = !liveMailboxTarget || this.supportsCompactionAwareness(liveMailboxTarget)
+            ? this.directContactPlan(fromSession.scopeId, acceptedTarget, fromSession.info)
+            : undefined;
+          const receiverContactToken = receiverContact ? randomUUID() : undefined;
+          const deliveredMessage: Message = {
+            ...message,
+            brokerReceivedAt,
+            brokerDeliveredAt: Date.now(),
+            ...(receiverContact?.notice ? { peerCompaction: receiverContact.notice } : {}),
+            ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
+            ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
+          };
+          if (!this.checkDeliveryEnvelope(socket, currentKey, message.id, fingerprint, fromSession.info, deliveredMessage)) break;
           const {
             clientToken: senderContactToken,
             stagedBaselineToken: senderBaselineToken,
           } = this.prepareSenderContact(currentKey, senderContact);
           if (liveMailboxTarget) {
-            const receiverContact = this.supportsCompactionAwareness(liveMailboxTarget)
-              ? this.directContactPlan(fromSession.scopeId, liveMailboxTarget.info, fromSession.info)
-              : undefined;
-            const receiverContactToken = receiverContact
-              ? this.trackDirectContact(liveMailboxTarget.key, receiverContact)
-              : undefined;
-            const deliveredMessage: Message = {
-              ...message,
-              brokerReceivedAt,
-              brokerDeliveredAt: Date.now(),
-              ...(receiverContact?.notice ? { peerCompaction: receiverContact.notice } : {}),
-              ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
-              ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
-            };
-            writeMessage(liveMailboxTarget.socket, {
+            if (receiverContact && receiverContactToken) this.trackDirectContact(liveMailboxTarget.key, receiverContact, receiverContactToken);
+            this.writeBrokerFrame(liveMailboxTarget.socket, {
               type: "message",
               from: fromSession.info,
               message: deliveredMessage,
@@ -1961,7 +2216,7 @@ class ParleyBroker {
             session.scopeId,
           );
           this.federationRoster.reconcileLocalRoster();
-          writeMessage(socket, {
+          this.writeBrokerFrame(socket, {
             type: "compaction_recorded",
             eventId: clientMessage.eventId,
             generation: state.generation,
@@ -1969,7 +2224,7 @@ class ParleyBroker {
           });
         } catch (error) {
           console.error("Failed to record successful compaction:", error);
-          writeMessage(socket, {
+          this.writeBrokerFrame(socket, {
             type: "compaction_record_failed",
             eventId: clientMessage.eventId,
             error: "Failed to persist compaction awareness",
@@ -1994,9 +2249,9 @@ class ParleyBroker {
             observer.info.id,
           );
           if (outcome === "accepted") {
-            writeMessage(socket, { type: "direct_contact_recorded", token: clientMessage.token });
+            this.writeBrokerFrame(socket, { type: "direct_contact_recorded", token: clientMessage.token });
           } else if (outcome === "unknown") {
-            writeMessage(socket, { type: "direct_contact_unknown", token: clientMessage.token });
+            this.writeBrokerFrame(socket, { type: "direct_contact_unknown", token: clientMessage.token });
           }
         }
         break;
@@ -2014,7 +2269,7 @@ class ParleyBroker {
         const receiver = this.sessions.get(currentKey);
         const sender = route ? this.sessions.get(route.from) : undefined;
         if (route?.to === currentKey && receiver?.socket === socket && sender) {
-          writeMessage(sender.socket, {
+          this.writeBrokerFrame(sender.socket, {
             type: "message_receipt",
             from: receiver.info,
             receipt: clientMessage.receipt,
@@ -2032,7 +2287,7 @@ class ParleyBroker {
         if (sender?.socket !== socket) throw new Error("Sender session not found");
         const result = this.withdrawMessage(sender, clientMessage.messageId);
         const { accepted, ...details } = result;
-        writeMessage(socket, {
+        this.writeBrokerFrame(socket, {
           type: accepted ? "delivered" : "delivery_failed",
           messageId: clientMessage.messageId,
           requestId: clientMessage.requestId,
@@ -2213,7 +2468,7 @@ class ParleyBroker {
     if (!sender) {
       return;
     }
-    writeMessage(sender.socket, {
+    this.writeBrokerFrame(sender.socket, {
       type: "message_receipt",
       from: entry.target,
       receipt: {
@@ -2311,7 +2566,7 @@ class ParleyBroker {
         code: "E_CANCELLATION_UNAVAILABLE", reason: "No reachable recipient or queued message owned by this session; earlier work may already have happened" };
     }
     try {
-      writeMessage(receiver.socket, {
+      this.writeBrokerFrame(receiver.socket, {
         type: "message_control", from: sender.info,
         control: { action: "cancel", messageId, timestamp: Date.now(), detail: "The sender withdrew this message. Work may already have happened." },
       });
@@ -2334,7 +2589,7 @@ class ParleyBroker {
     contactToken?: string,
     details: Pick<DeliveryDetails, "recipient" | "cancellation"> = {},
   ): void {
-    writeMessage(socket, {
+    this.writeBrokerFrame(socket, {
       type: "delivered",
       messageId,
       delivery,
@@ -2346,8 +2601,22 @@ class ParleyBroker {
     });
   }
 
+  private deliveryEnvelopeFits(from: SessionInfo, message: Message): boolean {
+    const bytes = serializedPayloadSize({ type: "message", from, message });
+    return bytes !== null && bytes <= MAX_FRAME_BYTES;
+  }
+
+  /** Reject before any ask/contact/mailbox acceptance or receiver side effects. */
+  private checkDeliveryEnvelope(socket: net.Socket, senderKey: string, messageId: string, fingerprint: string, from: SessionInfo, message: Message): boolean {
+    if (this.deliveryEnvelopeFits(from, message)) return true;
+    const reason = "Message exceeds the enriched delivery frame limit";
+    this.recordDelivery(senderKey, messageId, fingerprint, "failed", reason, "E_MESSAGE_TOO_LARGE");
+    this.writeDeliveryFailure(socket, messageId, reason, "E_MESSAGE_TOO_LARGE");
+    return false;
+  }
+
   private writeDeliveryFailure(socket: net.Socket, messageId: string, reason: string, code: string, retryable = false, outcomeKnown = true, details: Pick<DeliveryDetails, "recipient" | "cancellation"> = {}): void {
-    writeMessage(socket, { type: "delivery_failed", messageId, reason, delivery: outcomeKnown ? "failed" : "unknown", code, retryable: outcomeKnown && retryable, outcomeKnown, ...details });
+    this.writeBrokerFrame(socket, { type: "delivery_failed", messageId, reason, delivery: outcomeKnown ? "failed" : "unknown", code, retryable: outcomeKnown && retryable, outcomeKnown, ...details });
   }
 
   private deliveryFingerprint(message: Message, targetId: string, contactKind: "direct" | "broadcast"): string {
@@ -2370,10 +2639,60 @@ class ParleyBroker {
     return JSON.stringify([fromSessionId, messageId]);
   }
 
+  private partnerDeliveryRecords(senderKey: string, messageId: string): Array<[string, DeliveryRecord]> {
+    this.pruneDeliveryRecords();
+    const dispatchId = JSON.stringify(["outgoing", senderKey, messageId]);
+    return [...this.deliveryRecords].filter(([, record]) => record.senderKey === senderKey && record.messageId !== messageId
+      && this.federationConversations.sharesDispatchIdentity(dispatchId, JSON.stringify(["outgoing", senderKey, record.messageId])));
+  }
+
+  /** A new durable admission replaces older negative verdicts of every
+   * associated identity. Accepted partners prevent admission instead. */
+  private invalidatePartnerDeliveryRecords(senderKey: string, messageId: string): void {
+    for (const [key] of this.partnerDeliveryRecords(senderKey, messageId)) this.deliveryRecords.delete(key);
+  }
+
+  /** Authenticate retained ownership independently of links and ID conversion. */
+  private hasPriorOutgoingDispatch(fromSessionId: string, messageId: string): boolean {
+    const identity = decodeConversationMessageId(messageId);
+    const sender = this.sessions.get(fromSessionId);
+    const ownsAuthoredIdentity = !identity || (sender && identity.stableSessionId === sender.info.id
+      && identity.originId === this.federationOrigin?.originId);
+    // The broker-owned local scope/session key persists without a live peer row
+    // or interpreting public scope aliases against today's link configuration.
+    return Boolean(ownsAuthoredIdentity)
+      && this.federationConversations.hasDispatched(JSON.stringify(["outgoing", fromSessionId, messageId]));
+  }
+
+  /** Passive prior-attempt rejection across every routing class. Volatile
+   * receipts still provide their stronger current-process verdict. */
+  private rejectRetainedUnknown(socket: net.Socket, fromSessionId: string, messageId: string): boolean {
+    const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionId, messageId));
+    if (record) {
+      if (record.outcomeKnown) return false;
+      const inFlight = this.federationInFlightMessageIds.has(JSON.stringify([fromSessionId, messageId]));
+      this.writeDeliveryFailure(socket, messageId, record.reason ?? "Previous delivery outcome is unknown",
+        inFlight ? "E_MESSAGE_ID_REUSE" : record.code ?? "E_DELIVERY_UNKNOWN", false, false, { recipient: record.recipient, cancellation: record.cancellation });
+      return true;
+    }
+    try {
+      if (!this.hasPriorOutgoingDispatch(fromSessionId, messageId)) return false;
+      const inFlight = this.federationInFlightMessageIds.has(JSON.stringify([fromSessionId, messageId]));
+      this.writeDeliveryFailure(socket, messageId,
+        inFlight ? "A delivery for this message id is already in flight; its outcome is not yet known"
+          : "This retained message was dispatched before; its recovered outcome is unknown",
+        inFlight ? "E_MESSAGE_ID_REUSE" : "E_DELIVERY_UNKNOWN", false, false);
+      return true;
+    } catch (error) {
+      this.writeDeliveryFailure(socket, messageId, (error as Error).message, "E_CONVERSATION_STATE_FAILURE", false, false);
+      return true;
+    }
+  }
+
   private replayOrReject(socket: net.Socket, fromSessionId: string, messageId: string, fingerprint: string): boolean {
     this.pruneDeliveryRecords();
     const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionId, messageId));
-    if (!record) return false;
+    if (!record) return this.rejectRetainedUnknown(socket, fromSessionId, messageId);
     if (record.fingerprint !== fingerprint) {
       this.writeDeliveryFailure(socket, messageId, "Message id was reused with different authored content", "E_MESSAGE_ID_REUSE");
       return true;
@@ -2412,6 +2731,8 @@ class ParleyBroker {
       this.deliveryRecords.delete(oldest);
     }
     this.deliveryRecords.set(this.deliveryRecordKey(fromSessionId, messageId), {
+      senderKey: fromSessionId,
+      messageId,
       fingerprint,
       state,
       ...(reason ? { reason } : {}),
@@ -2481,9 +2802,7 @@ class ParleyBroker {
             liveSender !== undefined,
           )
         : undefined;
-      const receiverContactToken = receiverContact
-        ? this.trackDirectContact(session.key, receiverContact)
-        : undefined;
+      const receiverContactToken = receiverContact ? randomUUID() : undefined;
       const deliveredMessage: Message = {
         ...entry.message,
         brokerDeliveredAt: Date.now(),
@@ -2491,7 +2810,17 @@ class ParleyBroker {
         ...(receiverContactToken ? { contactToken: receiverContactToken } : {}),
         ...(receiverContact?.durableBaseline ? { contactBaseline: true } : {}),
       };
-      writeMessage(session.socket, {
+      // State can change while queued (e.g. a newly compacted sender).
+      // Never emit an oversized frame even if it was safe when accepted.
+      if (!this.deliveryEnvelopeFits(entry.from, deliveredMessage)) {
+        this.notifyMailboxUndelivered(entry, "Mailbox delivery exceeds the frame limit after receiver enrichment");
+        this.messageReceiptRoutes.delete(entry.message.id);
+        this.updateDeliveryRecord(entry.fromKey, entry.message.id, "failed", "Message exceeds the enriched delivery frame limit", "E_MESSAGE_TOO_LARGE");
+        this.mailboxMessages.splice(index, 1);
+        continue;
+      }
+      if (receiverContact && receiverContactToken) this.trackDirectContact(session.key, receiverContact, receiverContactToken);
+      this.writeBrokerFrame(session.socket, {
         type: "message",
         from: entry.from,
         message: deliveredMessage,
@@ -2704,7 +3033,7 @@ class ParleyBroker {
   private broadcast(msg: BrokerMessage, exclude?: string, scopeId?: string): void {
     for (const [id, session] of this.sessions) {
       if (id !== exclude && sameScope(session.scopeId, scopeId)) {
-        writeMessage(session.socket, msg);
+        this.writeBrokerFrame(session.socket, msg);
       }
     }
   }
@@ -2726,7 +3055,7 @@ class ParleyBroker {
       if (!canSeeSession(session.info, subject)) {
         continue;
       }
-      writeMessage(session.socket, msg);
+      this.writeBrokerFrame(session.socket, msg);
     }
   }
 
@@ -2793,7 +3122,7 @@ class ParleyBroker {
             const isCapable = sameScope(session.scopeId, scopeId)
               && session.extensions?.some((extension) => extension.namespace === namespace);
             if (isCapable) {
-              writeMessage(session.socket, { type: "extension_owner", namespace });
+              this.writeBrokerFrame(session.socket, { type: "extension_owner", namespace });
             }
           }
         }
@@ -2832,7 +3161,7 @@ class ParleyBroker {
             const isCapable = sameScope(session.scopeId, scopeId)
               && session.extensions.some((ext) => ext.namespace === namespace);
             if (isCapable) {
-              writeMessage(session.socket, {
+              this.writeBrokerFrame(session.socket, {
                 type: "extension_owner",
                 namespace,
                 ownerId: winner.session.info.id,
@@ -2856,12 +3185,12 @@ class ParleyBroker {
 
     const session = this.sessions.get(currentKey);
     if (!session || session.socket !== socket) {
-      writeMessage(socket, { type: "error", error: "Session not found" });
+      this.writeBrokerFrame(socket, { type: "error", error: "Session not found" });
       return;
     }
 
     if (!session.extensions?.length) {
-      writeMessage(socket, { type: "error", error: "Session has not advertised extension capability" });
+      this.writeBrokerFrame(socket, { type: "error", error: "Session has not advertised extension capability" });
       return;
     }
 
@@ -2872,42 +3201,42 @@ class ParleyBroker {
     const payload = msg.payload;
 
     if (typeof namespace !== "string" || !this.validateNamespace(namespace)) {
-      writeMessage(socket, { type: "error", error: "Invalid namespace" });
+      this.writeBrokerFrame(socket, { type: "error", error: "Invalid namespace" });
       return;
     }
 
     if (audience !== "owner" && audience !== "capable") {
-      writeMessage(socket, { type: "error", error: "Invalid audience" });
+      this.writeBrokerFrame(socket, { type: "error", error: "Invalid audience" });
       return;
     }
 
     const payloadSize = serializedPayloadSize(payload);
     if (payloadSize === null || payloadSize > MAX_EXTENSION_MESSAGE_BYTES) {
-      writeMessage(socket, { type: "error", error: "Invalid extension payload or payload exceeds 16 KiB limit" });
+      this.writeBrokerFrame(socket, { type: "error", error: "Invalid extension payload or payload exceeds 16 KiB limit" });
       return;
     }
 
     // Verify sender has capability for this namespace
     const hasCapability = session.extensions?.some((ext) => ext.namespace === namespace);
     if (!hasCapability) {
-      writeMessage(socket, { type: "error", error: "Sender does not have capability for this namespace" });
+      this.writeBrokerFrame(socket, { type: "error", error: "Sender does not have capability for this namespace" });
       return;
     }
 
     const owner = this.namespaceOwners.get(scopedExtensionKey(session.scopeId, namespace));
     if ((audience === "owner" || ownerOnly) && !owner) {
-      writeMessage(socket, { type: "error", error: "No owner for this namespace" });
+      this.writeBrokerFrame(socket, { type: "error", error: "No owner for this namespace" });
       return;
     }
 
     // For owner-only messages, validate exact socket and epoch
     if (ownerOnly && owner) {
       if (typeof ownerEpoch !== "string") {
-        writeMessage(socket, { type: "error", error: "ownerEpoch required for owner-only messages" });
+        this.writeBrokerFrame(socket, { type: "error", error: "ownerEpoch required for owner-only messages" });
         return;
       }
       if (currentKey !== owner.sessionKey || socket !== owner.socket || ownerEpoch !== owner.epoch) {
-        writeMessage(socket, { type: "error", error: "Owner validation failed" });
+        this.writeBrokerFrame(socket, { type: "error", error: "Owner validation failed" });
         return;
       }
     }
@@ -2933,7 +3262,7 @@ class ParleyBroker {
           recipientSession.socket === owner.socket);
 
       if (shouldReceive) {
-        writeMessage(recipientSession.socket, {
+        this.writeBrokerFrame(recipientSession.socket, {
           type: "extension_message",
           namespace,
           fromSessionId: session.info.id,
@@ -2955,7 +3284,7 @@ class ParleyBroker {
 
     const session = this.sessions.get(currentKey);
     if (!session || session.socket !== socket) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace: String(msg.namespace || ""),
         committed: false,
@@ -2966,7 +3295,7 @@ class ParleyBroker {
     }
 
     if (!session.extensions?.length) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace: String(msg.namespace || ""),
         committed: false,
@@ -2982,7 +3311,7 @@ class ParleyBroker {
     const payload = msg.payload;
 
     if (typeof namespace !== "string" || !this.validateNamespace(namespace)) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace: String(namespace),
         committed: false,
@@ -2994,7 +3323,7 @@ class ParleyBroker {
     const stateNamespace = scopedExtensionStateNamespace(session.scopeId, namespace);
 
     if (typeof ownerEpoch !== "string") {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace,
         committed: false,
@@ -3005,7 +3334,7 @@ class ParleyBroker {
     }
 
     if (typeof expectedRevision !== "number" || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace,
         committed: false,
@@ -3017,7 +3346,7 @@ class ParleyBroker {
 
     const payloadSize = serializedPayloadSize(payload);
     if (payloadSize === null || payloadSize > MAX_EXTENSION_STATE_BYTES) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace,
         committed: false,
@@ -3030,7 +3359,7 @@ class ParleyBroker {
     // Verify sender has capability for this namespace
     const hasCapability = session.extensions?.some((ext) => ext.namespace === namespace);
     if (!hasCapability) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace,
         committed: false,
@@ -3042,7 +3371,7 @@ class ParleyBroker {
 
     const owner = this.namespaceOwners.get(scopedExtensionKey(session.scopeId, namespace));
     if (!owner) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace,
         committed: false,
@@ -3054,7 +3383,7 @@ class ParleyBroker {
 
     // Validate owner, socket, and epoch
     if (currentKey !== owner.sessionKey || socket !== owner.socket || ownerEpoch !== owner.epoch) {
-      writeMessage(socket, {
+      this.writeBrokerFrame(socket, {
         type: "extension_state_result",
         namespace,
         committed: false,
@@ -3067,7 +3396,7 @@ class ParleyBroker {
     const result = this.extensionStateManager.commitState(stateNamespace, expectedRevision, payload);
 
     // Send result to committer
-    writeMessage(socket, {
+    this.writeBrokerFrame(socket, {
       type: "extension_state_result",
       namespace,
       committed: result.committed,
@@ -3087,7 +3416,7 @@ class ParleyBroker {
 
         const isCapable = recipientSession.extensions.some((ext) => ext.namespace === namespace);
         if (isCapable) {
-          writeMessage(recipientSession.socket, {
+          this.writeBrokerFrame(recipientSession.socket, {
             type: "extension_state",
             namespace,
             revision: result.revision,

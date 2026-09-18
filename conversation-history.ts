@@ -3,10 +3,18 @@ import type { Message, MessageControl, SessionInfo } from "./types.ts";
 
 export interface OutstandingAsk {
   to: string;
+  /** Remote asks bind the originally selected responder incarnation. */
+  endpointEpoch?: string;
+  originEpoch?: string;
   targetDisplay: string;
   preview: string;
   sentAt: number;
   message?: Message["content"];
+}
+
+export function matchesAskCounterpart(ask: Pick<OutstandingAsk, "to" | "endpointEpoch" | "originEpoch">, from: SessionInfo): boolean {
+  return ask.to === from.id && (ask.endpointEpoch === undefined || ask.endpointEpoch === from.endpointEpoch)
+    && (ask.originEpoch === undefined || ask.originEpoch === from.federation?.originEpoch);
 }
 
 export interface ConversationHistory {
@@ -88,6 +96,8 @@ export function restoreConversationHistory(entries: readonly unknown[]): Convers
           const message = data.message as Message["content"] | undefined;
           state.outgoing.set(data.messageId, {
             to: data.to, targetDisplay: typeof data.targetDisplay === "string" ? data.targetDisplay : data.to,
+            ...(typeof data.endpointEpoch === "string" ? { endpointEpoch: data.endpointEpoch } : {}),
+            ...(typeof data.originEpoch === "string" ? { originEpoch: data.originEpoch } : {}),
             sentAt: data.sentAt, preview: message?.text?.replace(/\s+/g, " ").slice(0, 120) ?? "",
             ...(message ? { message } : {}),
           });
@@ -105,7 +115,8 @@ export function restoreConversationHistory(entries: readonly unknown[]): Convers
     if (!context) continue;
     const message = context.message;
     if (!message.replyTo || message.completesAsk === false || message.expectsReply) continue;
-    if (state.outgoing.get(message.replyTo)?.to === context.from.id) state.outgoing.delete(message.replyTo);
+    const ask = state.outgoing.get(message.replyTo);
+    if (ask && matchesAskCounterpart(ask, context.from)) state.outgoing.delete(message.replyTo);
   }
   return state;
 }

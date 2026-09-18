@@ -78,20 +78,20 @@ const defaults: ParleyConfig = {
   replyHint: true,
 };
 
-export function loadConfig(): ParleyConfig {
-  const raw = readConfigRaw();
-  if (raw === undefined) {
-    return { ...defaults };
-  }
-
+function readConfig(fallback?: (error: Error, parsed: unknown) => ParleyConfig): ParleyConfig {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
+    const raw = readConfigRaw();
+    if (raw === undefined) {
+      return { ...defaults, brokerArgs: [...defaults.brokerArgs] };
+    }
+    parsed = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       throw new Error("Config must be a JSON object");
     }
 
     const parsedConfig = parsed as Record<string, unknown>;
-    const config: ParleyConfig = { ...defaults };
+    const config: ParleyConfig = { ...defaults, brokerArgs: [...defaults.brokerArgs] };
 
     if (Object.hasOwn(parsedConfig, "brokerCommand")) {
       if (typeof parsedConfig.brokerCommand !== "string") {
@@ -185,6 +185,30 @@ export function loadConfig(): ParleyConfig {
     return config;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to load parley config: ${message}`, { cause: error });
+    const failure = new Error(`Failed to load parley config: ${message}`, { cause: error });
+    if (fallback) return fallback(failure, parsed);
+    throw failure;
   }
+}
+
+export function loadConfig(): ParleyConfig {
+  return readConfig();
+}
+
+/** Keep explicit conversation delivery available when configuration is invalid,
+ * without unsolicited wakeups or weakening outbound consent. A valid explicit
+ * enabled:false remains respected even if another setting is invalid. */
+export function loadRuntimeConfig(reportError: (error: Error) => void): ParleyConfig {
+  return readConfig((error, parsed) => {
+    reportError(error);
+    const explicitlyDisabled = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      && (parsed as Record<string, unknown>).enabled === false;
+    return {
+      ...defaults,
+      brokerArgs: [...defaults.brokerArgs],
+      enabled: !explicitlyDisabled,
+      inboundTrigger: "never",
+      confirmSend: true,
+    };
+  });
 }

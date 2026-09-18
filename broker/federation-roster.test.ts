@@ -182,6 +182,8 @@ test("initial snapshot binds remote aliases to local scope and creates origin-qu
   assert.equal(imported[0]?.originEpoch, "remote_epoch_12345678");
   assert.deepEqual(imported[0]?.info.federation, {
     originId: remoteOrigin.id,
+    originEpoch: "remote_epoch_12345678",
+    conversation: false,
     originLabel: remoteOrigin.label,
     remoteScopeAlias: binding.remoteScopeAlias,
     remoteStableSessionId: entry.stableSessionId,
@@ -487,4 +489,41 @@ test("disconnect atomically prunes only that peer link's imported projection", (
   assert.equal(changes.length, 1);
   assert.equal(changes[0]?.left.length, 1);
   assert.equal(changes[0]?.left[0]?.info.federation.originId, remoteOrigin.id);
+});
+
+test("bounded compact exports retain endpoint identity for exact delivery", () => {
+  const info = session("compact-local", { cwd: "/" + "x".repeat(3000) });
+  const { roster, sent } = harness([{ ownership: "local", exportEligible: true, localScopeId: binding.localScopeId, info }]);
+  roster.linkUp(peerLink());
+  const frame = sent[0]?.frame;
+  assert.ok(frame && frame.type === "peer_roster_snapshot");
+  assert.equal(isPeerRosterSnapshot(frame), true);
+  assert.ok(frame.sessions[0]!.session.cwd.length < info.cwd.length);
+  assert.equal(frame.sessions[0]!.session.endpointEpoch, info.endpointEpoch);
+});
+
+test("negotiated endpoint conversation support survives compact exports and capability updates, never legacy rosters", () => {
+  const info = session("compact-conversation", { cwd: "/" + "x".repeat(3000) });
+  const local = { ownership: "local" as const, exportEligible: true, conversationCapable: true, localScopeId: binding.localScopeId, info };
+  const { roster, sent } = harness([local]);
+  const current = peerLink();
+  current.features.push("peer-send-v1", "peer-send-exact-v1", "peer-conversation-text-v1");
+  roster.linkUp(current);
+  const frame = sent[0]?.frame;
+  assert.ok(frame?.type === "peer_roster_snapshot");
+  assert.equal(frame.sessions[0]?.session.conversation, true);
+  assert.ok(frame.sessions[0]!.session.cwd.length < info.cwd.length);
+  const remote = remoteEntry("capable");
+  remote.session.conversation = true;
+  roster.handlePeerFrame(current.linkId, snapshot([remote]));
+  assert.equal(roster.listImported()[0]?.info.federation.conversation, true);
+  assert.equal("conversation" in roster.listImported()[0]!.info, false, "peer marker is not a session-authored public field");
+  remote.session.conversation = false;
+  roster.handlePeerFrame(current.linkId, delta(2, [remote], []));
+  assert.equal(roster.listImported()[0]?.info.federation.conversation, false);
+  const legacy = harness([local]);
+  legacy.roster.linkUp(peerLink());
+  const oldFrame = legacy.sent[0]?.frame;
+  assert.ok(oldFrame?.type === "peer_roster_snapshot");
+  assert.equal("conversation" in oldFrame.sessions[0]!.session, false);
 });

@@ -1,5 +1,5 @@
 /**
- * Federation Slice 3: routed direct send frames.
+ * Single-hop routed direct text and negotiated conversation frames.
  *
  * A peer send carries one client message from an origin broker's locally
  * owned session to a destination broker's locally owned session over a
@@ -15,8 +15,14 @@
  *   The destination must resolve it to a locally owned session. A target
  *   that resolves only to an imported row is a single-hop violation.
  * - No remote mailbox queueing in federation v1: a disconnected target fails.
+ * - peer-send-exact-v1 optionally pins the destination endpoint epoch. A pin
+ *   is checked after authorization and before delivery; it is never ignored.
+ * - peer-conversation-text-v1 requires author-qualified retained IDs and both
+ *   endpoint/broker incarnation pins. Reply threading reverses a recorded edge,
+ *   independent of the transport sendId and explicit ask-completion intent.
  */
 
+import { decodeConversationMessageId } from "./federation-conversation.ts";
 import type { SessionInfo } from "../types.ts";
 import {
   FEDERATION_PROTOCOL_NAME,
@@ -46,6 +52,10 @@ export interface PeerSendMessagePayload {
   id: string;
   timestamp: number;
   text: string;
+  replyTo?: string;
+  expectsReply?: boolean;
+  completesAsk?: boolean;
+  senderWaitMode?: "blocking" | "nonblocking";
 }
 
 export interface PeerSendRequest {
@@ -62,12 +72,19 @@ export interface PeerSendRequest {
   /** Target identity in the destination broker's own namespace. */
   targetScopeAlias: string;
   targetStableSessionId: string;
+  /** Only sent when peer-send-exact-v1 is negotiated; never silently ignored. */
+  targetEndpointEpoch?: string;
+  /** All three are required for the negotiated conversation envelope. */
+  senderEndpointEpoch?: string;
+  senderOriginEpoch?: string;
+  targetOriginEpoch?: string;
   message: PeerSendMessagePayload;
 }
 
 export type PeerSendFailureCode =
   | "E_SEND_TARGET_NOT_FOUND"
   | "E_SEND_TARGET_DISCONNECTED"
+  | "E_SEND_TARGET_REBOUND"
   | "E_SEND_UNAUTHORIZED"
   | "E_SEND_INVALID"
   | "E_SEND_DUPLICATE"
@@ -111,12 +128,12 @@ function hasOnlyKeys(value: Record<string, unknown>, required: readonly string[]
   return true;
 }
 
-function isStableSessionId(value: unknown): value is string {
+function isStableSessionId(value: unknown, conversation = false): value is string {
   return typeof value === "string"
     && value.length > 0
     && value.length <= FEDERATION_SESSION_ID_MAX_LENGTH
     && !CONTROL_OR_FORMAT_CHARACTERS.test(value)
-    && value.trim() === value;
+    && (conversation ? value.trim().length > 0 : value.trim() === value);
 }
 
 function isTimestamp(value: unknown): value is number {
@@ -126,6 +143,7 @@ function isTimestamp(value: unknown): value is number {
 const PEER_SEND_FAILURE_CODES: readonly PeerSendFailureCode[] = [
   "E_SEND_TARGET_NOT_FOUND",
   "E_SEND_TARGET_DISCONNECTED",
+  "E_SEND_TARGET_REBOUND",
   "E_SEND_UNAUTHORIZED",
   "E_SEND_INVALID",
   "E_SEND_DUPLICATE",
@@ -144,19 +162,33 @@ export function isPeerSendRequest(value: unknown): value is PeerSendRequest {
     "targetScopeAlias",
     "targetStableSessionId",
     "message",
-  ])) return false;
+  ], ["targetEndpointEpoch", "senderEndpointEpoch", "senderOriginEpoch", "targetOriginEpoch"])) return false;
   if (!isRecord(value.message)
-    || !hasOnlyKeys(value.message, ["id", "timestamp", "text"])) return false;
+    || !hasOnlyKeys(value.message, ["id", "timestamp", "text"], ["replyTo", "expectsReply", "completesAsk", "senderWaitMode"])) return false;
+  const conversation = value.senderOriginEpoch !== undefined;
+  if (conversation) {
+    if (!isFederationCorrelationId(value.senderOriginEpoch) || !isFederationCorrelationId(value.senderEndpointEpoch)
+      || !isFederationCorrelationId(value.targetOriginEpoch) || !isFederationCorrelationId(value.targetEndpointEpoch)
+      || !decodeConversationMessageId(value.message.id)) return false;
+  } else if (value.senderEndpointEpoch !== undefined || value.targetOriginEpoch !== undefined
+    || Object.keys(value.message).some(key => !["id", "timestamp", "text"].includes(key))) return false;
+  if (value.message.replyTo !== undefined && !decodeConversationMessageId(value.message.replyTo)) return false;
+  if (value.message.expectsReply !== undefined && typeof value.message.expectsReply !== "boolean") return false;
+  if (value.message.completesAsk !== undefined && (typeof value.message.completesAsk !== "boolean"
+    || (value.message.completesAsk && !value.message.replyTo))) return false;
+  if (value.message.senderWaitMode !== undefined && value.message.senderWaitMode !== "blocking"
+    && value.message.senderWaitMode !== "nonblocking") return false;
   return value.type === "peer_send"
     && value.protocol === FEDERATION_PROTOCOL_NAME
     && value.version === FEDERATION_PROTOCOL_VERSION
     && isCanonicalFederationOriginId(value.originId)
     && isFederationCorrelationId(value.sendId)
     && isCanonicalFederationScopeAlias(value.senderScopeAlias)
-    && isStableSessionId(value.senderStableSessionId)
+    && isStableSessionId(value.senderStableSessionId, conversation)
     && isCanonicalFederationScopeAlias(value.targetScopeAlias)
-    && isStableSessionId(value.targetStableSessionId)
-    && isFederationCorrelationId(value.message.id)
+    && isStableSessionId(value.targetStableSessionId, conversation)
+    && (value.targetEndpointEpoch === undefined || isFederationCorrelationId(value.targetEndpointEpoch))
+    && (conversation || isFederationCorrelationId(value.message.id))
     && isTimestamp(value.message.timestamp)
     && typeof value.message.text === "string"
     && value.message.text.length <= FEDERATION_SEND_TEXT_MAX_LENGTH;
@@ -222,6 +254,9 @@ export interface PendingPeerSend {
   messageId: string;
   /** Broker session key of the local sending session. */
   senderKey: string;
+  /** Durable attempt barrier, independent of the per-link transport sendId. */
+  dispatchId?: string;
+  dispatchAlias?: string;
   recipient?: SessionInfo;
   /** Delivery fingerprint used for replay records once the result arrives. */
   fingerprint: string;

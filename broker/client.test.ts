@@ -496,3 +496,41 @@ test("correlated cancellation failure preserves its own uncertainty and cannot f
     });
   }
 });
+
+test("snapshots without endpoint epochs fail closed while ordinary legacy discovery still sends", async () => {
+  const federation = { originId: "host:legacy", remoteScopeAlias: "legacy-work", remoteStableSessionId: "reviewer" };
+  const snapshot = {
+    id: encodeOriginQualifiedSessionIdentity(federation), federation, trustedLocal: false as const,
+    name: "legacy-reviewer", cwd: "/remote", model: "test", pid: 2, startedAt: 1, lastActivity: 1,
+  };
+  let lists = 0;
+  const sends: Extract<ClientMessage, { type: "send" }>[] = [];
+  await withScriptedBroker(REQUIRED_FEATURES, (socket, frame) => {
+    if (frame.type === "list") {
+      lists++;
+      writeMessage(socket, { type: "sessions", requestId: frame.requestId, sessions: [snapshot] });
+      return true;
+    }
+    if (frame.type === "send") {
+      sends.push(frame);
+      writeMessage(socket, accepted(frame.message.id));
+    }
+  }, async (client) => {
+    const fresh = await client.sendToSession(snapshot, { text: "Fresh invalid snapshot" });
+    assert.equal(fresh.outcomeKnown, true, "fresh operations are known unsent at a local admission failure");
+    const result = await client.sendToSession(snapshot, { text: "Approved snapshot only", messageId: "unpin-message" });
+    assert.equal(result.delivered, false);
+    assert.equal(result.outcomeKnown, false, "a local admission failure cannot determine an earlier retained identity's outcome");
+    assert.equal(result.delivery, "unknown");
+    assert.equal(result.retryable, false);
+    assert.equal(result.code, "E_INVALID_TARGET");
+    assert.equal(result.id, "unpin-message");
+    assert.match(result.reason ?? "", /endpoint epoch/);
+    assert.equal(sends.length, 0);
+    assert.equal(lists, 0, "missing snapshot identity cannot be replaced by fresh discovery");
+    assert.equal((await client.send(snapshot.id, { text: "Ordinary legacy send" })).delivered, true);
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0]?.targetEpoch, undefined);
+    assert.equal(lists, 1);
+  });
+});

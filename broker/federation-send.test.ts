@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { encodeConversationMessageId } from "./federation-conversation.ts";
 import {
   FEDERATION_SEND_TEXT_MAX_LENGTH,
   PeerSendDedup,
@@ -42,7 +43,8 @@ function validResult(overrides: Record<string, unknown> = {}): Record<string, un
 }
 
 test("peer send requests accept the canonical frame and reject every mutation of it", () => {
-  assert.equal(isPeerSendRequest(validRequest()), true);
+  assert.equal(isPeerSendRequest(validRequest()), true, "legacy ordinary send frames remain valid");
+  assert.equal(isPeerSendRequest(validRequest({ targetEndpointEpoch: "epoch_12345678" })), true);
 
   for (const mutation of [
     { protocol: "other" },
@@ -58,6 +60,8 @@ test("peer send requests accept the canonical frame and reject every mutation of
     { senderStableSessionId: "padded " },
     { targetScopeAlias: "Bad Alias" },
     { targetStableSessionId: "unsafe\nid" },
+    { targetEndpointEpoch: "short" },
+    { targetEndpointEpoch: 12 },
     { message: { id: "msg_0001_ABCDEFGH", timestamp: 1 } },
     { message: { id: "msg_0001_ABCDEFGH", timestamp: -1, text: "x" } },
     { message: { id: "msg_0001_ABCDEFGH", timestamp: 1.5, text: "x" } },
@@ -76,6 +80,7 @@ test("peer send requests accept the canonical frame and reject every mutation of
 
 test("peer send results require correlated identity, a verdict, and strict failure payloads", () => {
   assert.equal(isPeerSendResult(validResult()), true);
+  assert.equal(isPeerSendResult(validResult({ ok: false, code: "E_SEND_TARGET_REBOUND", error: "Target endpoint changed before delivery" })), true);
   assert.equal(isPeerSendResult(validResult({ ok: false, code: "E_SEND_TARGET_NOT_FOUND", error: "Session not found" })), true);
 
   for (const mutation of [
@@ -134,4 +139,28 @@ test("pending peer sends resolve once, drop with their link, and expire on deadl
   assert.equal(expired.length, 1);
   assert.equal(expired[0]?.messageId, "msg-4");
   assert.equal(tracker.size, 0);
+});
+
+
+test("conversation envelopes require canonical retained IDs, both endpoint pins, and independently typed reply intent", () => {
+  const id = encodeConversationMessageId({ originId: "host:penguin", originEpoch: "origin_epoch_1234",
+    scopeAlias: "mistfall-remote", stableSessionId: "remote / stable session", endpointEpoch: "sender_epoch_1234", nonce: "message_nonce_1234" });
+  const request = validRequest({ senderOriginEpoch: "origin_epoch_1234", senderEndpointEpoch: "sender_epoch_1234",
+    targetOriginEpoch: "target_origin_1234", targetEndpointEpoch: "target_endpoint_1234",
+    message: { id, timestamp: 1789580000000, text: "threaded question", replyTo: id, expectsReply: true, completesAsk: false, senderWaitMode: "nonblocking" },
+  });
+  assert.equal(isPeerSendRequest(request), true);
+  for (const key of ["senderOriginEpoch", "senderEndpointEpoch", "targetOriginEpoch", "targetEndpointEpoch"]) {
+    const missing = { ...request };
+    delete missing[key];
+    assert.equal(isPeerSendRequest(missing), false, `missing ${key}`);
+  }
+  for (const message of [
+    { ...(request.message as object), id: "scalar_nonce_1234" },
+    { ...(request.message as object), replyTo: "scalar_nonce_1234" },
+    { ...(request.message as object), expectsReply: "true" },
+    { ...(request.message as object), completesAsk: 1 },
+    { ...(request.message as object), senderWaitMode: "waiting" },
+  ]) assert.equal(isPeerSendRequest({ ...request, message }), false);
+  assert.equal(isPeerSendRequest(validRequest({ message: { id: "scalar_nonce_1234", timestamp: 1, text: "legacy", expectsReply: false } })), false);
 });

@@ -45,6 +45,7 @@ export function createExtensionHarness(sessionName: string | (() => string) = "c
   const events = new EventEmitter();
   const lifecycleHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
   const commands = new Map<string, (args: string, ctx: unknown) => unknown>();
+  const shortcuts = new Map<string, (ctx: unknown) => unknown>();
   const tools: CapturedTool[] = [];
   let currentSessionName = typeof sessionName === "function" ? sessionName() : sessionName;
   let activeToolNames = [...(options.activeTools ?? [])];
@@ -84,7 +85,9 @@ export function createExtensionHarness(sessionName: string | (() => string) = "c
     registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => unknown }) => {
       commands.set(name, command.handler);
     },
-    registerShortcut: () => undefined,
+    registerShortcut: (key: string, shortcut: { handler: (ctx: unknown) => unknown }) => {
+      shortcuts.set(key, shortcut.handler);
+    },
     sendMessage: (message: { customType?: string; content?: string; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: string }) => {
       sentMessages.push({ message, options, activeTools: [...activeToolNames] });
       if (harnessOptions.persistMessages !== false) persistedMessages.push(message);
@@ -97,7 +100,7 @@ export function createExtensionHarness(sessionName: string | (() => string) = "c
   };
   const ctx = {
     cwd: repoDir,
-    mode: options.mode ?? (options.hasUI ? "tui" : "print"),
+    ...(options.mode === undefined ? {} : { mode: options.mode }),
     model: { id: "child-model" },
     sessionManager: {
       getSessionId: () => typeof options.sessionId === "function" ? options.sessionId() : options.sessionId ?? "session-child-test",
@@ -124,6 +127,7 @@ export function createExtensionHarness(sessionName: string | (() => string) = "c
     ctx,
     tools,
     commands,
+    shortcuts,
     entries,
     sentMessages,
     persistedMessages,

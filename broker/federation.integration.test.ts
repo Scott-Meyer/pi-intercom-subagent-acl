@@ -7,11 +7,13 @@ import { tmpdir } from "node:os";
 import { once } from "node:events";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createMessageReader, writeMessage } from "./framing.ts";
-import { isBrokerAcceptPeerResult, isBrokerDialPeerResult, isFederationBridgeAttach } from "./federation-protocol.ts";
+import { isBrokerAcceptPeerResult, isBrokerDialPeerResult, isFederationBridgeAttach, encodeOriginQualifiedSessionIdentity } from "./federation-protocol.ts";
 import type { SessionInfo } from "../types.ts";
 import type { BrokerDialPeerRequest, BrokerDialPeerResult, FederationBridgeAttach } from "./federation-types.ts";
 import { getBrokerSocketPath } from "./paths.ts";
 import { getTsxCliPath } from "./spawn.ts";
+import { ParleyClient } from "./client.ts";
+import { FEDERATION_EXACT_SEND_FEATURE } from "./federation-types.ts";
 
 const repoDir = process.cwd();
 
@@ -137,6 +139,7 @@ async function registerOrdinaryClient(
   socketPath: string,
   sessionId: string,
   sessionOverrides: Partial<SessionInfo> = {},
+  scopeId?: string,
 ): Promise<net.Socket> {
   const socket = net.connect(socketPath);
   await once(socket, "connect");
@@ -150,6 +153,7 @@ async function registerOrdinaryClient(
     writeMessage(socket, {
       type: "register",
       sessionId,
+      ...(scopeId ? { scopeId } : {}),
       session: {
         name: sessionId,
         cwd: repoDir,
@@ -188,7 +192,7 @@ async function advertiseSession(socket: net.Socket, requestId: string, name: str
   const response = new Promise<{ ok: boolean; name?: string }>((resolve, reject) => {
     const reader = createMessageReader((value) => {
       if (typeof value !== "object" || value === null || !("type" in value) || value.type !== "advertise_result") return;
-      if (!("requestId" in value) || value.requestId !== requestId) return;
+      if (!("requestId" in value) || value.requestId !== requestId || !("ok" in value) || typeof value.ok !== "boolean") return;
       socket.off("data", reader);
       const result = value as { ok: boolean; name?: string };
       resolve({ ok: result.ok, ...(result.name ? { name: result.name } : {}) });
@@ -254,6 +258,12 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
   const expectedCapabilities = new Set(["A".repeat(32), "C".repeat(32), "D".repeat(32)]);
   let delayFirstPreparedHello = true;
   let dropPeerAcks = false;
+  let disableExactFeature = false;
+  let holdRemoteRoster = false;
+  let holdNextPeerSend = false;
+  let heldPeerSend: { destination: net.Socket; value: unknown } | undefined;
+  const remoteRosterFrames: { source: net.Socket; value: unknown }[] = [];
+  let exactSender: ParleyClient | undefined;
   /** Assigned from broker_list_scopes once the brokers are up; the proxy
    * closures below capture it and only run during dials after assignment. */
   let localOriginId = "";
@@ -281,7 +291,10 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
         linkId: attach.linkId,
         localOrigin: { id: "host:penguin", label: "Penguin" },
         remoteOrigin: { id: localOriginId, label: "MacBook" },
-        scopeBindings: [{ localScopeId: null, localScopeAlias: "mistfall-remote", remoteScopeAlias: "mistfall-local" }],
+        scopeBindings: [
+        { localScopeId: null, localScopeAlias: "mistfall-remote", remoteScopeAlias: "mistfall-local" },
+        { localScopeId: "remote-private", localScopeAlias: "private-remote", remoteScopeAlias: "private-local" },
+      ],
       });
       const prepared = await readFirstFrame(destination);
       assert.equal(isBrokerAcceptPeerResult(prepared.value), true);
@@ -291,15 +304,32 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
         delayFirstPreparedHello = false;
         await new Promise((resolve) => setTimeout(resolve, 1_200));
       }
-      if (first.leftover.length > 0) destination.write(first.leftover);
+      const sourceReader = createMessageReader(value => {
+        const frame = value as { type?: string; features?: string[] };
+        if (disableExactFeature && frame.type === "peer_hello") {
+          frame.features = frame.features?.filter(feature => feature !== FEDERATION_EXACT_SEND_FEATURE);
+        }
+        if (holdNextPeerSend && frame.type === "peer_send") {
+          holdNextPeerSend = false;
+          heldPeerSend = { destination, value };
+          return;
+        }
+        writeMessage(destination, value);
+      }, error => source.destroy(error));
+      source.on("data", sourceReader);
       destination.on("data", createMessageReader(value => {
-        if (dropPeerAcks && (value as { type?: string }).type === "peer_send_result") return;
+        const type = (value as { type?: string }).type;
+        if (dropPeerAcks && type === "peer_send_result") return;
+        if (holdRemoteRoster && (type === "peer_roster_delta" || type === "peer_roster_snapshot")) {
+          remoteRosterFrames.push({ source, value });
+          return;
+        }
         writeMessage(source, value);
       }, error => source.destroy(error)));
+      if (first.leftover.length > 0) sourceReader(first.leftover);
       destination.resume();
-      source.pipe(destination);
       source.resume();
-})().catch((error) => source.destroy(error));
+    })().catch((error) => source.destroy(error));
   });
 
   try {
@@ -326,7 +356,10 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
       capability,
       localOrigin: { id: localOriginId, label: "MacBook" },
       remoteOrigin: { id: "host:penguin", label: "Penguin" },
-      scopeBindings: [{ localScopeId: null, localScopeAlias: "mistfall-local", remoteScopeAlias: "mistfall-remote" }],
+      scopeBindings: [
+        { localScopeId: null, localScopeAlias: "mistfall-local", remoteScopeAlias: "mistfall-remote" },
+        { localScopeId: "local-private", localScopeAlias: "private-local", remoteScopeAlias: "private-remote" },
+      ],
     });
 
     const malformedSocket = net.connect(localSocketPath);
@@ -353,7 +386,10 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
       linkId: "link_badversion",
       localOrigin: { id: "host:penguin", label: "Penguin" },
       remoteOrigin: { id: localOriginId, label: "MacBook" },
-      scopeBindings: [{ localScopeId: null, localScopeAlias: "mistfall-remote", remoteScopeAlias: "mistfall-local" }],
+      scopeBindings: [
+        { localScopeId: null, localScopeAlias: "mistfall-remote", remoteScopeAlias: "mistfall-local" },
+        { localScopeId: "remote-private", localScopeAlias: "private-remote", remoteScopeAlias: "private-local" },
+      ],
     });
     const preparationResult = await preparationResponse;
     assert.equal(isBrokerAcceptPeerResult(preparationResult), true);
@@ -383,7 +419,7 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     if (!mismatch.ok) assert.equal(mismatch.code, "E_ORIGIN_MISMATCH");
 
     const localClient = await registerOrdinaryClient(localSocketPath, "local-client");
-    const remoteClient = await registerOrdinaryClient(remoteSocketPath, "remote-client");
+    let remoteClient = await registerOrdinaryClient(remoteSocketPath, "remote-client");
     clientSockets.push(localClient, remoteClient);
     const importedRemote = await waitForImportedSession(localClient, "remote-client");
     const importedLocal = await waitForImportedSession(remoteClient, "local-client");
@@ -393,6 +429,111 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     assert.equal(importedLocal.federation?.originId, localOriginId);
     const scopesWithSessions = await listScopes(localSocketPath, "list_scopes_sessions_01");
     assert.deepEqual((scopesWithSessions as { scopes?: unknown[] }).scopes, [{ scopeId: null, liveSessions: 1 }]);
+    // Scope-qualified identities are routing serializations, not authority.
+    // A guessed row in another mapped namespace is indistinguishable from
+    // an absent row, including on retries and exact-target sends.
+    const scopedLocal = await registerOrdinaryClient(localSocketPath, "scoped-local", {}, "local-private");
+    const scopedRemote = await registerOrdinaryClient(remoteSocketPath, "scoped-remote", {
+      name: "Hidden remote colleague", cwd: "/hidden/private",
+    }, "remote-private");
+    clientSockets.push(scopedLocal, scopedRemote);
+    const privateRow = await waitForImportedSession(scopedLocal, "scoped-remote");
+    assert.equal((await listSessions(localClient, "scope_visibility_barrier")).some(row => row.id === privateRow.id), false);
+    const guessedId = encodeOriginQualifiedSessionIdentity({ originId: "host:penguin",
+      remoteScopeAlias: "private-remote", remoteStableSessionId: "scoped-remote" });
+    assert.equal(guessedId, privateRow.id);
+    const hiddenProbe = await sendDirect(localClient, guessedId, "scope_hidden_probe");
+    const missingProbe = await sendDirect(localClient, guessedId + "absent", "scope_missing_probe");
+    for (const result of [hiddenProbe, await sendDirect(localClient, guessedId, "scope_hidden_probe")]) {
+      assert.equal(result.code, "E_TARGET_NOT_FOUND");
+      assert.equal(result.recipient, undefined, "no hidden cwd/name/id returned in failure feedback");
+      assert.equal(result.reason, missingProbe.reason);
+    }
+    const scopedInbound = waitForBrokerMessage(scopedRemote, value => value.type === "message"
+      && (value.message as { id?: string })?.id === "scope_authorized_send");
+    assert.equal((await sendDirect(scopedLocal, privateRow.id, "scope_authorized_send")).type, "delivered");
+    await scopedInbound;
+
+    // Exercise exact remote delivery through the actual consumer API.
+    exactSender = new ParleyClient();
+    const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const oldScope = process.env.PI_PARLEY_SCOPE_ID;
+    process.env.PI_CODING_AGENT_DIR = localDir;
+    delete process.env.PI_PARLEY_SCOPE_ID;
+    try {
+      await exactSender.connect({ name: "exact-sender", cwd: repoDir, model: "test", pid: process.pid,
+        startedAt: Date.now(), lastActivity: Date.now() }, "exact-sender");
+    } finally {
+      if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
+      if (oldScope === undefined) delete process.env.PI_PARLEY_SCOPE_ID;
+      else process.env.PI_PARLEY_SCOPE_ID = oldScope;
+    }
+    await waitForImportedSession(remoteClient, "exact-sender");
+    const hiddenExact = await exactSender.sendToSession({ ...privateRow, endpointEpoch: "wrong_epoch_12345" }, { text: "scope before epoch" });
+    assert.equal(hiddenExact.code, "E_TARGET_NOT_FOUND");
+    assert.equal(hiddenExact.recipient, undefined);
+    const malformedExactResponse = waitForBrokerMessage(localClient, value => value.messageId === "invalid_remote_exact");
+    writeMessage(localClient, { type: "send", to: importedRemote.id, targetId: importedRemote.id,
+      message: { id: "invalid_remote_exact", timestamp: Date.now(), content: { text: "missing epoch" } } });
+    assert.equal((await malformedExactResponse).code, "E_INVALID_TARGET", "qualified to does not bypass exact field validation");
+    for (const [mode, fields] of [["invalid", { targetId: importedRemote.id, targetEpoch: importedRemote.endpointEpoch }],
+      ["resolved", {}]] as const) {
+      const id = `invalid_remote_mode_${mode}`;
+      const response = waitForBrokerMessage(localClient, value => value.messageId === id);
+      writeMessage(localClient, { type: "send", to: importedRemote.id, targetMode: mode, ...fields,
+        message: { id, timestamp: Date.now(), content: { text: "invalid target mode" } } });
+      assert.equal((await response).code, "E_INVALID_TARGET");
+    }
+
+    // Pause a valid exact send after origin validation, replace the remote
+    // endpoint, and delay its roster update. Destination must refuse delivery
+    // even though the origin still sees the original caller-owned snapshot.
+    holdRemoteRoster = true;
+    holdNextPeerSend = true;
+    const racedExact = exactSender.sendToSession(importedRemote, { text: "must not reach replacement" });
+    const holdDeadline = Date.now() + 5_000;
+    while (!heldPeerSend && Date.now() < holdDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(heldPeerSend, "exact send reached the controllable peer boundary");
+    assert.equal((heldPeerSend.value as { targetEndpointEpoch?: string }).targetEndpointEpoch, importedRemote.endpointEpoch);
+    remoteClient.destroy();
+    remoteClient = await registerOrdinaryClient(remoteSocketPath, "remote-client");
+    clientSockets.push(remoteClient);
+    await waitForImportedSession(remoteClient, "exact-sender");
+    const replacementDeliveries: unknown[] = [];
+    const replacementCollector = createMessageReader(value => {
+      if ((value as { type?: string }).type === "message") replacementDeliveries.push(value);
+    }, error => { throw error; });
+    remoteClient.on("data", replacementCollector);
+    writeMessage(heldPeerSend.destination, heldPeerSend.value);
+    heldPeerSend = undefined;
+    const destinationRebound = await racedExact;
+    assert.equal(destinationRebound.code, "E_TARGET_REBOUND");
+    assert.equal(destinationRebound.delivery, "failed");
+    assert.equal(destinationRebound.outcomeKnown, true);
+    assert.equal(destinationRebound.retryable, true);
+    assert.equal(replacementDeliveries.length, 0);
+    holdRemoteRoster = false;
+    for (const frame of remoteRosterFrames.splice(0)) writeMessage(frame.source, frame.value);
+    let replacementRow = importedRemote;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      replacementRow = await waitForImportedSession(localClient, "remote-client");
+      if (replacementRow.endpointEpoch !== importedRemote.endpointEpoch) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.notEqual(replacementRow.endpointEpoch, importedRemote.endpointEpoch);
+    const originRebound = await exactSender.sendToSession(importedRemote, { text: "old caller snapshot" });
+    assert.equal(originRebound.code, "E_TARGET_REBOUND");
+    assert.equal(originRebound.retryable, true);
+    assert.equal(originRebound.outcomeKnown, true);
+    assert.equal(replacementDeliveries.length, 0, "neither origin nor destination rebound reaches replacement");
+    const exactSuccess = await exactSender.sendToSession(replacementRow, { text: "fresh caller snapshot" });
+    assert.equal(exactSuccess.delivered, true);
+    assert.equal(exactSuccess.recipient?.endpointEpoch, replacementRow.endpointEpoch);
+    await listSessions(remoteClient, "exact_delivery_barrier");
+    assert.equal(replacementDeliveries.length, 1);
+    remoteClient.off("data", replacementCollector);
+
     // Routed direct send: the remote client receives the message with the
     // broker-authoritative imported sender identity, and the local sender
     // sees delivery feedback only from the correlated destination result.
@@ -445,17 +586,31 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     }, () => undefined);
     localClient.on("data", inFlightCollector);
     try {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        writeMessage(localClient, {
-          type: "send",
-          to: importedRemote.id,
-          message: {
-            id: "federated_inflight_1",
-            timestamp: Date.now(),
-            content: { text: "race the first delivery" },
-          },
-        });
+      const send = {
+        type: "send",
+        to: importedRemote.id,
+        message: {
+          id: "federated_inflight_1",
+          timestamp: Date.now(),
+          content: { text: "race the first delivery" },
+        },
+      };
+      holdNextPeerSend = true;
+      writeMessage(localClient, send);
+      const holdDeadline = Date.now() + 5_000;
+      while (!heldPeerSend && Date.now() < holdDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.ok(heldPeerSend, "first operation is held at the peer boundary, before an acknowledgement is possible");
+      writeMessage(localClient, send);
+      const duplicateDeadline = Date.now() + 5_000;
+      while (!inFlightResults.some(value => value.type === "delivery_failed" && value.code === "E_MESSAGE_ID_REUSE") && Date.now() < duplicateDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
       }
+      assert.ok(inFlightResults.some(value => value.type === "delivery_failed" && value.code === "E_MESSAGE_ID_REUSE"), "duplicate is refused before releasing the first operation");
+      // The peer-reader callback mutates this value while the client awaits.
+      const racingPeerSend = heldPeerSend as { destination: net.Socket; value: unknown } | undefined;
+      assert.ok(racingPeerSend);
+      writeMessage(racingPeerSend.destination, racingPeerSend.value);
+      heldPeerSend = undefined;
       const raceDeadline = Date.now() + 5_000;
       while (inFlightResults.length < 2 && Date.now() < raceDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -489,13 +644,13 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
         id: "federated_ask_1",
         timestamp: Date.now(),
         expectsReply: true,
-        content: { text: "remote asks arrive in a later slice" },
+        content: { text: "remote asks require authenticated preflight" },
       },
     });
     const blockingProbe = await blockingResponse;
     assert.equal(blockingProbe.type, "delivery_failed");
-    assert.equal(blockingProbe.code, "E_INVALID_MESSAGE");
-    assert.match(String(blockingProbe.reason), /later federation slice/);
+    assert.equal(blockingProbe.code, "E_SEND_UNSUPPORTED");
+    assert.match(String(blockingProbe.reason), /does not support text conversations/);
 
     const localChild = await registerOrdinaryClient(localSocketPath, "local-child", {
       isSubagent: true,
@@ -505,6 +660,9 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     clientSockets.push(localChild);
     const restrictedView = await listSessions(localChild, "roster_restricted_view");
     assert.equal(restrictedView.some((session) => session.federation !== undefined), false);
+    const restrictedSend = await sendDirect(localChild, importedRemote.id, "restricted_remote_probe");
+    assert.equal(restrictedSend.code, "E_TARGET_NOT_FOUND");
+    assert.equal(restrictedSend.recipient, undefined, "ACL-hidden remote identity is not revealed by feedback");
     const remoteViewBeforeAdvertise = await listSessions(remoteClient, "roster_hidden_local_child");
     assert.equal(remoteViewBeforeAdvertise.some((session) => session.federation?.remoteStableSessionId === "local-child"), false);
 
@@ -557,10 +715,30 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     const pruned = await listSessions(localClient, "roster_pruned_1");
     assert.equal(pruned.some((session) => session.federation?.originId === "host:penguin"), false);
 
+    disableExactFeature = true;
     const reconnected = await dialPeer(localSocketPath, request("request_abcdefgh", "C".repeat(32)));
     assert.equal(reconnected.ok, true);
     assert.equal(attachments.length, 2);
-    await waitForImportedSession(localClient, "remote-client");
+    const legacyRow = await waitForImportedSession(localClient, "remote-client");
+    const legacyExact = await exactSender.sendToSession(legacyRow, { text: "do not drop endpoint pin" });
+    assert.equal(legacyExact.code, "E_SEND_UNSUPPORTED");
+    assert.equal(legacyExact.delivered, false);
+    assert.equal(legacyExact.outcomeKnown, true);
+    const legacyDefaultExact = waitForBrokerMessage(localClient, value => value.messageId === "legacy_default_exact");
+    writeMessage(localClient, { type: "send", to: legacyRow.id, targetId: legacyRow.id, targetEpoch: legacyRow.endpointEpoch,
+      message: { id: "legacy_default_exact", timestamp: Date.now(), content: { text: "old exact client remains strict" } } });
+    assert.equal((await legacyDefaultExact).code, "E_SEND_UNSUPPORTED", "absent targetMode never silently drops an exact pin");
+    const legacyInbound = waitForBrokerMessage(remoteClient, value => value.type === "message"
+      && (value.message as { id?: string })?.id === "legacy_ordinary_send");
+    assert.equal((await sendDirect(localClient, legacyRow.id, "legacy_ordinary_send")).type, "delivered",
+      "ordinary peer-send-v1 remains compatible without exact feature");
+    await legacyInbound;
+    const ordinaryLegacyInbound = waitForBrokerMessage(remoteClient, value => value.type === "message"
+      && (value.message as { id?: string })?.id === "legacy_real_client_send");
+    const legacyOrdinary = await exactSender.send(legacyRow.id, { text: "ordinary resolution on legacy peer", messageId: "legacy_real_client_send" });
+    assert.equal(legacyOrdinary.delivered, true, "real client's automatic resolution may use legacy ordinary send");
+    await ordinaryLegacyInbound;
+    disableExactFeature = false;
 
     // Tear down and then race reciprocal dials. Canonical origin ordering picks
     // MacBook's outbound link, so overlap can transiently succeed but converges
@@ -585,7 +763,10 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
           linkId: attach.linkId,
           localOrigin: { id: localOriginId, label: "MacBook" },
           remoteOrigin: { id: "host:penguin", label: "Penguin" },
-          scopeBindings: [{ localScopeId: null, localScopeAlias: "mistfall-local", remoteScopeAlias: "mistfall-remote" }],
+          scopeBindings: [
+            { localScopeId: null, localScopeAlias: "mistfall-local", remoteScopeAlias: "mistfall-remote" },
+            { localScopeId: "local-private", localScopeAlias: "private-local", remoteScopeAlias: "private-remote" },
+          ],
         });
         const prepared = await readFirstFrame(destination);
         assert.equal(isBrokerAcceptPeerResult(prepared.value), true);
@@ -607,7 +788,10 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
       capability,
       localOrigin: { id: "host:penguin", label: "Penguin" },
       remoteOrigin: { id: localOriginId, label: "MacBook" },
-      scopeBindings: [{ localScopeId: null, localScopeAlias: "mistfall-remote", remoteScopeAlias: "mistfall-local" }],
+      scopeBindings: [
+        { localScopeId: null, localScopeAlias: "mistfall-remote", remoteScopeAlias: "mistfall-local" },
+        { localScopeId: "remote-private", localScopeAlias: "private-remote", remoteScopeAlias: "private-local" },
+      ],
     });
     const raceResults = await Promise.all([
       dialPeer(localSocketPath, request("request_raceleft", "D".repeat(32))),
@@ -625,6 +809,7 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     if (!stableFromLocal.ok) assert.equal(stableFromLocal.code, "E_ALREADY_CONNECTED");
     if (!stableFromRemote.ok) assert.equal(stableFromRemote.code, "E_ALREADY_CONNECTED");
 
+    await exactSender.disconnect();
     for (const socket of clientSockets.splice(0)) socket.end();
     await new Promise((resolve) => setTimeout(resolve, 100));
     for (const socket of proxiedSockets.splice(0)) socket.destroy();
@@ -634,6 +819,7 @@ test("two real brokers establish an explicit peer role through a FlightDeck-styl
     ]);
     assert.equal(exited, true, "both brokers should auto-shutdown after the final peer disconnects");
   } finally {
+    await exactSender?.disconnect().catch(() => undefined);
     for (const socket of clientSockets) socket.destroy();
     for (const socket of proxiedSockets) socket.destroy();
     proxy.close();

@@ -4,6 +4,9 @@ import {
   FEDERATION_PROTOCOL_NAME,
   FEDERATION_PROTOCOL_VERSION,
   FEDERATION_ROSTER_FEATURE,
+  FEDERATION_CONVERSATION_FEATURE,
+  FEDERATION_SEND_FEATURE,
+  FEDERATION_EXACT_SEND_FEATURE,
   FEDERATION_SESSION_ID_MAX_LENGTH,
   type FederationScopeBinding,
 } from "./federation-types.ts";
@@ -26,6 +29,8 @@ const MAX_SESSION_PROJECTION_BYTES = 1400;
 const CONTROL_OR_FORMAT_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
 
 export interface FederationRosterSessionProjection {
+  /** Present only on a conversation-negotiated link; broker-derived endpoint support. */
+  conversation?: boolean;
   endpointEpoch?: string;
   name?: string;
   description?: string;
@@ -90,12 +95,15 @@ export type FederationRosterFrame = PeerRosterSnapshot | PeerRosterDelta | PeerR
 export interface LocallyOwnedFederationSession {
   ownership: "local";
   exportEligible: boolean;
+  conversationCapable?: boolean;
   localScopeId: string | null;
   info: SessionInfo;
 }
 
 export interface FederationSessionProvenance {
   originId: string;
+  conversation?: boolean;
+  originEpoch?: string;
   originLabel?: string;
   remoteScopeAlias: string;
   remoteStableSessionId: string;
@@ -183,13 +191,14 @@ function isSequence(value: unknown): value is number {
 
 function isProjection(value: unknown): value is FederationRosterSessionProjection {
   if (!isRecord(value) || !hasOnlyKeys(value, ["cwd", "model", "pid", "startedAt", "lastActivity"], [
-    "endpointEpoch", "name", "description", "runtimeFallbackAlias", "status",
+    "conversation", "endpointEpoch", "name", "description", "runtimeFallbackAlias", "status",
     "contextPct", "contextTokens", "contextWindow", "tmuxPane",
   ])) return false;
   if (!isSafeBoundedText(value.cwd, 4096, true) || !isSafeBoundedText(value.model, 256, true)) return false;
   if (!Number.isSafeInteger(value.pid) || (value.pid as number) < 0) return false;
   if (!Number.isSafeInteger(value.startedAt) || (value.startedAt as number) < 0) return false;
   if (!Number.isSafeInteger(value.lastActivity) || (value.lastActivity as number) < 0) return false;
+  if (value.conversation !== undefined && typeof value.conversation !== "boolean") return false;
   if (value.endpointEpoch !== undefined && !isFederationCorrelationId(value.endpointEpoch)) return false;
   if (value.status !== undefined && !isSafeBoundedText(value.status, 256, true)) return false;
   if (value.tmuxPane !== undefined && !isSafeBoundedText(value.tmuxPane, 128)) return false;
@@ -298,11 +307,12 @@ export function isFederationRosterFrame(value: unknown): value is FederationRost
   return isPeerRosterSnapshot(value) || isPeerRosterDelta(value) || isPeerRosterResyncRequest(value);
 }
 
-function projectionFromSession(info: SessionInfo): FederationRosterSessionProjection {
+function projectionFromSession(info: SessionInfo, conversation?: boolean): FederationRosterSessionProjection {
   const safeInteger = (value: number): number => Number.isSafeInteger(value) && value >= 0 ? value : 0;
   const cwd = isSafeBoundedText(info.cwd, 4096, true) ? info.cwd : "";
   const model = isSafeBoundedText(info.model, 256, true) ? info.model : "unknown";
   const projection: FederationRosterSessionProjection = {
+    ...(conversation !== undefined ? { conversation } : {}),
     ...(info.endpointEpoch !== undefined && isFederationCorrelationId(info.endpointEpoch) ? { endpointEpoch: info.endpointEpoch } : {}),
     ...(info.name !== undefined ? { name: info.name } : {}),
     ...(info.description !== undefined ? { description: info.description } : {}),
@@ -322,6 +332,8 @@ function projectionFromSession(info: SessionInfo): FederationRosterSessionProjec
   // Preserve identity/presentation fields when possible, but shrink legacy
   // unbounded paths before giving up on an otherwise eligible local session.
   const compact: FederationRosterSessionProjection = {
+    ...(conversation !== undefined ? { conversation } : {}),
+    ...(info.endpointEpoch !== undefined && isFederationCorrelationId(info.endpointEpoch) ? { endpointEpoch: info.endpointEpoch } : {}),
     cwd: cwd.slice(0, 256),
     model: model.slice(0, 128),
     pid: safeInteger(info.pid),
@@ -432,11 +444,11 @@ export class FederationRosterState {
     return [...this.links.values()].flatMap((state) => [...state.imported.values()]);
   }
 
-  /** Resolves an origin-qualified imported identity across every live link. */
-  findImportedByQualifiedId(id: string): ImportedFederatedSession | undefined {
+  /** Resolves an imported identity only inside the caller-authorized local scope. */
+  findImportedByQualifiedId(id: string, localScopeId: string | null): ImportedFederatedSession | undefined {
     for (const state of this.links.values()) {
       const imported = state.imported.get(id);
-      if (imported) return imported;
+      if (imported && imported.localScopeId === localScopeId) return imported;
     }
     return undefined;
   }
@@ -578,7 +590,7 @@ export class FederationRosterState {
         const entry: FederationRosterEntry = {
           scopeAlias: binding.localScopeAlias,
           stableSessionId: local.info.id,
-          session: projectionFromSession(local.info),
+          session: projectionFromSession(local.info, link.features.includes(FEDERATION_CONVERSATION_FEATURE) ? local.conversationCapable === true : undefined),
         };
         if (!isRosterEntry(entry)) throw new FederationRosterError("Local session cannot be represented in federation");
         result.set(rosterKey(entry.scopeAlias, entry.stableSessionId), entry);
@@ -675,12 +687,19 @@ export class FederationRosterState {
       if (!binding) throw new FederationRosterError(`Remote scope alias ${entry.scopeAlias} is not authorized on this link`);
       const qualifiedId = this.qualifiedIdForRemote(link, entry.scopeAlias, entry.stableSessionId);
       if (result.has(qualifiedId)) throw new FederationRosterError("Duplicate qualified session identity in roster frame");
+      const { conversation: endpointConversation, ...projection } = entry.session;
+      if (endpointConversation !== undefined && !link.features.includes(FEDERATION_CONVERSATION_FEATURE)) {
+        throw new FederationRosterError("Endpoint conversation capability was not negotiated on this link");
+      }
       const info: ImportedFederatedSessionInfo = {
         id: qualifiedId,
-        ...entry.session,
+        ...projection,
         trustedLocal: false,
         federation: {
           originId: link.remoteOrigin.id,
+          originEpoch,
+          conversation: [FEDERATION_ROSTER_FEATURE, FEDERATION_SEND_FEATURE, FEDERATION_EXACT_SEND_FEATURE,
+            FEDERATION_CONVERSATION_FEATURE].every(feature => link.features.includes(feature)) && endpointConversation === true,
           ...(link.remoteOrigin.label ? { originLabel: link.remoteOrigin.label } : {}),
           remoteScopeAlias: entry.scopeAlias,
           remoteStableSessionId: entry.stableSessionId,

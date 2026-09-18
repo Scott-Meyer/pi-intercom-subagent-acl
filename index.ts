@@ -3,12 +3,12 @@ import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { defineTool, sessionCompactFailuresReachExtensions, sessionInfoChangesReachExtensions, StringEnum } from "./pi-compat.ts";
-import { ParleyClient, type SendResult } from "./broker/client.ts";
+import { ParleyClient, type SendOptions, type SendResult } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
-import { getAskTimeoutMs, loadConfig, type ParleyConfig } from "./config.ts";
+import { getAskTimeoutMs, loadRuntimeConfig, type ParleyConfig } from "./config.ts";
 import { COMPACTION_AWARENESS_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceipt, MessageReceiptStatus, PeerCompactionNotice, SessionInfo, SessionRegistration } from "./types.ts";
 import {
@@ -27,7 +27,7 @@ import {
   type ParleyOutboxResultV1,
 } from "./extension-api.ts";
 import { ReplyTracker, type ParleyContext } from "./reply-tracker.ts";
-import { restoreConversationHistory, messageControlKey, type OutstandingAsk } from "./conversation-history.ts";
+import { restoreConversationHistory, messageControlKey, matchesAskCounterpart, type OutstandingAsk } from "./conversation-history.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
@@ -677,7 +677,7 @@ function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): stri
 function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: boolean, idPrefix: string): string {
   const name = session.name || "Unnamed session";
   const remote = session.federation
-    ? `remote:${session.federation.originLabel ?? session.federation.originId}; text sends only when supported, no asks/replies/attachments`
+    ? `remote:${session.federation.originLabel ?? session.federation.originId}; ${session.federation.conversation ? "text conversations (ask/reply)" : "text sends when supported, no asks/replies"}; no attachments`
     : undefined;
   const tags = [isSelf ? "self" : session.cwd === currentCwd ? "same cwd" : undefined, remote, session.status]
     .filter((tag): tag is string => Boolean(tag));
@@ -716,7 +716,7 @@ function formatInboundDeliveryMetadata(message: Message): string {
 }
 export default function piParleyExtension(pi: ExtensionAPI) {
   let client: ParleyClient | null = null;
-  const config: ParleyConfig = loadConfig();
+  const config: ParleyConfig = loadRuntimeConfig((error) => console.error(error.message));
   const askTimeoutMs = getAskTimeoutMs();
   const compactionPresenceSupported = sessionCompactFailuresReachExtensions();
   const localExtensions = new Map<string, {
@@ -858,6 +858,8 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   }
   let replyWaiter: {
     from: string;
+    endpointEpoch?: string;
+    originEpoch?: string;
     replyTo: string;
     resolve: (message: Message) => void;
     reject: (error: Error) => void;
@@ -981,7 +983,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   function settleOutgoingReply(from: SessionInfo, message: Message): void {
     if (!message.replyTo || message.completesAsk === false || message.expectsReply) return;
     const ask = outstandingAsks.get(message.replyTo);
-    if (!ask || ask.to !== from.id) return;
+    if (!ask || !matchesAskCounterpart(ask, from)) return;
     recordConversationEntry("parley_ask_settled", { messageId: message.replyTo, reason: "reply accepted by host", timestamp: Date.now() });
     outstandingAsks.delete(message.replyTo);
   }
@@ -992,7 +994,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   function currentSendIdentity(client: ParleyClient): string {
     return client.getSelfSession()?.name?.trim() || pi.getSessionName()?.trim() || "unnamed session";
   }
-  function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown"): Promise<Message> {
+  function waitForReply(from: string, replyTo: string, signal?: AbortSignal, cancelOnAbort?: () => void, getDeliveryState: () => string = () => "unknown", endpointEpoch?: string, originEpoch?: string): Promise<Message> {
     if (replyWaiter) {
       return Promise.reject(new Error("Already waiting for a reply"));
     }
@@ -1019,6 +1021,8 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       signal?.addEventListener("abort", onAbort, { once: true });
       replyWaiter = {
         from,
+        ...(endpointEpoch ? { endpointEpoch } : {}),
+        ...(originEpoch ? { originEpoch } : {}),
         replyTo,
         resolve: (message) => {
           cleanup();
@@ -1707,7 +1711,6 @@ export default function piParleyExtension(pi: ExtensionAPI) {
           return;
         }
         const result = await activeClient.send(target.id, {
-          messageId: request.requestId,
           text: request.message,
           provenance: {
             type: "extension_outbox",
@@ -1855,7 +1858,10 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     const origin = entry.from.federation
       ? `\nRemote origin: ${entry.from.federation.originLabel || entry.from.federation.originId}; scope ${entry.from.federation.remoteScopeAlias}`
       : "";
-    const outgoing = injectedMessage.replyTo ? outstandingAsks.get(injectedMessage.replyTo) ?? findOutgoingTopic(injectedMessage.replyTo) : undefined;
+    const requestedAsk = injectedMessage.replyTo ? outstandingAsks.get(injectedMessage.replyTo) : undefined;
+    const isRequestedAnswer = requestedAsk !== undefined && matchesAskCounterpart(requestedAsk, entry.from)
+      && injectedMessage.completesAsk !== false && !injectedMessage.expectsReply;
+    const outgoing = requestedAsk ?? (injectedMessage.replyTo ? findOutgoingTopic(injectedMessage.replyTo) : undefined);
     const topic = outgoing && outgoing.to === entry.from.id
       ? `\nReply to your message: ${JSON.stringify(previewText(outgoing.message?.text ?? outgoing.preview, 240))}`
       : "";
@@ -1879,7 +1885,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     pendingHostEnvelopes.set(`message:${entry.message.id}`, envelope);
     try {
       pi.sendMessage(envelope,
-        delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger || Boolean(outgoing && outgoing.to === entry.from.id))
+        delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger || isRequestedAnswer)
           ? { triggerTurn: true } : { deliverAs: "steer" });
     } catch {
       emitMessageReceipt(entry.message.id, "queued", "retained locally; host injection will be retried");
@@ -1921,7 +1927,9 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     emitMessageReceipt(receivedMessage.id, "receiver_received");
     const waiter = replyWaiter;
     const fromMatches = waiter && ((from.name || from.id).toLowerCase() === waiter.from.toLowerCase() || from.id === waiter.from);
-    const matchedWaiter = fromMatches && receivedMessage.replyTo === waiter.replyTo && receivedMessage.completesAsk !== false && !receivedMessage.expectsReply;
+    const matchedWaiter = fromMatches && (waiter.endpointEpoch === undefined || waiter.endpointEpoch === from.endpointEpoch)
+      && (waiter.originEpoch === undefined || waiter.originEpoch === from.federation?.originEpoch)
+      && receivedMessage.replyTo === waiter.replyTo && receivedMessage.completesAsk !== false && !receivedMessage.expectsReply;
     replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
     recordConversationEntry("parley_inbound_received", {
       from, message: receivedMessage, receivedAt: receiverReceivedAt,
@@ -2195,14 +2203,13 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   async function resolveSessionTarget(activeClient: ParleyClient, nameOrId: string): Promise<string | null> {
     return resolveSessionFromRoster(await activeClient.listSessions(), nameOrId)?.id ?? null;
   }
-  async function resolveSupervisorTarget(activeClient: ParleyClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
+  async function resolveSupervisorTarget(activeClient: ParleyClient, metadata: ChildOrchestratorMetadata): Promise<SessionInfo | null> {
+    const sessions = await activeClient.listSessions();
     if (metadata.orchestratorSessionId) {
-      const bySessionId = await resolveSessionTarget(activeClient, metadata.orchestratorSessionId);
-      if (bySessionId) {
-        return bySessionId;
-      }
+      const bySessionId = resolveSessionFromRoster(sessions, metadata.orchestratorSessionId);
+      if (bySessionId) return bySessionId;
     }
-    return resolveSessionTarget(activeClient, metadata.orchestratorTarget);
+    return resolveSessionFromRoster(sessions, metadata.orchestratorTarget);
   }
   async function resolveCwdDeliveryTarget(activeClient: ParleyClient, options: {
     to?: string;
@@ -2231,7 +2238,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       ...(options.to ? { to: options.to } : {}),
     });
     if (existing.kind === "found" && existing.session) {
-      return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
+      return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id, session: existing.session };
     }
     if (!options.openProjectPaneIfMissing) {
       throw new Error(`${existing.reason ?? `No parley session is connected in ${targetCwd}.`} No session was launched and no message was sent.`);
@@ -2816,8 +2823,11 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       return;
     }
 
-    const details = event.details as { error?: unknown; delivered?: unknown };
-    if (details.error === true || details.delivered === false) {
+    const details = event.details as { error?: unknown; delivered?: unknown; replyMessageId?: unknown };
+    const receivedAnswer = typeof details.replyMessageId === "string" && details.replyMessageId.length > 0;
+    // A correlated answer completes the operation independently of transport
+    // acceptance. Keep the receipt unknown without misclassifying that answer.
+    if (details.error === true || (details.delivered === false && !receivedAnswer)) {
       return { isError: true };
     }
   });
@@ -2852,6 +2862,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
         }, { description: "Structured interview request for reason='interview_request'" })),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const actionGeneration = runtimeGeneration;
         const historyWarnings: string[] = [];
         const recordActionEntry = (type: string, data: unknown): void => {
           try { pi.appendEntry(type, data); }
@@ -2902,7 +2913,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
         }
 
         const metadata = childOrchestratorMetadata;
-        let resolvedSupervisor: string | null;
+        let resolvedSupervisor: SessionInfo | null;
         try {
           resolvedSupervisor = await resolveSupervisorTarget(connectedClient, metadata);
         } catch (error) {
@@ -2917,7 +2928,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
             details: { error: true },
           };
         }
-        const sendTo = resolvedSupervisor ?? metadata.orchestratorTarget;
+        const sendTo = resolvedSupervisor?.id ?? metadata.orchestratorTarget;
         const senderIdentity = currentSendIdentity(connectedClient);
         if (signal?.aborted) {
           return {
@@ -2982,45 +2993,68 @@ export default function piParleyExtension(pi: ExtensionAPI) {
         let deliveryState = "created";
         let questionId: string | null = null;
         let requestSendResult: SendResult | undefined;
+        const settleQuestion = (id: string, disposition: string): void => {
+          outstandingAsks.delete(id);
+          recordActionEntry("parley_ask_settled", { messageId: id, reason: disposition, timestamp: Date.now() });
+        };
         try {
-          questionId = randomUUID();
-          replyPromise = waitForReply(sendTo, questionId, signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
+          const prepared = resolvedSupervisor?.federation
+            ? await connectedClient.prepareConversation(resolvedSupervisor)
+            : undefined;
+          if (prepared && (!getLiveContext(ctx, actionGeneration) || client !== connectedClient)) {
+            throw new Error("Session ended during conversation preparation; no question was sent");
+          }
+          if (signal?.aborted) throw new Error("Cancelled before question dispatch");
+          if (replyWaiter) throw new Error("Already waiting for a reply");
+          questionId = prepared?.messageId ?? randomUUID();
+          const binding = {
+            ...(prepared?.recipient.endpointEpoch ? { endpointEpoch: prepared.recipient.endpointEpoch } : {}),
+            ...(prepared?.recipient.federation?.originEpoch ? { originEpoch: prepared.recipient.federation.originEpoch } : {}),
+          };
+          const requestText = reason === "interview_request"
+            ? formatChildOrchestratorMessage("interview", metadata, formatSupervisorInterviewRequest(supervisorInterview!, typeof params.message === "string" ? params.message : undefined))
+            : formatChildOrchestratorMessage("ask", metadata, params.message as string);
+          const sentAt = Date.now();
+          outstandingAsks.set(questionId, { to: sendTo, ...binding, targetDisplay: metadata.orchestratorTarget,
+            preview: previewText(requestText, 120) ?? requestText, sentAt, message: { text: requestText } });
+          recordActionEntry("parley_ask_pending", { messageId: questionId, to: sendTo, ...binding,
+            targetDisplay: metadata.orchestratorTarget, message: { text: requestText }, sentAt });
+          replyPromise = waitForReply(sendTo, questionId, signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState), binding.endpointEpoch, binding.originEpoch);
           replyPromise.catch(() => undefined);
           if (signal?.aborted) {
-            rejectReplyWaiter(new Error("Cancelled"));
+            rejectOwnedReplyWaiter(questionId, new Error("Cancelled"));
             try {
               await replyPromise;
             } catch {
               // The waiter was intentionally rejected above; the tool result reports cancellation.
             }
+            settleQuestion(questionId, "not-delivered");
             return {
               content: [{ type: "text", text: "Cancelled" }],
               details: { error: true },
             };
           }
-          const requestText = reason === "interview_request"
-            ? formatChildOrchestratorMessage("interview", metadata, formatSupervisorInterviewRequest(supervisorInterview!, typeof params.message === "string" ? params.message : undefined))
-            : formatChildOrchestratorMessage("ask", metadata, params.message as string);
-          const sendResult = await connectedClient.send(sendTo, {
+          const sendQuestion = (options: SendOptions): Promise<SendResult> => prepared
+            ? connectedClient.sendToSession(prepared.recipient, options)
+            : connectedClient.send(sendTo, options);
+          const sendResult = await sendQuestion({
             messageId: questionId,
             text: requestText,
             expectsReply: true,
             completesAsk: false,
             senderWaitMode: "blocking",
+            signal,
           });
           requestSendResult = sendResult;
           deliveryState = sendResult.delivery;
           if (!sendResult.delivered) {
+            if (sendResult.outcomeKnown) settleQuestion(questionId, "not-delivered");
             const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
             rejectOwnedReplyWaiter(questionId, new Error(`Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}`));
-            if (replyPromise) {
-              try {
-                await replyPromise;
-              } catch {
-                // The waiter was already rejected above. Keep the delivery failure as the only error here.
-              }
-            }
-            return {
+            let answered = false;
+            try { await replyPromise; answered = true; }
+            catch { /* Only a still-pending waiter was rejected. A received answer survives missing acceptance. */ }
+            if (sendResult.outcomeKnown || !answered) return {
               content: [{ type: "text", text: formatDeliveryResult(sendResult, { kind: "Ask", sender: senderIdentity, target: metadata.orchestratorTarget }) }],
               details: { error: true, ...deliveryDetails(sendResult) },
             };
@@ -3040,6 +3074,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
           });
           const requestCompaction = sendResult.peerCompaction;
           const replyMessage = await replyPromise;
+          settleQuestion(questionId, "answer returned");
           const replyText = replyMessage.content.text;
           const replyAttachments = replyMessage.content.attachments?.length
             ? formatAttachments(replyMessage.content.attachments)
@@ -3065,9 +3100,10 @@ export default function piParleyExtension(pi: ExtensionAPI) {
           return {
             content: [{
               type: "text",
-              text: `${awareness.length ? `${awareness.join("\n\n")}\n\n` : ""}**Reply from supervisor:**\nQuestion message ID: ${questionId}\nReply message ID: ${replyMessage.id}\n\n${replyText}${replyAttachments}${historyNote()}${structuredReply?.error ? `\n\nThe structured answer could not be validated: ${structuredReply.error}` : ""}`,
+              text: `${!sendResult.outcomeKnown ? "Ask acceptance remains unknown; no replay was attempted. A correlated answer was received independently.\n\n" : ""}${awareness.length ? `${awareness.join("\n\n")}\n\n` : ""}**Reply from supervisor:**\nQuestion message ID: ${questionId}\nReply message ID: ${replyMessage.id}\n\n${replyText}${replyAttachments}${historyNote()}${structuredReply?.error ? `\n\nThe structured answer could not be validated: ${structuredReply.error}` : ""}`,
             }],
             details: {
+              ...deliveryDetails(sendResult),
               replyMessageId: replyMessage.id,
               ...(structuredReply
                 ? structuredReply.value !== undefined
@@ -3119,16 +3155,20 @@ export default function piParleyExtension(pi: ExtensionAPI) {
         if (isPartial) {
           return new Text(theme.fg("warning", "Waiting for supervisor..."), 0, 0);
         }
-        const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string; structuredReplyParseError?: string } | undefined;
+        const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; replyMessageId?: string; outcomeKnown?: boolean; reason?: string; structuredReplyParseError?: string } | undefined;
         const textContent = firstTextContent(result);
-        const failed = Boolean(context.isError || details?.error === true || details?.delivered === false);
+        const receivedAnswer = Boolean(details?.replyMessageId);
+        const failed = Boolean(context.isError || details?.error === true || (details?.delivered === false && !receivedAnswer));
         const parseWarning = typeof details?.structuredReplyParseError === "string";
-        let text = failed
-          ? theme.fg("error", "✗ ")
-          : parseWarning
-            ? theme.fg("warning", "⚠ ")
-            : theme.fg("success", "✓ ");
-        text += theme.fg(failed ? "error" : "text", textContent);
+        const uncertain = details?.outcomeKnown === false && !parseWarning;
+        let text = uncertain
+          ? theme.fg("warning", "? ")
+          : failed
+            ? theme.fg("error", "✗ ")
+            : parseWarning
+              ? theme.fg("warning", "⚠ ")
+              : theme.fg("success", "✓ ");
+        text += theme.fg(uncertain ? "warning" : failed ? "error" : "text", textContent);
         if (parseWarning) {
           text += "\n" + theme.fg("warning", `Structured reply parse issue: ${details.structuredReplyParseError}`);
         }
@@ -3396,6 +3436,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const actionGeneration = runtimeGeneration;
       let sendIdentity: string | undefined;
       const historyWarnings: string[] = [];
       const recordActionEntry = (type: string, data: unknown): void => {
@@ -3529,12 +3570,12 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
             hasNotifiedSupervisorOfAdvertise = true;
             try {
               const resolvedSupervisor = await resolveSupervisorTarget(connectedClient, metadata);
-              const sendTarget = resolvedSupervisor ?? metadata.orchestratorTarget;
+              const sendTarget = resolvedSupervisor?.id ?? metadata.orchestratorTarget;
               const advertiseNotice = await connectedClient.send(sendTarget, {
                 text: formatChildOrchestratorMessage(
                   "update",
                   metadata,
-                  `This subagent has advertised itself as "${result.name}" and is now fully visible to and reachable by every session on the parley mesh, not just you.`,
+                  `This subagent has advertised itself as "${result.name}" and is now discoverable by other eligible peers within its Parley scope.`,
                 ),
                 expectsReply: false,
               });
@@ -3954,8 +3995,17 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
                 };
               }
             }
-            captureSendIdentity();
-            const result = await connectedClient.send(sendTo, {
+            const threadRecipient = replyTo
+              ? resolveSessionFromRoster(await connectedClient.listSessions(), sendTo)
+              : undefined;
+            const prepared = threadRecipient?.federation
+              ? await connectedClient.prepareConversation(threadRecipient)
+              : undefined;
+            if (prepared && (!getLiveContext(ctx, actionGeneration) || client !== connectedClient)) {
+              throw new Error("Session ended during thread preparation; no message was sent");
+            }
+            const sendOptions: SendOptions = {
+              ...(prepared ? { messageId: prepared.messageId } : {}),
               text: message,
               attachments,
               replyTo,
@@ -3964,7 +4014,11 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
               retryOf,
               signal: _signal,
               contactKind: "direct",
-            });
+            };
+            captureSendIdentity();
+            const result = prepared
+              ? await connectedClient.sendToSession(prepared.recipient, sendOptions)
+              : await connectedClient.send(sendTo, sendOptions);
             if (!result.delivered) {
               return {
                 content: [{ type: "text", text: formatDeliveryResult(result, { kind: "Message", sender: sendIdentity!, target: targetDisplay }) + projectObservation(target) }],
@@ -4037,10 +4091,11 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
           let questionSendResult: SendResult | undefined;
           let questionTargetDisplay = to ?? cwd ?? "peer";
           let questionTargetId: string | undefined;
-          const rememberQuestion = (id: string, target: string, label: string): void => {
+          const rememberQuestion = (id: string, target: string, label: string, endpointEpoch?: string, originEpoch?: string): void => {
             const sentAt = Date.now();
-            outstandingAsks.set(id, { to: target, targetDisplay: label, preview: previewText(message, 120) ?? message, sentAt, message: { text: message, attachments } });
-            recordActionEntry("parley_ask_pending", { messageId: id, to: target, targetDisplay: label, message: { text: message, attachments }, sentAt });
+            const binding = { ...(endpointEpoch ? { endpointEpoch } : {}), ...(originEpoch ? { originEpoch } : {}) };
+            outstandingAsks.set(id, { to: target, ...binding, targetDisplay: label, preview: previewText(message, 120) ?? message, sentAt, message: { text: message, attachments } });
+            recordActionEntry("parley_ask_pending", { messageId: id, to: target, ...binding, targetDisplay: label, message: { text: message, attachments }, sentAt });
           };
           const settleQuestion = (id: string, reason: string): void => {
             outstandingAsks.delete(id);
@@ -4058,14 +4113,14 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
             if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
             } else {
-              const resolved = await resolveSessionTarget(connectedClient, to!);
+              const resolved = resolveSessionFromRoster(await connectedClient.listSessions(), to!);
               if (!resolved) {
                 return {
                   content: [{ type: "text", text: `Session "${to}" is not currently connected. Questions require a connected peer; no question was sent.` }],
                   details: { error: true },
                 };
               }
-              target = { id: resolved, label: to! };
+              target = { id: resolved.id, label: to!, session: resolved };
             }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
@@ -4089,11 +4144,25 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
                 details: { error: true },
               };
             }
+            const prepared = target.session?.federation
+              ? await connectedClient.prepareConversation(target.session)
+              : undefined;
+            if (prepared && (!getLiveContext(ctx, actionGeneration) || client !== connectedClient)) {
+              throw new Error("Session ended during conversation preparation; no question was sent");
+            }
+            if (_signal?.aborted) throw new Error("Cancelled before question dispatch");
+            if (replyWaiter && blocking !== false) throw new Error("Already waiting for a reply");
+            const preparedId = prepared?.messageId ?? randomUUID();
+            const responderEpoch = prepared?.recipient.endpointEpoch;
+            const responderOriginEpoch = prepared?.recipient.federation?.originEpoch;
+            const sendQuestion = (options: SendOptions): Promise<SendResult> => prepared
+              ? connectedClient.sendToSession(prepared.recipient, options)
+              : connectedClient.send(sendTo, options);
             if (blocking === false) {
-              const askId = randomUUID();
-              rememberQuestion(askId, sendTo, targetDisplay);
+              const askId = preparedId;
+              rememberQuestion(askId, sendTo, targetDisplay, responderEpoch, responderOriginEpoch);
               captureSendIdentity();
-              const sendResult = await connectedClient.send(sendTo, {
+              const sendResult = await sendQuestion({
                 messageId: askId,
                 text: message,
                 attachments,
@@ -4140,12 +4209,12 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
                 },
               };
             }
-            questionId = randomUUID();
-            rememberQuestion(questionId, sendTo, targetDisplay);
-            replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
+            questionId = preparedId;
+            rememberQuestion(questionId, sendTo, targetDisplay, responderEpoch, responderOriginEpoch);
+            replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState), responderEpoch, responderOriginEpoch);
             replyPromise.catch(() => undefined);
             captureSendIdentity();
-            const sendResult = await connectedClient.send(sendTo, {
+            const sendResult = await sendQuestion({
               messageId: questionId,
               text: message,
               attachments,
@@ -4162,18 +4231,23 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
             questionSendResult = sendResult;
             deliveryState = sendResult.delivery;
             questionCompaction = sendResult.peerCompaction;
+            // Correlated answers and transport acceptance are independent observations.
+            // A fast answer may already have resolved the waiter while the ask ACK
+            // was lost. Return that answer without inventing delivery acceptance.
             if (!sendResult.delivered) {
               if (sendResult.outcomeKnown) settleQuestion(questionId, "not-delivered");
               const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
               rejectOwnedReplyWaiter(questionId, new Error(`Message to "${targetDisplay}" was not delivered: ${errorText}`));
-              if (replyPromise) {
-                try {
-                  await replyPromise;
-                } catch {
-                  // The waiter was already rejected above. Keep the delivery failure as the only error here.
-                }
+              let answered = false;
+              try {
+                await replyPromise;
+                answered = true;
+              } catch {
+                // Rejecting a still-pending waiter closes this blocking call. An
+                // already-resolved answer survives, even if its microtask was
+                // queued after the send result's continuation.
               }
-              return {
+              if (sendResult.outcomeKnown || !answered) return {
                 content: [{ type: "text", text: formatDeliveryResult(sendResult, { kind: "Ask", sender: sendIdentity!, target: targetDisplay }) + projectObservation(target) }],
                 details: { error: true, ...deliveryDetails(sendResult) },
               };
@@ -4211,7 +4285,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
             connectedClient.acknowledgeSendContact(sendResult);
             acknowledgeInboundMessageContact(connectedClient, replyMessage);
             return {
-              content: [{ type: "text", text: `${awarenessText}**Reply from ${targetDisplay}** (asked as ${sendIdentity!}):\nQuestion message ID: ${questionId}\nReply message ID: ${replyMessage.id}\n\n${replyText}${replyAttachments}` }],
+              content: [{ type: "text", text: `${!sendResult.outcomeKnown ? "Ask acceptance remains unknown; no replay was attempted. A correlated answer was received independently.\n\n" : ""}${awarenessText}**Reply from ${targetDisplay}** (asked as ${sendIdentity!}):\nQuestion message ID: ${questionId}\nReply message ID: ${replyMessage.id}\n\n${replyText}${replyAttachments}` }],
               details: {
                 ...deliveryDetails(sendResult),
                 replyMessageId: replyMessage.id,
@@ -4268,15 +4342,25 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
                 details: { error: true },
               };
             }
-            captureSendIdentity();
-            const result = await connectedClient.send(target.from.id, {
+            const prepared = target.from.federation
+              ? await connectedClient.prepareConversation(target.from)
+              : undefined;
+            if (prepared && (!getLiveContext(ctx, actionGeneration) || client !== connectedClient)) {
+              throw new Error("Session ended during reply preparation; no answer was sent");
+            }
+            const replyOptions: SendOptions = {
+              ...(prepared ? { messageId: prepared.messageId } : {}),
               text: message,
               attachments,
               replyTo: target.message.id,
               completesAsk: true,
               signal: _signal,
               contactKind: "direct",
-            });
+            };
+            captureSendIdentity();
+            const result = prepared
+              ? await connectedClient.sendToSession(prepared.recipient, replyOptions)
+              : await connectedClient.send(target.from.id, replyOptions);
             if (!result.delivered) {
               return {
                 content: [{ type: "text", text: formatDeliveryResult(result, { kind: "Reply", sender: sendIdentity!, target: target.from.name || target.from.id }) }],
@@ -4414,7 +4498,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
       return new Text(text, 0, 0);
     },
     renderResult(result, { isPartial }, theme, context) {
-      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string; senderIdentity?: string; outcomeKnown?: boolean; unknownCount?: number } | undefined;
+      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; replyMessageId?: string; reason?: string; senderIdentity?: string; outcomeKnown?: boolean; unknownCount?: number } | undefined;
       if (details?.senderIdentity) {
         const state = (context.state ?? {}) as { senderIdentity?: string };
         if (state.senderIdentity !== details.senderIdentity) {
@@ -4426,7 +4510,7 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
       if (isPartial) {
         return new Text(theme.fg("warning", details?.senderIdentity ? `Parley working as ${details.senderIdentity}…` : "Parley working..."), 0, 0);
       }
-      const failed = Boolean(context.isError || details?.error === true || details?.delivered === false);
+      const failed = Boolean(context.isError || details?.error === true || (details?.delivered === false && !details?.replyMessageId));
       const uncertain = details?.outcomeKnown === false || (details?.unknownCount ?? 0) > 0;
       let text = uncertain ? theme.fg("warning", "? ") : failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
       text += theme.fg(uncertain ? "warning" : failed ? "error" : "text", result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n"));
@@ -4527,7 +4611,8 @@ Receipts include sender/recipient identity, exact message IDs, delivery state, a
   async function openParleyOverlay(ctx: ExtensionContext): Promise<void> {
     const overlayGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, overlayGeneration);
-    if (!liveContext?.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") return;
+    const mode = (liveContext as (ExtensionContext & { mode?: string }) | null)?.mode;
+    if (!liveContext?.hasUI || (mode !== undefined && mode !== "tui")) return;
 
     let overlayClient: ParleyClient;
     try {

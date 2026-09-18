@@ -55,7 +55,7 @@ A session becomes parley-connected when all of these are true:
 - the session has started or reloaded after the extension was installed
 - the local broker is running or can be auto-started
 
-The session list shows connected sessions visible through the caller's routing scope and subagent permissions, not every open Pi process. Remote rows identify their origin. A remote link may support direct text sends or discovery only; other conversation operations remain host-local.
+The session list shows connected sessions visible through the caller's routing scope and subagent permissions, not every open Pi process. Remote rows identify their origin and negotiated support: text conversations, text sends only, or discovery only. Remote attachments, mailboxes, and broadcast are not supported.
 
 If a session is unnamed, pi-parley exposes a collision-resistant runtime-only fallback alias like `session-1a2b3c4d-5e6f-7a8b` so other connected sessions can target it. That alias is not persisted as the Pi session title or treated as a reconnect identity, so `pi --resume` can keep showing the transcript snippet without allowing a different unnamed process to inherit queued mail.
 
@@ -127,7 +127,7 @@ Registered only with the required pi-subagents child bridge metadata and no nati
 
 **`broadcast`** — Sends independent messages to the current snapshot of visible live **host-local** peers, excluding the sender. Scope and subagent permissions still apply. It neither includes remote rows nor queues disconnected sessions, and rejects targeting/thread fields.
 
-**`ask`** — Sends a question to a connected local recipient. It waits for the explicit answer by default, or returns the initial delivery outcome with `blocking: false`. Asynchronous answers enter the conversation later, including while a headless caller works. Offline asks fail rather than entering a mailbox. Timeout and cancellation are separate outcomes.
+**`ask`** — Sends a question to a connected local recipient or a negotiated remote conversation endpoint. It waits for the explicit answer by default, or returns the initial delivery outcome with `blocking: false`. Asynchronous answers enter the conversation later, including while a headless caller works. Offline asks fail rather than entering a mailbox. Timeout and cancellation are separate outcomes.
 
 **`reply`** — Explicitly answers a pending ask or threads a response to an ordinary message. It uses the active parley context, otherwise the sole pending ask; `to` can select a sender and exact `replyTo` can select a retained message. Ambiguity returns candidate context rather than guessing. A clarification `ask` does not complete the original question.
 
@@ -192,7 +192,7 @@ Create `~/.pi/agent/parley/config.json`:
 | `replyHint` | true | Include a reply affordance for incoming asks in the rendered message |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
 
-If `config.json` cannot be parsed or contains an invalid value, pi-parley logs the error and disables unsolicited broker auto-triggering with `inboundTrigger: "never"` until the config is fixed. Explicit requested-answer and control-notice delivery still applies.
+If `config.json` cannot be parsed or contains an invalid value, pi-parley logs the error and uses safe defaults: `inboundTrigger: "never"` and `confirmSend: true` until the config is fixed. Explicit requested-answer and control-notice delivery still applies. A valid explicit `enabled: false` remains respected even if another setting is invalid; outbox sends without a confirmation UI stay blocked.
 Obsolete `toolVisibility` values are ignored; the generic `parley` tool remains stable in the active tool set for prompt-cache friendliness.
 
 Custom broker commands are trusted local configuration: anyone who can edit this config can choose the executable used for future broker auto-spawns. For example, if you have Bun installed and want it to start the broker directly, use:
@@ -277,6 +277,25 @@ pi.events.emit(PARLEY_OUTBOX_REQUEST_EVENT, {
 
 `confirmSend` applies to outbox requests. If confirmation is required and no UI is available, the request fails closed with `confirmation_unavailable`. The outbox resolves the target through the current session's scoped parley client, so extensions cannot choose the sender, scope, or resolved target ID. Duplicate `requestId` values are rejected and do not deliver again. Receiver messages include structured `extension_outbox` provenance in message details and model-visible sender context.
 
+### Peer-stream providers
+
+Cross-computer transport is caller-loaded and opt-in. Parley does not discover hosts, import a transport provider, choose default remote endpoints, or require a particular operating system or management application.
+
+```typescript
+import { PeerStreamController } from "pi-parley/broker/attachment.ts";
+
+const peers = new PeerStreamController();
+const provider = peers.registerProvider(acquireAuthenticatedDuplex);
+// Registration alone does not acquire or connect.
+const link = await provider.attach(binding, brokerAuthority);
+// Later: revoke admissions and join acquisitions, links, and cleanup.
+await peers.close();
+```
+
+The factory receives an opaque caller-defined binding and an abort signal, and returns an owned binary Node `Duplex` authenticated to the exact destination broker. `brokerAuthority` supplies an explicit local broker endpoint, expected Parley origins, and independently authorized scope bindings for each end. Provider/host identities do not define Parley origins or broker/session incarnations.
+
+`attachPeerStream(options)` and `peers.attachOwnedStream(options)` accept an already-owned stream instead. Ownership transfers at invocation, including failed startup. Adapters may use `Duplex.from({ readable, writable })` for stdio, but stream destruction must join the provider's own cleanup obligations. EOF half-closes sending after admitted writes settle; receiving remains open. No acquire/connect/retry/replay happens implicitly. An attachment resolves only after broker handshake acceptance; its non-rejecting `completion` and idempotent `close()` join admitted writes and owned cleanup. Neither transport setup nor a write callback is a message-delivery receipt.
+
 ## How It Works
 
 ```mermaid
@@ -309,15 +328,19 @@ The broker is a standalone TypeScript process that manages session registration 
 
 Messages use length-prefixed JSON over a local socket/pipe transport (4-byte length + JSON payload) to handle fragmentation properly. The protocol includes request correlation for session listing, explicit delivery failures, validation for malformed or out-of-order messages, a frame-size cap, per-connection local rate limiting, and no-op presence coalescing.
 
-**Experimental broker federation.** A trusted local controller such as FlightDeck can ask the broker to dial an ephemeral loopback bridge with a single-use capability. The broker writes a capability-bearing `bridge_attach` preface for FlightDeck to consume. Before opaque forwarding begins, FlightDeck independently prepares the destination broker's expected origins and local scope bindings through `broker_accept_peer`; that exact prepared destination connection becomes the opaque pipe, and the brokers then complete a strict `peer_hello` / `peer_hello_ack` exchange. Link IDs are broker-generated, public scope aliases never expose private local scope IDs to the peer, reciprocal dials converge through deterministic origin ordering, and accepted peer links use an explicit connection role rather than impersonating ordinary clients.
+**Experimental broker federation.** A caller-owned authenticated stream attaches two brokers without making either broker network-addressable. The neutral attachment controller handles the single-use `bridge_attach` preface and independently authorized `broker_accept_peer` preparation; that exact prepared destination connection becomes the opaque pipe. Readiness requires the brokers' strict `peer_hello` / `peer_hello_ack` handshake. Public scope aliases never expose private local scope IDs, and peer links never impersonate ordinary local clients.
 
 When both brokers negotiate `peer-roster-v1`, each link exchanges an authoritative bounded snapshot followed by monotonically sequenced deltas under a broker-lifetime origin epoch. Sequence gaps request a fresh snapshot; stale epochs cannot roll state back; and disconnect atomically prunes only that link's imported sessions. Brokers export only locally owned mains and explicitly advertised subagents, never re-export imports. Raw local scope IDs remain link-local authority while public aliases qualify remote identities. Imported rows are visibly marked `remote:…`, are never `trustedLocal`, and respect local scope/subagent visibility.
 
-When both brokers also negotiate `peer-send-v1`, direct sends to imported `oqs1.*` targets route over the link: the origin broker replays/records locally, correlates the send, and confirms acceptance only when the destination broker's correlated result arrives. Link loss or a deadline after dispatch can leave the outcome unknown: a missing acknowledgement is not proof of nondelivery. The destination resolves the sender from its broker-authoritative imported roster, requires a locally owned, scope-matched, ACL-visible target, dedupes per-link send ids, and delivers through the ordinary message pipeline so steering and waking behave exactly like local delivery. V1 remote sends are direct text-only (≤32 KiB): asks, replies, supersession, attachments, broadcast, and mailbox queueing remain host-local.
+`peer-send-v1` supports direct text sends (≤32 KiB) to imported `oqs1.*` sessions. The destination authenticates the sender through its imported roster and enforces local target ownership, scope, and visibility. A correlated destination result confirms acceptance; a missing acknowledgement does not prove nondelivery. Legacy links remain send-only or discovery-only.
+
+`peer-conversation-text-v1` adds text asks, replies, and threaded progress when both brokers **and participating endpoint clients** support the conversation contract and exact sends. Before an ask installs its waiter/history, `prepareConversation()` returns a canonical `oqm1.*` message ID and pinned author/recipient snapshots. Retained IDs include the original author's origin, scope, broker incarnation, session identity, endpoint incarnation, and nonce. Replies retain the original `replyTo`; only the recorded counterpart with both endpoint and broker incarnations intact may answer. Progress does not complete an ask, and replacement endpoints are not rebound. Ordinary notifications on capable endpoints also retain replyable conversation identities.
+
+A bounded, flushed dispatch journal records attempts before dispatch. Uncertain outcomes survive broker-process crashes/restarts and reconnects without automatic replay; only a positively correlated preacceptance nondelivery verdict can rearm an attempt. Retained uncertainty still blocks an unchanged legacy retry if its name now resolves locally or the target upgrades to conversations; preflight checks the original identity before conversion. Capability downgrade does not turn a retained receipt into known nondelivery. Caller-supplied scalar identities are durably associated with converted handles before preparation returns; association alone is not dispatch, and both identities share one admission record. Retained identities remain unknown/non-retryable when discovery or preflight cannot recover a verdict, while fresh operations remain known-unsent before dispatch. Passive lookup creates no journal; an incomplete final append preserves the verified prefix and allows unrelated local work while disabling new federated dispatch. Unreadable or corrupt complete history is not treated as absence. Persistence failure or exhausted retention fails closed before a new dispatch. This is a broker-process recovery guarantee, not a promise of recovery after host power loss or filesystem loss. If an answer arrives before a lost ask acknowledgement, the blocking tool returns the answer while keeping transport acceptance explicitly unknown.
 
 The broker owns a persisted canonical federation origin (adopted from the first controller-supplied id or minted as `install:<uuid>`), exposed with live scope enumeration through the trusted-local `broker_list_scopes` control; every dial/accept must present exactly it.
 
-Remote links without `peer-send-v1` support remain discovery-only. Broadcast, queued mailboxes, extension channels, and compaction awareness remain host-local in federation v1. Identity transport, roster replication, and routed sends are negotiated as separate capabilities.
+Caller-owned endpoint snapshots additionally require `peer-send-exact-v1`: replacement endpoints fail with `E_TARGET_REBOUND`, and legacy links reject pinned sends rather than silently delivering to a replacement. Ordinary re-resolvable sends remain compatible with `peer-send-v1`. Remote attachments, supersession, queued mailboxes, broadcast, extension channels, compaction awareness, and multi-hop routing are outside this slice. Identity transport, roster replication, direct sends, and conversations negotiate independently; rolling older local clients keep their original metadata schema.
 
 Session IDs are the trusted addressing key within one broker routing scope. Duplicate names remain allowed, but ambiguous names fail rather than selecting a recipient. The stable session ID shown by `list`/`status` distinguishes those endpoints. Mail queued for a disconnected session is redelivered to a session that reconnects under the same session ID, or to a session that matches both its explicit name and its directory, so a same-named session in a different project never inherits another project's queued messages. Runtime-only `session-...` aliases are excluded from name-based mailbox reconnection, and a disconnected mailbox is never remapped to the sender. Set `PI_PARLEY_STABLE_ID` or `stableId` in `config.json` to pin a session's parley ID across full process relaunches; `config.json` is machine-global, so a fixed `stableId` there applies to every session on the machine and the newest registration takes over that identity only within the same `PI_PARLEY_SCOPE_ID` boundary. The broker owns local trust metadata such as `trustedLocal`; `peerUid` is reserved for runtimes that can expose real peer credentials and is left unset otherwise. Client-supplied cwd/model/pid/status are display metadata, not authentication.
 
@@ -378,6 +401,8 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 │   ├── federation-protocol.ts # Strict validators and qualified ID codec
 │   ├── federation-roster.ts   # Snapshot/delta import and resynchronization
 │   ├── federation-send.ts     # Routed direct send frames and correlation
+│   ├── federation-conversation.ts # Qualified identities and durable dispatch barriers
+│   ├── attachment.ts          # Neutral owned streams and lazy provider registration
 │   ├── federation-origin.ts   # Persisted canonical federation origin
 │   ├── peer-link.ts      # Peer authority, handshake, and lifecycle
 │   ├── framing.ts        # Length-prefixed JSON protocol
@@ -396,7 +421,7 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 
 ## Limitations
 
-- **Remote messaging is direct text-only** — Federation supports broker identity, a replicated remote roster, and routed direct text sends. Asks, replies, receipts, and attachments remain host-local.
+- **Remote conversations are negotiated text-only** — Capable brokers and endpoint clients support asks/replies/progress; older links remain send-only or discovery-only. Attachments, remote mailboxes, and multi-hop routing are unsupported.
 - **Bounded inspection, not a separate archive** — `pending` and `read` expose retained incoming context; journaled history lives in the Pi session, not a standalone durable inbox
 - **No attachments UI** — `file`, `snippet`, and `context` attachments are supported in the protocol, but not in the compose overlay
 - **Visibility is scoped** — The roster includes connected sessions permitted by routing scope and child ACLs, not every Pi process or every sibling

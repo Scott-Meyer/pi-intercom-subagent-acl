@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   runtime:
-    name: Runtime ownership (${{ matrix.os }})
+    name: Runtime and federation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -26,7 +26,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx tsx --test broker/build.test.ts broker/process-lock.test.ts broker/runtime-claim.test.ts broker/runtime-lifecycle.test.ts
+      - run: npx tsx --test broker/build.test.ts broker/process-lock.test.ts broker/runtime-claim.test.ts broker/runtime-lifecycle.test.ts broker/federation-conversation.test.ts broker/federation-conversation.integration.test.ts broker/attachment.test.ts federation-extension.integration.test.ts
 
   package:
     name: Package and supported Pi hosts

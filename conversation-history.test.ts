@@ -93,3 +93,25 @@ test("unrelated custom entry types cannot populate or settle Parley conversation
   assert.equal(state.settledIncoming.size, 0);
   assert.deepEqual([...state.outgoing.keys()], ["ask"]);
 });
+
+test("recovery retains exact counterpart bindings and cannot settle an ask using a replacement incarnation", () => {
+  const original = { ...peer(), endpointEpoch: "original-endpoint", federation: {
+    originId: "host:planner", remoteScopeAlias: "shared", remoteStableSessionId: peer().id, originEpoch: "original-broker", conversation: true,
+  } };
+  const entry = pending("retained-author-qualified-handle");
+  const boundPending = { ...entry, data: { ...entry.data, endpointEpoch: original.endpointEpoch, originEpoch: original.federation.originEpoch } };
+  const answer = message("retained-answer-handle", { replyTo: entry.data.messageId, completesAsk: true });
+  for (const other of [
+    { ...original, endpointEpoch: "replacement-endpoint" },
+    { ...original, federation: { ...original.federation, originEpoch: "replacement-broker" } },
+    peer(), { ...original, id: "other-author" },
+  ]) {
+    const state = restoreConversationHistory([boundPending, persisted(answer, other)]);
+    assert.equal(state.outgoing.get(entry.data.messageId)?.endpointEpoch, original.endpointEpoch);
+    assert.equal(state.outgoing.get(entry.data.messageId)?.originEpoch, original.federation.originEpoch);
+    assert.equal(state.outgoing.size, 1, "same thread ID alone is not authority to complete the ask");
+    assert.equal(state.incoming.get(answer.id)?.message.replyTo, entry.data.messageId);
+  }
+  const state = restoreConversationHistory([boundPending, persisted(answer, original)]);
+  assert.equal(state.outgoing.size, 0, "a host-persisted completing answer from the recorded incarnation settles the ask");
+});

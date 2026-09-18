@@ -5,7 +5,7 @@ import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isPeerCompactionNotice, isSessionInfo } from "./protocol.ts";
 import { getParleyScopeId } from "../config.ts";
-import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, FEDERATED_CONVERSATION_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -16,7 +16,15 @@ import type {
   MessageReceipt,
   SessionInfo,
   SessionRegistration,
+  PreparedConversation,
 } from "../types.ts";
+
+export type { PreparedConversation } from "../types.ts";
+export class ConversationPrepareError extends Error {
+  constructor(readonly code: string, message: string, readonly outcomeKnown = true) {
+    super(message); this.name = "ConversationPrepareError";
+  }
+}
 
 export interface SendOptions {
   text: string;
@@ -93,6 +101,7 @@ export class ParleyClient extends EventEmitter {
   private _sessionId: string | null = null;
   private _selfSession: SessionInfo | null = null;
   private _features = new Set<string>();
+  private pendingPreparations = new Map<string, { resolve: (r: PreparedConversation) => void; reject: (e: Error) => void }>();
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingCancellations = new Map<string, { messageId: string; resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
@@ -105,6 +114,8 @@ export class ParleyClient extends EventEmitter {
   private livenessInFlight = false;
 
   private failPending(error: Error): void {
+    for (const pending of this.pendingPreparations.values()) pending.reject(error);
+    this.pendingPreparations.clear();
     for (const pending of this.pendingSends.values()) {
       pending.reject(error);
     }
@@ -339,7 +350,7 @@ export class ParleyClient extends EventEmitter {
           session,
           ...(sessionId ? { sessionId } : {}),
           ...(scopeId ? { scopeId } : {}),
-          clientFeatures: [COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE],
+          clientFeatures: [COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, FEDERATED_CONVERSATION_FEATURE],
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
         });
       } catch (error) {
@@ -607,6 +618,26 @@ export class ParleyClient extends EventEmitter {
         break;
       }
 
+      case "conversation_prepared": {
+        const prepared = brokerMessage.prepared as PreparedConversation | undefined;
+        if (typeof brokerMessage.requestId !== "string" || !prepared || typeof prepared.messageId !== "string"
+          || !isSessionInfo(prepared.author) || !isSessionInfo(prepared.recipient)) throw new Error("Invalid conversation preparation");
+        const pending = this.pendingPreparations.get(brokerMessage.requestId);
+        this.pendingPreparations.delete(brokerMessage.requestId);
+        pending?.resolve(prepared);
+        break;
+      }
+      case "conversation_prepare_failed": {
+        if (typeof brokerMessage.requestId !== "string" || typeof brokerMessage.code !== "string"
+          || typeof brokerMessage.error !== "string" || (brokerMessage.outcomeKnown !== undefined && typeof brokerMessage.outcomeKnown !== "boolean")) {
+          throw new Error("Invalid conversation preparation failure");
+        }
+        const pending = this.pendingPreparations.get(brokerMessage.requestId);
+        this.pendingPreparations.delete(brokerMessage.requestId);
+        pending?.reject(new ConversationPrepareError(brokerMessage.code, brokerMessage.error, brokerMessage.outcomeKnown ?? true));
+        break;
+      }
+
       case "message_receipt": {
         if (!isSessionInfo(brokerMessage.from) || !isMessageReceipt(brokerMessage.receipt)) {
           throw new Error("Invalid message_receipt event");
@@ -863,6 +894,43 @@ export class ParleyClient extends EventEmitter {
     });
   }
 
+  /** Allocate/recheck the canonical retained identity BEFORE installing reply waiters.
+   * No message is dispatched. Send the returned recipient snapshot and messageId;
+   * the broker binds both author and recipient incarnations again at delivery.
+   * A supplied qualified ID stays unchanged (including on failed rechecks).
+   * A retained scalar ID is checked before conversion; earlier uncertainty is
+   * reported through ConversationPrepareError.outcomeKnown, never rearmed. */
+  async prepareConversation(recipient: SessionInfo | string, options: { messageId?: string; timeoutMs?: number } = {}): Promise<PreparedConversation> {
+    const recheck = options.messageId !== undefined;
+    const unavailable = (error: unknown): ConversationPrepareError => error instanceof ConversationPrepareError ? error
+      : new ConversationPrepareError("E_PREPARE_TRANSPORT", `Conversation preflight unavailable; no new delivery was attempted: ${toError(error).message}`, !recheck);
+    let socket: net.Socket;
+    try { socket = this.requireActiveSocket(); }
+    catch (error) { throw unavailable(error); }
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingPreparations.delete(requestId);
+        reject(new ConversationPrepareError("E_PREPARE_TIMEOUT", "Conversation preflight timed out; no new delivery was attempted", !recheck));
+      }, options.timeoutMs ?? 5000);
+      this.pendingPreparations.set(requestId, {
+        resolve: result => { clearTimeout(timeout); resolve(result); },
+        reject: error => { clearTimeout(timeout); reject(unavailable(error)); },
+      });
+      try {
+        writeMessage(socket, { type: "prepare_conversation", requestId,
+          to: typeof recipient === "string" ? recipient : recipient.id,
+          ...(typeof recipient !== "string" && recipient.endpointEpoch ? { targetEpoch: recipient.endpointEpoch } : {}),
+          ...(options.messageId !== undefined ? { messageId: options.messageId } : {}),
+        });
+      } catch (error) {
+        this.pendingPreparations.delete(requestId);
+        clearTimeout(timeout);
+        reject(unavailable(error));
+      }
+    });
+  }
+
   async send(to: string, options: SendOptions): Promise<SendResult> {
     return this.sendInternal(to, options);
   }
@@ -873,24 +941,45 @@ export class ParleyClient extends EventEmitter {
    * while every recipient still gets an ordinary message ID, delivery record,
    * receipt route, rate-limit charge, and exact-endpoint rebound check. An
    * endpoint epoch supplied by the caller is never silently re-resolved.
+   * Snapshots without an epoch, or whose remote peer cannot enforce endpoint
+   * pins, fail closed. Ordinary send() discovery can use legacy federation.
    */
   async sendToSession(session: SessionInfo, options: SendOptions): Promise<SendResult> {
-    const exactTarget = session.endpointEpoch
-      ? { id: session.id, epoch: session.endpointEpoch }
-      : null;
-    return this.sendInternal(session.id, options, exactTarget);
+    const retainedIdentity = options.messageId !== undefined;
+    if (!session.endpointEpoch) {
+      const outcomeKnown = options.messageId === undefined;
+      return {
+        id: options.messageId ?? randomUUID(), delivered: false, delivery: outcomeKnown ? "failed" : "unknown",
+        outcomeKnown, retryable: false, code: "E_INVALID_TARGET",
+        reason: "Session snapshot has no endpoint epoch; exact delivery cannot be guaranteed",
+      };
+    }
+    if (session.federation?.conversation && !options.messageId?.startsWith("oqm1.")) {
+      try {
+        const prepared = await this.prepareConversation(session, { messageId: options.messageId });
+        options = { ...options, messageId: prepared.messageId };
+      } catch (error) {
+        const outcomeKnown = error instanceof ConversationPrepareError ? error.outcomeKnown : options.messageId === undefined;
+        return { id: options.messageId ?? randomUUID(), delivered: false, delivery: outcomeKnown ? "failed" : "unknown", outcomeKnown,
+          retryable: false, code: error instanceof ConversationPrepareError ? error.code : "E_CONVERSATION_PREPARE", reason: toError(error).message };
+      }
+    }
+    return this.sendInternal(session.id, options, { id: session.id, epoch: session.endpointEpoch }, retainedIdentity);
   }
 
   private async sendInternal(
     to: string,
     options: SendOptions,
-    rosterTarget?: { id: string; epoch: string } | null,
+    rosterTarget?: { id: string; epoch: string },
+    retainedIdentity = options.messageId !== undefined,
   ): Promise<SendResult> {
-    const messageId = options.messageId ?? randomUUID();
-    const failedBeforeSend = (error: unknown, code = "E_NOT_CONNECTED"): SendResult => ({
-      id: messageId, delivered: false, delivery: "failed", outcomeKnown: true,
-      retryable: true, code, reason: toError(error).message,
-    });
+    let messageId = options.messageId ?? randomUUID();
+    const failedBeforeSend = (error: unknown, code = "E_NOT_CONNECTED"): SendResult => {
+      const preparation = error instanceof ConversationPrepareError;
+      const outcomeKnown = preparation ? error.outcomeKnown : !retainedIdentity;
+      return { id: messageId, delivered: false, delivery: outcomeKnown ? "failed" : "unknown", outcomeKnown,
+        retryable: !preparation && outcomeKnown, code, reason: toError(error).message };
+    };
     let socket: net.Socket;
     try {
       socket = this.requireActiveSocket();
@@ -933,7 +1022,7 @@ export class ParleyClient extends EventEmitter {
         try {
           writeMessage(socket, {
             type: "send", to, message,
-            ...(targetId && targetEpoch ? { targetId, targetEpoch } : {}),
+            ...(targetId && targetEpoch ? { targetId, targetEpoch, targetMode: rosterTarget === undefined && !messageId.startsWith("oqm1.") ? "resolved" : "snapshot" } : {}),
             ...(options.contactKind ? { contactKind: options.contactKind } : {}),
           });
         } catch (error) {
@@ -942,24 +1031,36 @@ export class ParleyClient extends EventEmitter {
         }
       });
     };
-    if (options.replyTo && rosterTarget === undefined) return sendOnce();
-    const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
+    if (options.replyTo && rosterTarget === undefined && !options.replyTo.startsWith("oqm1.") && !to.startsWith("oqs1.")) return sendOnce();
+    const resolveTarget = async (): Promise<{ id: string; epoch: string; session: SessionInfo } | null> => {
       const sessions = await this.listSessions();
       const byId = sessions.find((session) => session.id === to);
       const byName = byId ? [] : sessions.filter((session) => session.name?.toLowerCase() === to.toLowerCase());
       const byPrefix = byId || byName.length > 0 ? [] : sessions.filter((session) => session.id.startsWith(to));
       const matches = byId ? [byId] : byName.length > 0 ? byName : byPrefix;
       const target = matches.length === 1 ? matches[0]! : null;
-      return target?.endpointEpoch ? { id: target.id, epoch: target.endpointEpoch } : null;
+      return target?.endpointEpoch ? { id: target.id, epoch: target.endpointEpoch, session: target } : null;
     };
     // Discovery failures happen before any send, and retain the caller's handle.
     try {
-      const target = rosterTarget === undefined ? await resolveTarget() : rosterTarget;
+      const target: { id: string; epoch: string; session?: SessionInfo } | null = rosterTarget === undefined ? await resolveTarget() : rosterTarget;
       if (options.signal?.aborted) return cancelledResult();
       if (!target) return sendOnce();
+      if (target.session?.federation?.conversation && !messageId.startsWith("oqm1.")) {
+        try {
+          const prepared = await this.prepareConversation(target.session, { messageId: options.messageId });
+          messageId = prepared.messageId;
+          message.id = messageId;
+          // Negotiated conversations are pinned, including ordinary notifications.
+          // Rebound never silently mints a new author-qualified instruction.
+          return sendOnce(prepared.recipient.id, prepared.recipient.endpointEpoch);
+        } catch (error) {
+          return failedBeforeSend(error, error instanceof ConversationPrepareError ? error.code : "E_CONVERSATION_PREPARE");
+        }
+      }
       const result = await sendOnce(target.id, target.epoch);
       // Never turn an uncertain, already-written attempt into known cancellation.
-      if (rosterTarget !== undefined || result.code !== "E_TARGET_REBOUND" || !result.outcomeKnown || options.signal?.aborted) return result;
+      if (rosterTarget !== undefined || messageId.startsWith("oqm1.") || result.code !== "E_TARGET_REBOUND" || !result.outcomeKnown || options.signal?.aborted) return result;
       const reboundTarget = await resolveTarget();
       if (options.signal?.aborted) return cancelledResult();
       return reboundTarget ? sendOnce(reboundTarget.id, reboundTarget.epoch) : result;

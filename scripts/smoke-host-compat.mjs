@@ -154,6 +154,13 @@ try {
     const extensionManifest = JSON.parse(readFileSync(join(extensionRoot, "package.json"), "utf8"));
     assert.deepEqual(extensionManifest.dependencies, { "fs-native-extensions": "^1.5.1", tsx: "^4.23.13" });
     const extensionPath = join(extensionRoot, "index.ts");
+    // Publish the fixture broker before RPC stdin can end the host. Otherwise its
+    // asynchronous auto-spawn can finish after cleanup's PID census and recreate
+    // a directory while it is being removed. This also exercises packed spawning.
+    run(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+      import { spawnBrokerIfNeeded } from ${JSON.stringify(pathToFileURL(join(extensionRoot, "broker/spawn.ts")).href)};
+      await spawnBrokerIfNeeded('npx', ['--no-install', 'tsx']);
+    `], { cwd: project, timeout: 15000, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir } });
     const input = [
       { id: "commands", type: "get_commands" },
       { id: "alias", type: "prompt", message: `/alias ${host.label}-compatible` },
@@ -224,6 +231,6 @@ try {
   if (process.env.PI_PARLEY_KEEP_SMOKE_TMP === "1") {
     console.log(`Kept smoke workspace: ${scratch}`);
   } else {
-    rmSync(scratch, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   }
 }

@@ -735,7 +735,8 @@ export class CollaborationStateStore {
   }
 
   private fsyncFile(filePath: string): void {
-    const file = openSync(filePath, "r");
+    // Windows FlushFileBuffers requires write access, even after a completed write.
+    const file = openSync(filePath, "r+");
     try {
       fsyncSync(file);
     } finally {

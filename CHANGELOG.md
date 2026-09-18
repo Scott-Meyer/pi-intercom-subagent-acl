@@ -2,6 +2,19 @@
 
 All notable changes to the `pi-parley` extension will be documented in this file.
 
+## [1.1.3] - 2026-09-18
+
+### Fixed
+
+- Pre-1.1 `intercom_message` journal entries render with the inline
+  presentation again: the message renderer is registered under both the new
+  and legacy custom types.
+- The publish workflow runs the full test suite before publishing, not just
+  the typecheck.
+- coord-observer (pi-config) registers on `parley:extension-register`,
+  mirrors both the parley and pre-rename intercom tools, and normalizes
+  legacy entry types.
+
 ## [1.1.2] - 2026-09-18
 
 ### Fixed

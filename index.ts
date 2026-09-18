@@ -2716,6 +2716,14 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded);
   });
 
+  // Pre-1.1 journals recorded intercom_message entries; the same inline
+  // presentation renders them so old conversations keep their form.
+  pi.registerMessageRenderer("intercom_message", (message, options, theme) => {
+    const details = message.details as { from: SessionInfo; message: Message; replyCommand?: string; bodyText?: string } | undefined;
+    if (!details) return undefined;
+    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded);
+  });
+
   pi.on("tool_result", (event) => {
     if (event.toolName !== PARLEY_TOOL_NAME && event.toolName !== "contact_supervisor") {
       return;

@@ -20,5 +20,6 @@ jobs:
       # Trusted publishing requires a current npm CLI
       - run: npm install -g npm@latest
       - run: npm ci
+      - run: npm test -- --test-timeout=120000
       - run: npm run typecheck
       - run: npm publish --access public --provenance

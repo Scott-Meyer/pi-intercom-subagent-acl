@@ -1,51 +1,95 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeEntryType, restoreConversationHistory, type ConversationHistory } from "./conversation-history.ts";
-import type { SessionInfo } from "./types.ts";
+import { messageControlKey, restoreConversationHistory } from "./conversation-history.ts";
+import type { Message, MessageControl, SessionInfo } from "./types.ts";
 
-function peer(): SessionInfo {
-  return { id: "peer-1", cwd: "/w", model: "m", pid: 1, startedAt: 0, lastActivity: 0, name: "planner" };
+function peer(id = "peer-1"): SessionInfo {
+  return { id, cwd: "/w", model: "m", pid: 1, startedAt: 0, lastActivity: 0, name: "planner" };
 }
 
-test("normalizeEntryType maps pre-1.1 journal entry types", () => {
-  assert.equal(normalizeEntryType("intercom_message"), "parley_message");
-  assert.equal(normalizeEntryType("intercom_ask_pending"), "parley_ask_pending");
-  assert.equal(normalizeEntryType("parley_message"), "parley_message");
-  assert.equal(normalizeEntryType(undefined), undefined);
-  assert.equal(normalizeEntryType("unrelated"), "unrelated");
+function message(id: string, extra: Partial<Message> = {}): Message {
+  return { id, content: { text: "A question with\n  context" }, timestamp: 1, ...extra };
+}
+
+function received(value: Message, from = peer()) {
+  return { type: "custom", customType: "parley_inbound_received", data: { from, message: value, receivedAt: 2 } };
+}
+
+function persisted(value: Message, from = peer()) {
+  return { type: "custom_message", customType: "parley_message", details: { from, message: value } };
+}
+
+function pending(id: string) {
+  return { type: "custom", customType: "parley_ask_pending", data: { messageId: id, to: peer().id, targetDisplay: "planner", sentAt: 3, message: message(id).content } };
+}
+
+test("Parley journals restore received context, host persistence, and outstanding asks", () => {
+  const delivered = message("delivered", { receiverReceivedAt: 4 });
+  const state = restoreConversationHistory([
+    received(message("queued")), persisted(delivered), pending("ask"),
+  ]);
+  assert.deepEqual(state.incoming.get("queued"), received(message("queued")).data);
+  assert.deepEqual(state.incoming.get("delivered"), { from: peer(), message: delivered, receivedAt: 4 });
+  assert.deepEqual([...state.persistedIncoming], ["delivered"]);
+  assert.deepEqual(state.outgoing.get("ask"), {
+    to: peer().id, targetDisplay: "planner", sentAt: 3,
+    preview: "A question with context", message: message("ask").content,
+  });
 });
 
-test("legacy custom_message journal entries replay like parley entries", () => {
-  const message = { id: "m-1", content: "one", timestamp: 1 };
-  const entries = [
-    {
-      type: "custom_message",
-      customType: "intercom_message",
-      details: { from: peer(), message: { ...message, receiverReceivedAt: 1 } },
-    },
-  ];
-  const state = restoreConversationHistory(entries);
-  const recovered = state.incoming.get("m-1");
-  assert.equal(recovered?.message.content, "one");
-  assert.equal(state.persistedIncoming.has("m-1"), true);
+test("Parley settlements and host-persisted controls restore conversation outcomes", () => {
+  const cancel: MessageControl = { messageId: "cancelled", action: "cancel", timestamp: 5 };
+  const supersede: MessageControl = { messageId: "superseded", action: "supersede", supersededBy: "replacement", timestamp: 6 };
+  const state = restoreConversationHistory([
+    received(message("cancelled")), received(message("superseded")),
+    { type: "custom", customType: "parley_inbound_control", data: { from: peer(), control: cancel } },
+    { type: "custom_message", customType: "parley_message_control", details: { from: peer(), control: supersede } },
+    { type: "custom", customType: "parley_inbound_settled", data: { messageId: "settled" } },
+    { type: "custom", customType: "parley_sent", data: { messageId: "answer", message: { text: "Answer", replyTo: "answered", completesAsk: true } } },
+    { type: "custom", customType: "parley_sent", data: { messageId: "followup", message: { text: "More context", replyTo: "still-open", completesAsk: false } } },
+    pending("outgoing"),
+    { type: "custom", customType: "parley_ask_settled", data: { messageId: "outgoing" } },
+  ]);
+  assert.deepEqual([...state.settledIncoming], ["cancelled", "superseded", "settled", "answered"]);
+  assert.deepEqual([...state.controls.values()], [{ from: peer(), control: cancel }, { from: peer(), control: supersede }]);
+  assert.deepEqual([...state.persistedControls], [messageControlKey(supersede)]);
+  assert.equal(state.outgoing.size, 0);
 });
 
-test("legacy inbound and outstanding-ask journal entries replay", () => {
-  const entries = [
-    {
-      type: "custom",
-      customType: "intercom_inbound_received",
-      data: { from: peer(), message: { id: "m-2", content: "two", timestamp: 2 }, receivedAt: 2 },
-    },
-    {
-      type: "custom",
-      customType: "intercom_ask_pending",
-      data: { messageId: "m-3", to: "planner", targetDisplay: "planner", sentAt: 3, message: { text: "question" } },
-    },
-  ];
-  const state: ConversationHistory = restoreConversationHistory(entries);
-  const incoming = state.incoming.get("m-2");
-  assert.equal(incoming?.message.content, "two");
-  const outstanding = state.outgoing.get("m-3");
-  assert.equal(outstanding?.preview, "question");
+test("only host-persisted answers from the asked peer reconcile outstanding asks", () => {
+  const answer = (id: string, extra: Partial<Message> = {}) => message(`answer-${id}`, { replyTo: id, completesAsk: true, ...extra });
+  const toolAnswer = answer("tool");
+  const state = restoreConversationHistory([
+    ...["delivered", "queued", "tool", "foreign", "followup", "question"].map(pending),
+    persisted(answer("delivered")),
+    received(answer("queued")),
+    received(toolAnswer),
+    { type: "message", message: { role: "toolResult", details: { replyMessageId: toolAnswer.id } } },
+    persisted(answer("foreign"), peer("another-peer")),
+    persisted(answer("followup", { completesAsk: false })),
+    persisted(answer("question", { expectsReply: true })),
+  ]);
+  assert.deepEqual([...state.outgoing.keys()], ["queued", "foreign", "followup", "question"]);
+});
+
+test("unrelated custom entry types cannot populate or settle Parley conversations", () => {
+  const value = message("foreign", { replyTo: "ask", completesAsk: true });
+  const control: MessageControl = { messageId: "foreign", action: "cancel", timestamp: 5 };
+  const foreignEntries = [
+    received(value), persisted(value), pending("foreign-ask"),
+    { type: "custom_message", customType: "parley_message_control", details: { from: peer(), control } },
+    { type: "custom", customType: "parley_inbound_control", data: { from: peer(), control } },
+    { type: "custom", customType: "parley_inbound_settled", data: { messageId: "foreign" } },
+    { type: "custom", customType: "parley_sent", data: { message: value } },
+    { type: "custom", customType: "parley_ask_settled", data: { messageId: "ask" } },
+  ].flatMap((entry) => ["unrelated_", "other_"].map((prefix) => ({
+    ...entry, customType: entry.customType.replace("parley_", prefix),
+  })));
+  const state = restoreConversationHistory([pending("ask"), ...foreignEntries]);
+  assert.equal(state.incoming.size, 0);
+  assert.equal(state.controls.size, 0);
+  assert.equal(state.persistedIncoming.size, 0);
+  assert.equal(state.persistedControls.size, 0);
+  assert.equal(state.settledIncoming.size, 0);
+  assert.deepEqual([...state.outgoing.keys()], ["ask"]);
 });

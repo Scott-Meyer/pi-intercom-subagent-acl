@@ -27,8 +27,7 @@ import {
   type ParleyOutboxResultV1,
 } from "./extension-api.ts";
 import { ReplyTracker, type ParleyContext } from "./reply-tracker.ts";
-import { normalizeEntryType, restoreConversationHistory, messageControlKey, type OutstandingAsk } from "./conversation-history.ts";
-import { parleyEnv } from "./env-compat.ts";
+import { restoreConversationHistory, messageControlKey, type OutstandingAsk } from "./conversation-history.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
@@ -65,9 +64,6 @@ const SUBAGENT_RUN_ID_ENV = "PI_SUBAGENT_RUN_ID";
 const SUBAGENT_CHILD_AGENT_ENV = "PI_SUBAGENT_CHILD_AGENT";
 const SUBAGENT_CHILD_INDEX_ENV = "PI_SUBAGENT_CHILD_INDEX";
 const SUBAGENT_PARLEY_SESSION_NAME_ENV = "PI_SUBAGENT_PARLEY_SESSION_NAME";
-/** pi-subagents sets this before its own 1:1 rename lands; reading both keeps
- * child session-name targeting working during a mixed-version rollout. */
-const SUBAGENT_LEGACY_SESSION_NAME_ENV = "PI_SUBAGENT_INTERCOM_SESSION_NAME";
 const SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV = "PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR";
 
 interface ChildOrchestratorMetadata {
@@ -275,14 +271,14 @@ function formatAttachments(attachments: Attachment[]): string {
 function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
   const orchestratorTarget = process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV]?.trim();
   const orchestratorSessionId = process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV]?.trim()
-    || parleyEnv(PARLEY_SESSION_ID_ENV)?.trim();
+    || process.env[PARLEY_SESSION_ID_ENV]?.trim();
   const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
   const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
   const index = process.env[SUBAGENT_CHILD_INDEX_ENV]?.trim();
   if (!orchestratorTarget || !runId || !agent || !index) {
     return null;
   }
-  const sessionName = process.env[SUBAGENT_PARLEY_SESSION_NAME_ENV]?.trim() ?? process.env[SUBAGENT_LEGACY_SESSION_NAME_ENV]?.trim();
+  const sessionName = process.env[SUBAGENT_PARLEY_SESSION_NAME_ENV]?.trim();
   return {
     orchestratorTarget,
     ...(orchestratorSessionId ? { orchestratorSessionId } : {}),
@@ -648,7 +644,7 @@ function buildPresenceIdentity(pi: ExtensionAPI, sessionId: string): { name: str
   };
 }
 function resolveConfiguredParleySessionId(piSessionId: string, config: ParleyConfig): string {
-  return parleyEnv(STABLE_PARLEY_SESSION_ID_ENV)?.trim() || config.stableId || piSessionId;
+  return process.env[STABLE_PARLEY_SESSION_ID_ENV]?.trim() || config.stableId || piSessionId;
 }
 // The tmux pane id (e.g. "%212") the session was launched in. $TMUX_PANE is
 // inherited at process start and immutable for the lifetime — moving the pane
@@ -730,7 +726,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   let currentModel = "unknown";
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
-  const previousParleySessionId = parleyEnv(PARLEY_SESSION_ID_ENV);
+  const previousParleySessionId = process.env[PARLEY_SESSION_ID_ENV];
   let reconnectPromise: Promise<ParleyClient> | null = null;
   let reconnectPromiseGeneration: number | null = null;
   let startupConnectTimer: NodeJS.Timeout | null = null;
@@ -897,8 +893,8 @@ export default function piParleyExtension(pi: ExtensionAPI) {
 
   function inboundEnvelopeKey(value: { customType?: string; details?: unknown }): string | undefined {
     const details = value.details as { message?: Message; control?: MessageControl } | undefined;
-    if (normalizeEntryType(value.customType) === "parley_message" && details?.message?.id) return `message:${details.message.id}`;
-    if (normalizeEntryType(value.customType) === "parley_message_control" && details?.control?.messageId) return `control:${messageControlKey(details.control)}`;
+    if (value.customType === "parley_message" && details?.message?.id) return `message:${details.message.id}`;
+    if (value.customType === "parley_message_control" && details?.control?.messageId) return `control:${messageControlKey(details.control)}`;
     return undefined;
   }
 
@@ -1207,11 +1203,14 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   // (stock SDK) reports { tokens, contextWindow, percent }, with tokens/percent null
   // right after a compaction (before the next assistant response). We emit null in
   // that case to CLEAR a peer's stale value rather than freeze the old percentage.
-  // Feature-detected so an older runtime without getContextUsage() just omits it.
-  function currentContextUsage(): { contextPct?: number | null; contextTokens?: number | null; contextWindow?: number } {
-    const usage = getLiveContext()?.getContextUsage?.();
+  // A missing host capability is omitted; a supported getter reporting unknown
+  // usage explicitly clears its previous sample.
+  function currentContextUsage(): { contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null } {
+    const context = getLiveContext();
+    if (typeof context?.getContextUsage !== "function") return {};
+    const usage = context.getContextUsage();
     if (!usage) {
-      return {};
+      return { contextPct: null, contextTokens: null, contextWindow: null };
     }
     const result: { contextPct?: number | null; contextTokens?: number | null; contextWindow?: number } = {
       contextPct: typeof usage.percent === "number" && Number.isFinite(usage.percent) ? Math.round(usage.percent) : null,
@@ -1350,10 +1349,10 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       lastAppliedProfileIndex = state.index;
     };
     for (const [entryIndex, entry] of entries.entries()) {
-      if (entry.type === "custom_message" && typeof entry.details === "object" && entry.details !== null) {
-        const details = entry.details as { message?: { contactToken?: unknown; contactBaseline?: unknown }; contactToken?: unknown; contactBaseline?: unknown };
-        const delivered = details.message ?? details;
-        if (delivered.contactBaseline === true && typeof delivered.contactToken === "string") {
+      if (entry.type === "custom_message" && entry.customType === "parley_message" && typeof entry.details === "object" && entry.details !== null) {
+        const details = entry.details as { message?: { contactToken?: unknown; contactBaseline?: unknown } };
+        const delivered = details.message;
+        if (delivered?.contactBaseline === true && typeof delivered.contactToken === "string") {
           pendingReceiverBaselineTokens.add(delivered.contactToken);
         }
         continue;
@@ -1368,34 +1367,34 @@ export default function piParleyExtension(pi: ExtensionAPI) {
         requiredName?: unknown;
         updateId?: unknown;
       };
-      if (normalizeEntryType(entry.customType) === "parley_profile_pending" && typeof data.updateId === "string") {
+      if (entry.customType === "parley_profile_pending" && typeof data.updateId === "string") {
         const state = parseProfileState(data, entryIndex);
         if (state) pendingProfiles.set(data.updateId, state);
-      } else if (normalizeEntryType(entry.customType) === "parley_profile_abandoned" && typeof data.updateId === "string") {
+      } else if (entry.customType === "parley_profile_abandoned" && typeof data.updateId === "string") {
         pendingProfiles.delete(data.updateId);
-      } else if (normalizeEntryType(entry.customType) === "parley_profile_updated") {
+      } else if (entry.customType === "parley_profile_updated") {
         const state = parseProfileState(data, entryIndex);
         if (state) {
           applyProfileState(state);
           if (typeof data.updateId === "string") pendingProfiles.delete(data.updateId);
         }
       }
-      if (normalizeEntryType(entry.customType) === "parley_receiver_baseline_pending" && typeof data.token === "string") {
+      if (entry.customType === "parley_receiver_baseline_pending" && typeof data.token === "string") {
         pendingReceiverBaselineTokens.add(data.token);
       } else if (
-        (normalizeEntryType(entry.customType) === "parley_receiver_baseline_recorded"
-          || normalizeEntryType(entry.customType) === "parley_receiver_baseline_abandoned")
+        (entry.customType === "parley_receiver_baseline_recorded"
+          || entry.customType === "parley_receiver_baseline_abandoned")
         && typeof data.token === "string"
       ) {
         pendingReceiverBaselineTokens.delete(data.token);
       }
       if (typeof data.eventId !== "string" || data.eventId.length === 0) continue;
-      if (normalizeEntryType(entry.customType) === "parley_compaction_pending") {
+      if (entry.customType === "parley_compaction_pending") {
         pendingCompactionReports.set(
           data.eventId,
           typeof data.compactedAt === "number" ? data.compactedAt : 0,
         );
-      } else if (normalizeEntryType(entry.customType) === "parley_compaction_recorded") {
+      } else if (entry.customType === "parley_compaction_recorded") {
         pendingCompactionReports.delete(data.eventId);
       }
     }
@@ -1783,7 +1782,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     const entries = getLiveContext()?.sessionManager.getEntries() ?? [];
     for (let index = entries.length - 1; index >= 0; index--) {
       const entry = entries[index];
-      if (entry?.type !== "custom" || (normalizeEntryType(entry.customType) !== "parley_ask_pending" && normalizeEntryType(entry.customType) !== "parley_sent")) continue;
+      if (entry?.type !== "custom" || (entry.customType !== "parley_ask_pending" && entry.customType !== "parley_sent")) continue;
       const data = entry.data as { messageId?: string; to?: string; targetId?: string; message?: Message["content"] } | undefined;
       const recipient = data?.targetId ?? data?.to;
       if (data?.messageId === messageId && recipient && data.message) return { to: recipient, preview: data.message.text, message: data.message };
@@ -2100,7 +2099,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
         }
         // Schedule only after the owned promise is cleared: scheduleReconnect
         // drops calls made while a reconnect attempt is still in flight, and
-        // a legacy-broker cutover must keep retrying after it idles out.
+        // a failed broker connection must keep retrying after it idles out.
         if (retryAfterFailure) {
           scheduleReconnect();
         }
@@ -2627,7 +2626,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     const seen = new Set<string>();
     const messages = event.messages.filter((message) => {
       if (message.role !== "custom") return true;
-      if (normalizeEntryType(message.customType) === "parley_persistence_notice") return !conversationPersistenceWarning;
+      if (message.customType === "parley_persistence_notice") return !conversationPersistenceWarning;
       const key = inboundEnvelopeKey(message);
       if (!key) return true;
       if (seen.has(key)) return false;
@@ -2711,14 +2710,6 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer("parley_message", (message, options, theme) => {
-    const details = message.details as { from: SessionInfo; message: Message; replyCommand?: string; bodyText?: string } | undefined;
-    if (!details) return undefined;
-    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded);
-  });
-
-  // Pre-1.1 journals recorded intercom_message entries; the same inline
-  // presentation renders them so old conversations keep their form.
-  pi.registerMessageRenderer("intercom_message", (message, options, theme) => {
     const details = message.details as { from: SessionInfo; message: Message; replyCommand?: string; bodyText?: string } | undefined;
     if (!details) return undefined;
     return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded);
@@ -3202,7 +3193,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
         ? ""
         : " (parley name awaiting broker confirmation)";
     const publication = profile.description && !profile.descriptionPublished
-      ? " [description local only: broker upgrade required]"
+      ? " [description local only: broker does not support profiles]"
       : "";
     if (!identityAlreadyShown) result.content.push({
       type: "text",

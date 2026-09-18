@@ -125,8 +125,8 @@ export interface Message {
   retryOf?: string;
   /** Correlates this message to a previous message from this recipient. */
   replyTo?: string;
-  /** Explicit answer intent, separate from conversational correlation. Legacy
-   * omission treats replyTo without expectsReply as an answer. */
+  /** Explicit answer intent, separate from conversational correlation.
+   * By default, a reply without a further reply request completes the ask. */
   completesAsk?: boolean;
   expectsReply?: boolean;
   /** Informational sender activity; it does not lock the conversation. */
@@ -196,7 +196,7 @@ export type ClientMessage =
   | { type: "compaction_completed"; eventId: string }
   | { type: "direct_contact_seen"; token: string }
   | { type: "message_receipt"; receipt: MessageReceipt }
-  | { type: "cancel_message"; messageId: string; requestId?: string }
+  | { type: "cancel_message"; messageId: string; requestId: string }
   | { type: "cancel_ask"; messageId: string }
   | { type: "presence"; name?: string; description?: string | null; runtimeFallbackAlias?: boolean; status?: string; model?: string; contextPct?: number | null; contextTokens?: number | null; contextWindow?: number | null }
   | {
@@ -216,7 +216,7 @@ export type ClientMessage =
     };
 
 export type BrokerMessage =
-  | { type: "registered"; sessionId: string; features?: string[]; session?: SessionInfo }
+  | { type: "registered"; sessionId: string; features: string[]; session?: SessionInfo }
   | { type: "direct_contact_recorded"; token: string }
   | { type: "direct_contact_unknown"; token: string }
   | { type: "compaction_recorded"; eventId: string; generation: number; compactedAt: number }

@@ -1,4 +1,3 @@
-import { parleyEnv } from "../env-compat.ts";
 import { EventEmitter } from "events";
 import net from "net";
 import { randomUUID } from "crypto";
@@ -74,12 +73,12 @@ function toError(error: unknown): Error {
  * the existing onClose -> "disconnected" path drive reconnection.
  */
 function getLivenessIntervalMs(): number {
-  const raw = Number.parseInt(parleyEnv("PI_PARLEY_LIVENESS_INTERVAL_MS") ?? "", 10);
+  const raw = Number.parseInt(process.env.PI_PARLEY_LIVENESS_INTERVAL_MS ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
 }
 
 function getLivenessTimeoutMs(): number {
-  const raw = Number.parseInt(parleyEnv("PI_PARLEY_LIVENESS_TIMEOUT_MS") ?? "", 10);
+  const raw = Number.parseInt(process.env.PI_PARLEY_LIVENESS_TIMEOUT_MS ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, getLivenessIntervalMs()) : 5_000;
 }
 
@@ -96,9 +95,6 @@ export class ParleyClient extends EventEmitter {
   private _features = new Set<string>();
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingCancellations = new Map<string, { messageId: string; resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
-  /** Untagged legacy cancellation ACKs can collide with any later send using
-   * the same ID on this connection. Only a fresh connection disambiguates it. */
-  private legacyCancellationMessageIds = new Set<string>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
   private pendingAdvertise = new Map<string, { resolve: (result: AdvertiseResult) => void; reject: (e: Error) => void }>();
   private pendingCompactionReports = new Map<string, { resolve: (result: CompactionRecordedResult) => void; reject: (e: Error) => void }>();
@@ -211,6 +207,8 @@ export class ParleyClient extends EventEmitter {
     return socket;
   }
 
+  /** Establishes the current conversation and exact-target contract. Registration
+   * rejects brokers that do not advertise both; other capabilities are optional. */
   connect(session: SessionRegistration, sessionId?: string): Promise<void> {
     if (this.socket) {
       return Promise.reject(new Error("Already connected"));
@@ -289,7 +287,6 @@ export class ParleyClient extends EventEmitter {
       const onSocketError = (err: Error) => {
         if (connectionEstablished) {
           this.disconnectError = err;
-          this.emit("error", err);
           // A socket error after registration means the connection is dead.
           // Destroy the socket so onClose fires and emits "disconnected",
           // driving the extension's reconnect path. Without this, a half-open
@@ -297,6 +294,7 @@ export class ParleyClient extends EventEmitter {
           if (!socket.destroyed) {
             socket.destroy();
           }
+          if (this.listenerCount("error") > 0) this.emit("error", err);
         }
       };
 
@@ -307,8 +305,8 @@ export class ParleyClient extends EventEmitter {
           return;
         }
         this.disconnectError = protocolError;
-        this.emit("error", protocolError);
         socket.destroy();
+        if (this.listenerCount("error") > 0) this.emit("error", protocolError);
       };
 
       const reader = createMessageReader((msg) => {
@@ -341,7 +339,7 @@ export class ParleyClient extends EventEmitter {
           session,
           ...(sessionId ? { sessionId } : {}),
           ...(scopeId ? { scopeId } : {}),
-          clientFeatures: [COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE],
+          clientFeatures: [COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE],
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
         });
       } catch (error) {
@@ -357,25 +355,29 @@ export class ParleyClient extends EventEmitter {
   }
 
   private takePendingDelivery(message: Record<string, unknown>) {
-    if (message.requestId !== undefined && typeof message.requestId !== "string") {
-      throw new Error("Invalid delivery requestId");
-    }
-    if (typeof message.requestId === "string") {
+    if (message.requestId !== undefined) {
+      if (typeof message.requestId !== "string" || message.requestId.length === 0) {
+        throw new Error("Invalid delivery requestId");
+      }
+      if (
+        (message.type === "delivered" && (message.cancellation === undefined || message.delivery !== "socket_delivered"))
+        || (message.type === "delivery_failed" && message.cancellation !== undefined)
+        || message.peerCompaction !== undefined
+        || message.contactToken !== undefined
+      ) {
+        throw new Error("Invalid cancellation acknowledgement");
+      }
       const pending = this.pendingCancellations.get(message.requestId);
-      if (pending?.messageId !== message.messageId) return undefined;
+      if (!pending) return undefined; // A late cancellation ACK cannot settle a send.
+      if (pending.messageId !== message.messageId) {
+        throw new Error("Cancellation acknowledgement messageId does not match requestId");
+      }
       this.pendingCancellations.delete(message.requestId);
       return pending;
     }
-    if (this.legacyCancellationMessageIds.has(message.messageId as string)) return undefined;
     const pending = this.pendingSends.get(message.messageId as string);
-    if (pending) {
-      this.pendingSends.delete(message.messageId as string);
-      return pending;
-    }
-    // A message ID alone cannot distinguish a late send ACK from a cancel ACK.
-    // Legacy cancellation therefore times out as unknown rather than borrowing
-    // an unrelated send's acceptance.
-    return undefined;
+    if (pending) this.pendingSends.delete(message.messageId as string);
+    return pending;
   }
 
   private deliveryMetadata(message: Record<string, unknown>): Pick<DeliveryDetails, "recipient" | "cancellation"> {
@@ -412,10 +414,14 @@ export class ParleyClient extends EventEmitter {
         }
 
         if (
-          brokerMessage.features !== undefined
-          && (!Array.isArray(brokerMessage.features) || !brokerMessage.features.every((feature) => typeof feature === "string"))
+          !Array.isArray(brokerMessage.features)
+          || !brokerMessage.features.every((feature) => typeof feature === "string")
         ) {
           throw new Error("Invalid registered features");
+        }
+        const features = new Set(brokerMessage.features as string[]);
+        for (const required of [CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE]) {
+          if (!features.has(required)) throw new Error(`Missing required broker feature: ${required}`);
         }
         if (
           brokerMessage.session !== undefined
@@ -426,12 +432,11 @@ export class ParleyClient extends EventEmitter {
 
         this._sessionId = brokerMessage.sessionId;
         this._selfSession = brokerMessage.session as SessionInfo | undefined ?? null;
-        this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
-        this.legacyCancellationMessageIds.clear();
+        this._features = features;
         const registered: BrokerMessage = {
           type: "registered",
           sessionId: brokerMessage.sessionId,
-          ...(this._features.size > 0 ? { features: [...this._features] } : {}),
+          features: [...this._features],
           ...(this._selfSession ? { session: { ...this._selfSession } } : {}),
         };
         this.emit("broker_message", registered);
@@ -541,38 +546,64 @@ export class ParleyClient extends EventEmitter {
 
       case "delivered": {
         const { messageId, delivery, retryable, outcomeKnown, peerCompaction, contactToken } = brokerMessage;
-        if (typeof messageId !== "string" || (delivery !== undefined && delivery !== "socket_delivered" && delivery !== "queued") || (retryable !== undefined && typeof retryable !== "boolean") || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean") || (peerCompaction !== undefined && !isPeerCompactionNotice(peerCompaction)) || (contactToken !== undefined && typeof contactToken !== "string")) {
+        if (
+          typeof messageId !== "string"
+          || (delivery !== "socket_delivered" && delivery !== "queued")
+          || retryable !== false
+          || outcomeKnown !== true
+          || (peerCompaction !== undefined && !isPeerCompactionNotice(peerCompaction))
+          || (contactToken !== undefined && typeof contactToken !== "string")
+        ) {
           throw new Error("Invalid delivered message");
         }
 
+        if (brokerMessage.code !== undefined && typeof brokerMessage.code !== "string") throw new Error("Invalid delivery code");
         const metadata = this.deliveryMetadata(brokerMessage);
         const pending = this.takePendingDelivery(brokerMessage);
         if (!pending) {
-          // Late send responses are harmless once the caller has already timed out.
+          // Late responses are harmless once the caller has already timed out.
           return;
         }
 
         if (typeof contactToken === "string" && peerCompaction === undefined) {
           this.acknowledgeDirectContact(contactToken);
         }
-        pending.resolve({ ...metadata, id: messageId, delivered: true, delivery: delivery as "socket_delivered" | "queued" | undefined ?? "socket_delivered", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}), ...(peerCompaction !== undefined ? { peerCompaction } : {}), ...(typeof contactToken === "string" ? { contactToken } : {}) });
+        pending.resolve({
+          ...metadata, id: messageId, delivered: true, delivery,
+          retryable: false, outcomeKnown: true,
+          ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}),
+          ...(peerCompaction !== undefined ? { peerCompaction } : {}),
+          ...(typeof contactToken === "string" ? { contactToken } : {}),
+        });
         break;
       }
 
       case "delivery_failed": {
         const { messageId, reason, delivery, retryable, outcomeKnown } = brokerMessage;
-        if (typeof messageId !== "string" || typeof reason !== "string" || (delivery !== undefined && delivery !== "failed" && delivery !== "unknown") || (retryable !== undefined && typeof retryable !== "boolean") || (outcomeKnown !== undefined && typeof outcomeKnown !== "boolean")) {
+        if (
+          typeof messageId !== "string"
+          || typeof reason !== "string"
+          || (delivery !== "failed" && delivery !== "unknown")
+          || typeof retryable !== "boolean"
+          || outcomeKnown !== (delivery !== "unknown")
+          || (delivery === "unknown" && retryable !== false)
+        ) {
           throw new Error("Invalid delivery_failed message");
         }
 
+        if (brokerMessage.code !== undefined && typeof brokerMessage.code !== "string") throw new Error("Invalid delivery code");
         const metadata = this.deliveryMetadata(brokerMessage);
         const pending = this.takePendingDelivery(brokerMessage);
         if (!pending) {
-          // Late send responses are harmless once the caller has already timed out.
+          // Late responses are harmless once the caller has already timed out.
           return;
         }
 
-        pending.resolve({ ...metadata, id: messageId, delivered: false, reason, delivery: delivery as "failed" | "unknown" | undefined ?? "failed", retryable: delivery === "unknown" ? false : retryable as boolean | undefined ?? false, outcomeKnown: delivery === "unknown" ? false : outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
+        pending.resolve({
+          ...metadata, id: messageId, delivered: false, reason, delivery, retryable,
+          outcomeKnown: outcomeKnown as boolean,
+          ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}),
+        });
         break;
       }
 
@@ -866,13 +897,6 @@ export class ParleyClient extends EventEmitter {
     } catch (error) {
       return failedBeforeSend(error);
     }
-    if (rosterTarget && !this.supportsFeature(EXACT_SEND_FEATURE)) {
-      return { ...failedBeforeSend("The connected broker cannot enforce the caller's endpoint snapshot; no message was written", "E_EXACT_SEND_UNSUPPORTED"), retryable: false };
-    }
-    const preservesQuestion = options.replyTo && !(options.completesAsk ?? !options.expectsReply);
-    if ((preservesQuestion || options.supersedes) && !this.supportsFeature(CONVERSATION_CONTRACT_FEATURE)) {
-      return { ...failedBeforeSend("The connected broker does not support this conversation intent; no message was written", "E_CONVERSATION_CONTRACT_UNSUPPORTED"), retryable: false };
-    }
     const message: Message = {
       id: messageId,
       timestamp: Date.now(),
@@ -893,7 +917,6 @@ export class ParleyClient extends EventEmitter {
       reason: `${toError(error).message}; delivery may have occurred. The message has not been withdrawn.`,
     });
     const sendOnce = (targetId?: string, targetEpoch?: string): Promise<SendResult> => {
-      if (this.legacyCancellationMessageIds.has(messageId)) return Promise.resolve(unknownResult("A legacy cancellation made this message ID's acknowledgements ambiguous on the current connection"));
       if (options.signal?.aborted) return Promise.resolve(cancelledResult());
       if (this.pendingSends.has(messageId)) return Promise.resolve(unknownResult("This message ID already has an in-flight send", "E_MESSAGE_IN_FLIGHT"));
       return new Promise((resolve) => {
@@ -919,7 +942,7 @@ export class ParleyClient extends EventEmitter {
         }
       });
     };
-    if (!this.supportsFeature(EXACT_SEND_FEATURE) || (options.replyTo && rosterTarget === undefined)) return sendOnce();
+    if (options.replyTo && rosterTarget === undefined) return sendOnce();
     const resolveTarget = async (): Promise<{ id: string; epoch: string } | null> => {
       const sessions = await this.listSessions();
       const byId = sessions.find((session) => session.id === to);
@@ -954,12 +977,6 @@ export class ParleyClient extends EventEmitter {
     } catch (error) {
       return Promise.resolve({ id: messageId, delivered: false, delivery: "failed", outcomeKnown: true,
         retryable: true, code: "E_NOT_CONNECTED", reason: toError(error).message });
-    }
-    if (!this.supportsFeature(CONVERSATION_CONTRACT_FEATURE)) {
-      this.legacyCancellationMessageIds.add(messageId);
-      const sending = this.pendingSends.get(messageId);
-      this.pendingSends.delete(messageId);
-      sending?.reject(new Error("The legacy broker cannot distinguish this in-flight send from its cancellation acknowledgement"));
     }
     const requestId = randomUUID();
     return new Promise((resolve) => {

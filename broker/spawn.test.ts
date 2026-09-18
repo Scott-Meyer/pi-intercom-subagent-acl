@@ -1,10 +1,13 @@
 import test from "node:test";
 import { createMessageReader, writeMessage } from "./framing.ts";
-import { PARLEY_PROTOCOL_NAME, PARLEY_PROTOCOL_VERSION } from "./paths.ts";
+import { isBrokerHealthOkMessage } from "./protocol.ts";
+import { getBrokerSocketPath, PARLEY_PROTOCOL_NAME, PARLEY_PROTOCOL_VERSION } from "./paths.ts";
+import { tryAcquireProcessLock, type ProcessLockLease } from "./process-lock.ts";
+import { createRequire } from "node:module";
 import net from "node:net";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -14,9 +17,22 @@ import {
   getWindowsHiddenLauncherScript,
   getWindowsBrokerCommandLine,
   getWindowsHiddenLauncherPath,
-  isBrokerHealthOkMessage,
   writeWindowsHiddenLauncher,
 } from "./spawn.ts";
+
+function copySpawnModules(brokerDir: string): void {
+  const sourceDir = path.dirname(fileURLToPath(import.meta.url));
+  for (const fileName of ["spawn.ts", "framing.ts", "paths.ts", "process-lock.ts", "runtime-claim.ts", "protocol.ts", "federation-protocol.ts", "federation-types.ts"]) {
+    cpSync(path.join(sourceDir, fileName), path.join(brokerDir, fileName));
+  }
+  for (const fileName of ["session-profile.ts", "types.ts"]) {
+    cpSync(path.join(sourceDir, "..", fileName), path.join(brokerDir, "..", fileName));
+  }
+  const nodeModules = path.join(brokerDir, "..", "node_modules");
+  mkdirSync(nodeModules, { recursive: true });
+  const nativePackageDir = path.dirname(createRequire(import.meta.url).resolve("fs-native-extensions"));
+  symlinkSync(nativePackageDir, path.join(nodeModules, "fs-native-extensions"), "junction");
+}
 
 test("getTsxCliPath resolves tsx cli via module resolution", () => {
   const cliPath = getTsxCliPath();
@@ -236,11 +252,7 @@ test("spawnBrokerIfNeeded includes stderr from default broker startup failures",
     writeFileSync(path.join(extensionDir, "package.json"), JSON.stringify({ type: "module" }));
     writeFileSync(fakeTsxCli, "process.stderr.write('fake tsx failed\\n'); process.exit(1);\n");
 
-    const sourceDir = path.dirname(fileURLToPath(import.meta.url));
-    for (const fileName of ["spawn.ts", "framing.ts", "paths.ts"]) {
-      cpSync(path.join(sourceDir, fileName), path.join(brokerDir, fileName));
-    }
-    cpSync(path.join(sourceDir, "..", "env-compat.ts"), path.join(extensionDir, "env-compat.ts"));
+    copySpawnModules(brokerDir);
 
     process.env.PI_CODING_AGENT_DIR = path.join(root, "agent");
     const moduleUrl = `${pathToFileURL(path.join(brokerDir, "spawn.ts")).href}?case=${Date.now()}`;
@@ -255,6 +267,9 @@ test("spawnBrokerIfNeeded includes stderr from default broker startup failures",
         return true;
       },
     );
+    const retry = tryAcquireProcessLock(path.join(root, "agent", "parley", "broker.startup"));
+    assert.equal(retry.status, "acquired", "failed startup relinquishes only its own startup lease");
+    if (retry.status === "acquired") retry.lease.release();
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -277,35 +292,22 @@ async function importSpawnWithAgentDir(root: string): Promise<typeof import("./s
   mkdirSync(path.dirname(fakeTsxCli), { recursive: true });
   writeFileSync(path.join(extensionDir, "package.json"), JSON.stringify({ type: "module" }));
   writeFileSync(fakeTsxCli, "process.exit(0);\n");
-  const sourceDir = path.dirname(fileURLToPath(import.meta.url));
-  for (const fileName of ["spawn.ts", "framing.ts", "paths.ts"]) {
-    cpSync(path.join(sourceDir, fileName), path.join(brokerDir, fileName));
-  }
-  cpSync(path.join(sourceDir, "..", "env-compat.ts"), path.join(extensionDir, "env-compat.ts"));
+  copySpawnModules(brokerDir);
   const moduleUrl = `${pathToFileURL(path.join(brokerDir, "spawn.ts")).href}?case=${Date.now()}-${Math.random()}`;
   return await import(moduleUrl) as typeof import("./spawn.ts");
 }
 
-/** A broker stub that genuinely answers the framed health handshake, so
- * isBrokerRunning/waitForBroker see a healthy parley broker. onFirstHealth
- * runs once when the first health request arrives (e.g. to simulate the
- * spawn winner releasing its lock after startup). */
+/** A local endpoint that answers the framed Parley health handshake. */
 function listenHealthyParleyBroker(
   sockPath: string,
-  onFirstHealth?: () => void,
 ): { server: import("node:net").Server; close: () => Promise<void> } {
   const sockets = new Set<import("node:net").Socket>();
   const server = net.createServer((socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
-    let answeredFirst = false;
     const reader = createMessageReader((message) => {
       const request = message as { type?: string; requestId?: string };
       if (request.type === "health" && typeof request.requestId === "string") {
-        if (!answeredFirst) {
-          answeredFirst = true;
-          onFirstHealth?.();
-        }
         writeMessage(socket, {
           type: "health_ok",
           requestId: request.requestId,
@@ -328,40 +330,20 @@ function listenHealthyParleyBroker(
   };
 }
 
-function writeUnresolvedLegacyRuntime(agentDir: string): void {
-  const legacyDir = path.join(agentDir, "intercom");
-  mkdirSync(legacyDir, { recursive: true });
-  writeFileSync(path.join(legacyDir, "config.json"), JSON.stringify({ enabled: true }));
-  // A live legacy broker holds the intercom runtime.
-  writeFileSync(path.join(legacyDir, "broker.pid"), String(process.pid));
-}
-
-test("spawnBrokerIfNeeded refuses a healthy parley broker while a legacy intercom runtime is unresolved", async () => {
-  const root = mkdtempSync(path.join(tmpdir(), "parley-gate-"));
+test("spawnBrokerIfNeeded reuses a healthy broker without invoking the launcher", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "parley-reuse-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  let broker: { server: import("node:net").Server; close: () => Promise<void> } | undefined;
+  let broker: ReturnType<typeof listenHealthyParleyBroker> | undefined;
   try {
     const agentDir = path.join(root, "agent");
     const parleyDir = path.join(agentDir, "parley");
     mkdirSync(parleyDir, { recursive: true });
-    writeUnresolvedLegacyRuntime(agentDir);
-    // A healthy parley broker answers health on the target socket.
-    broker = listenHealthyParleyBroker(path.join(parleyDir, "broker.sock"));
-    await new Promise<void>((resolve) => broker!.server.once("listening", resolve));
-
+    broker = listenHealthyParleyBroker(getBrokerSocketPath(process.platform, agentDir));
+    await new Promise<void>(resolve => broker!.server.once("listening", resolve));
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const imported = await importSpawnWithAgentDir(root);
-
-    // With an early-return-on-healthy bypass this call would succeed and
-    // attach; the cutover gate must refuse instead.
-    await assert.rejects(
-      () => imported.spawnBrokerIfNeeded("npx", ["--no-install", "tsx"]),
-      (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.match(error.message, /legacy intercom broker is still running/);
-        return true;
-      },
-    );
+    await imported.spawnBrokerIfNeeded("missing-broker-launcher", []);
+    assert.equal(existsSync(path.join(parleyDir, "broker.startup")), false);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -370,58 +352,77 @@ test("spawnBrokerIfNeeded refuses a healthy parley broker while a legacy interco
   }
 });
 
-test("spawnBrokerIfNeeded contention path re-enters the cutover gate before attaching", async () => {
-  const root = mkdtempSync(path.join(tmpdir(), "parley-ctn-"));
+test("spawnBrokerIfNeeded waits for a competing starter without releasing its lock", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "parley-contender-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  let broker: { server: import("node:net").Server; close: () => Promise<void> } | undefined;
+  let broker: ReturnType<typeof listenHealthyParleyBroker> | undefined;
+  let starter: ProcessLockLease | undefined;
   try {
     const agentDir = path.join(root, "agent");
     const parleyDir = path.join(agentDir, "parley");
     mkdirSync(parleyDir, { recursive: true });
-    writeUnresolvedLegacyRuntime(agentDir);
-    const lockPath = path.join(parleyDir, "broker.spawn.lock");
-    // A concurrent start owns the spawn lock...
-    writeFileSync(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: "wx" });
-    // ...and its broker is healthy. When the winner's first health answer
-    // arrives it releases the lock, exactly as a real spawn winner would;
-    // the contender must then re-acquire and hit the cutover gate.
-    broker = listenHealthyParleyBroker(path.join(parleyDir, "broker.sock"), () => {
-      try { unlinkSync(lockPath); } catch { /* already released */ }
+    const lockDir = path.join(parleyDir, "broker.startup");
+    const acquired = tryAcquireProcessLock(lockDir);
+    assert.equal(acquired.status, "acquired");
+    if (acquired.status !== "acquired") throw new Error("Expected starter lease");
+    starter = acquired.lease;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const imported = await importSpawnWithAgentDir(root);
+    const connecting = imported.spawnBrokerIfNeeded("missing-broker-launcher", []);
+    // The winner publishes health after the contender has begun waiting.
+    broker = listenHealthyParleyBroker(getBrokerSocketPath(process.platform, agentDir));
+    await connecting;
+    assert.equal(tryAcquireProcessLock(lockDir).status, "occupied", "contender cannot release the starter's ownership");
+  } finally {
+    starter?.release();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await broker?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an occupied-runtime child exit waits for the owner's later health publication", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "parley-owner-starting-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = path.join(root, "agent");
+  const controlSockets = new Set<net.Socket>();
+  let broker: ReturnType<typeof listenHealthyParleyBroker> | undefined;
+  let publish: NodeJS.Timeout | undefined;
+  let closing = false;
+  const control = net.createServer((socket) => {
+    controlSockets.add(socket);
+    socket.resume();
+    socket.on("close", () => {
+      controlSockets.delete(socket);
+      if (closing) return;
+      // The fake child's control descriptor closes on its occupied exit. Only
+      // afterwards does the actual owner complete its delayed initialization.
+      publish = setTimeout(() => {
+        broker = listenHealthyParleyBroker(getBrokerSocketPath(process.platform, agentDir));
+      }, 200);
     });
-    await new Promise<void>((resolve) => broker!.server.once("listening", resolve));
-
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    const imported = await importSpawnWithAgentDir(root);
-
-    await assert.rejects(
-      () => imported.spawnBrokerIfNeeded("npx", ["--no-install", "tsx"]),
-      (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.match(error.message, /legacy intercom broker is still running/);
-        return true;
-      },
-    );
-  } finally {
-    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-    await broker?.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("isSpawnLockStale treats a fresh PID-only target lock as held", async () => {
-  const root = mkdtempSync(path.join(tmpdir(), "parley-lock-pidonly-"));
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  });
+  control.listen(0, "127.0.0.1");
+  await new Promise<void>(resolve => control.once("listening", resolve));
+  const address = control.address();
+  assert.ok(address && typeof address !== "string");
   try {
-    const agentDir = path.join(root, "agent");
     process.env.PI_CODING_AGENT_DIR = agentDir;
     const imported = await importSpawnWithAgentDir(root);
-    const parleyDir = path.join(agentDir, "parley");
-    mkdirSync(parleyDir, { recursive: true });
-    // A live owner wrote only its PID before the timestamp line.
-    writeFileSync(path.join(parleyDir, "broker.spawn.lock"), `${process.pid}\n`);
-    assert.equal(imported.isSpawnLockStale(), false);
+    const cli = path.join(root, "pi-parley", "node_modules", "tsx", "dist", "cli.mjs");
+    writeFileSync(cli, `import net from 'node:net';
+const socket = net.connect(${address.port}, '127.0.0.1');
+socket.once('connect', () => socket.write('occupied', () => process.exit(75)));
+`);
+    await imported.spawnBrokerIfNeeded("npx", ["--no-install", "tsx"]);
+    assert.ok(broker, "startup returns only after the winning owner's health response");
   } finally {
+    closing = true;
+    if (publish) clearTimeout(publish);
+    for (const socket of controlSockets) socket.destroy();
+    await new Promise<void>(resolve => control.close(() => resolve()));
+    await broker?.close();
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     rmSync(root, { recursive: true, force: true });

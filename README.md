@@ -4,8 +4,6 @@ Parley is a durable conversation layer for Pi sessions: targeted messaging, expl
 
 **Alt+M** or **`/parley`** opens the session picker and message composer. Agents communicate through the `parley` tool.
 
-> Parley began as a fork of [nicobailon/pi-intercom](https://github.com/nicobailon/pi-intercom) that grew into its own extension. Parley 1.0 kept the intercom runtime names so deployments upgraded in place; 1.1.0 completed the rename — the runtime directory migrates automatically on first start, and pre-1.1 session journals still replay.
-
 ## Why
 
 Sometimes you're running multiple pi sessions — one researching, one executing, one reviewing. Pi Parley lets you:
@@ -24,22 +22,21 @@ Each pi session that has parley loaded and enabled connects to a tiny local brok
 
 ## Install
 
-If any earlier parley extension is installed — upstream `npm:pi-intercom` or the previous ACL-fork git pin — remove it first so Pi does not load both copies:
+Install the package:
 
 ```bash
-pi remove npm:pi-intercom                 # if upstream was installed
-pi remove git:github.com/Scott-Meyer/pi-intercom-subagent-acl   # if the ACL fork was installed
+pi install npm:pi-parley
 ```
 
-Then install parley at the pinned release:
+Restart Pi. Enabled sessions connect automatically, and the package supplies the `pi-parley` skill with conversation and delivery context.
+
+For local development, register the checkout path instead of an npm copy:
 
 ```bash
-pi install git:github.com/Scott-Meyer/pi-parley@v1.0.0
+pi install /absolute/path/to/pi-parley
 ```
 
-Restart Pi. The extension auto-connects to the broker on startup and registers the bundled `pi-parley` skill with conversation and delivery context. An existing `~/.pi/agent/intercom/` runtime (config, federation links, queued mail) migrates to `~/.pi/agent/parley/` automatically on first start; see [Upgrading from 1.0.x or the intercom fork](#upgrading-from-10x-or-the-intercom-fork).
-
-This README describes the working tree. Features listed under [Unreleased](CHANGELOG.md#unreleased) are not yet in the pinned release.
+This loads the working tree. Reload a session after editing extension code; broker changes also need a [broker restart](#updating-parley).
 
 ### Pi compatibility
 
@@ -48,9 +45,9 @@ This package supports both Pi distributions:
 - `@mariozechner/pi-coding-agent` 0.73.1
 - `@earendil-works/pi-coding-agent` 0.80.3 or newer with a compatible sibling-package set; 0.80.3 is tested with `pi-agent-core`, `pi-ai`, and `pi-tui` pinned to 0.80.3, while the current 0.85.1 release is tested with its default resolution
 
-Installing pi-parley does not install or replace either coding-agent distribution or duplicate its host libraries. Pi, TUI, and TypeBox are optional peers supplied by the host; the package's only hard runtime dependency is `tsx`, used by the standalone broker. The fork loader maps the upstream-compatible extension imports to its own host modules. Fork hosts publish name changes to extensions immediately; upstream 0.73.1 exposes the same core event only to RPC/TUI consumers, so pi-parley uses a one-second compatibility fallback there. `npm run test:host-compat` packs the extension and boots it under upstream 0.73.1, a coherent fork 0.80.3 dependency set, and fork 0.85.1 without allowing one coding-agent distribution to pull in the other.
+Installing pi-parley does not install or replace either coding-agent distribution or duplicate its host libraries. Pi, TUI, and TypeBox are optional peers supplied by the host; Runtime dependencies are `tsx`, used by the standalone broker, and `fs-native-extensions`, which supplies OS-managed file locks. The native addon ships prebuilt binaries for macOS, Linux and Windows on x64/arm64; Linux requires kernel 3.15 or newer. The fork loader maps the upstream-compatible extension imports to its own host modules. Fork hosts publish name changes to extensions immediately; upstream 0.73.1 exposes the same core event only to RPC/TUI consumers, so pi-parley uses a one-second compatibility fallback there. `npm run test:host-compat` packs the extension and boots it under upstream 0.73.1, a coherent fork 0.80.3 dependency set, and fork 0.85.1 without allowing one coding-agent distribution to pull in the other.
 
-The ACL additions are also optional at runtime. An ordinary Pi session without pi-subagents bridge metadata gets normal parley behavior. Child-only visibility and the fallback `contact_supervisor` tool activate only when pi-subagents provides the corresponding environment metadata; if its native supervisor channel is available, pi-parley leaves that tool to the native channel.
+The child-session integration is optional at runtime. An ordinary Pi session without pi-subagents bridge metadata gets normal parley behavior. Child-only visibility and the fallback `contact_supervisor` tool activate only when pi-subagents provides the corresponding environment metadata; if its native supervisor channel is available, pi-parley leaves that tool to the native channel.
 
 A session becomes parley-connected when all of these are true:
 - the `pi-parley` extension is installed and loaded in that session
@@ -158,7 +155,7 @@ Successful compactions advance a private broker-owned generation for the session
 
 The first contact between two identities establishes a synchronously durable baseline without making a historical claim. Directional contact watermarks and compaction generations persist across reconnects and broker restarts; detection compares generations rather than elapsed time, so machine sleep and clock changes do not create false positives. Broker state files, limits, and recovery are isolated per scope; those files hash scopes, stable session IDs, and compaction event IDs rather than storing routing identities in plaintext. The Pi session journal retains opaque pending event IDs so compaction reports can be retried until the broker acknowledges durable storage.
 
-Compaction itself never sends a message or wakes another session. Broadcast neither displays nor consumes compaction notices and never enters the collaboration graph. A send rejected before acceptance does not advance contact watermarks. Sender first-contact baselines are durable before delivery success; receiver baselines are durably staged before delivery and promoted only after the surfaced message's opaque token is acknowledged. The Pi session journal retries an unconfirmed receiver token across reconnects and broker restarts. Later compaction notices also remain pending until acknowledgement and may safely repeat rather than be lost. Older clients do not advertise the capability, so mixed-version contact cannot silently consume a notice.
+Compaction itself never sends a message or wakes another session. Broadcast neither displays nor consumes compaction notices and never enters the collaboration graph. A send rejected before acceptance does not advance contact watermarks. Sender first-contact baselines are durable before delivery success; receiver baselines are durably staged before delivery and promoted only after the surfaced message's opaque token is acknowledged. The Pi session journal retries an unconfirmed receiver token across reconnects and broker restarts. Later compaction notices also remain pending until acknowledgement and may safely repeat rather than be lost. Clients that do not advertise the capability cannot silently consume a notice.
 
 ## Keyboard Shortcuts
 
@@ -249,7 +246,7 @@ The broker:
 - rejects stale owner-only writes
 - stores at most 64 KiB of opaque, revisioned state per namespace
 
-`channel.publish()` accepts payloads up to 16 KiB. A `capable` broadcast includes the sender, so consumers must not blindly republish messages they receive. `channel.commitState()` uses compare-and-swap against the last observed revision. Capabilities registered after the broker connection is established are synchronized without reconnecting. Clients connected to an older broker see the channel as unsupported and do not send extension operations.
+`channel.publish()` accepts payloads up to 16 KiB. A `capable` broadcast includes the sender, so consumers must not blindly republish messages they receive. `channel.commitState()` uses compare-and-swap against the last observed revision. Capabilities registered after the broker connection is established are synchronized without reconnecting. If the broker does not advertise extension-channel support, clients do not send extension operations.
 
 ### Extension outbox
 
@@ -312,7 +309,7 @@ The broker is a standalone TypeScript process that manages session registration 
 
 Messages use length-prefixed JSON over a local socket/pipe transport (4-byte length + JSON payload) to handle fragmentation properly. The protocol includes request correlation for session listing, explicit delivery failures, validation for malformed or out-of-order messages, a frame-size cap, per-connection local rate limiting, and no-op presence coalescing.
 
-**Experimental broker federation transport (Slices 1–3).** A trusted local controller such as FlightDeck can ask the broker to dial an ephemeral loopback bridge with a single-use capability. The broker writes a capability-bearing `bridge_attach` preface for FlightDeck to consume. Before opaque forwarding begins, FlightDeck independently prepares the destination broker's expected origins and local scope bindings through `broker_accept_peer`; that exact prepared destination connection becomes the opaque pipe, and the brokers then complete a strict `peer_hello` / `peer_hello_ack` exchange. Link IDs are broker-generated, public scope aliases never expose private local scope IDs to the peer, reciprocal dials converge through deterministic origin ordering, and accepted peer links use an explicit connection role rather than impersonating ordinary clients.
+**Experimental broker federation.** A trusted local controller such as FlightDeck can ask the broker to dial an ephemeral loopback bridge with a single-use capability. The broker writes a capability-bearing `bridge_attach` preface for FlightDeck to consume. Before opaque forwarding begins, FlightDeck independently prepares the destination broker's expected origins and local scope bindings through `broker_accept_peer`; that exact prepared destination connection becomes the opaque pipe, and the brokers then complete a strict `peer_hello` / `peer_hello_ack` exchange. Link IDs are broker-generated, public scope aliases never expose private local scope IDs to the peer, reciprocal dials converge through deterministic origin ordering, and accepted peer links use an explicit connection role rather than impersonating ordinary clients.
 
 When both brokers negotiate `peer-roster-v1`, each link exchanges an authoritative bounded snapshot followed by monotonically sequenced deltas under a broker-lifetime origin epoch. Sequence gaps request a fresh snapshot; stale epochs cannot roll state back; and disconnect atomically prunes only that link's imported sessions. Brokers export only locally owned mains and explicitly advertised subagents, never re-export imports. Raw local scope IDs remain link-local authority while public aliases qualify remote identities. Imported rows are visibly marked `remote:…`, are never `trustedLocal`, and respect local scope/subagent visibility.
 
@@ -320,29 +317,32 @@ When both brokers also negotiate `peer-send-v1`, direct sends to imported `oqs1.
 
 The broker owns a persisted canonical federation origin (adopted from the first controller-supplied id or minted as `install:<uuid>`), exposed with live scope enumeration through the trusted-local `broker_list_scopes` control; every dial/accept must present exactly it.
 
-Remote links without `peer-send-v1` support remain discovery-only. Broadcast, queued mailboxes, extension channels, and compaction awareness remain host-local in federation v1. Mixed ACL.9 peers can retain the base identity link without falsely negotiating roster support.
+Remote links without `peer-send-v1` support remain discovery-only. Broadcast, queued mailboxes, extension channels, and compaction awareness remain host-local in federation v1. Identity transport, roster replication, and routed sends are negotiated as separate capabilities.
 
 Session IDs are the trusted addressing key within one broker routing scope. Duplicate names remain allowed, but ambiguous names fail rather than selecting a recipient. The stable session ID shown by `list`/`status` distinguishes those endpoints. Mail queued for a disconnected session is redelivered to a session that reconnects under the same session ID, or to a session that matches both its explicit name and its directory, so a same-named session in a different project never inherits another project's queued messages. Runtime-only `session-...` aliases are excluded from name-based mailbox reconnection, and a disconnected mailbox is never remapped to the sender. Set `PI_PARLEY_STABLE_ID` or `stableId` in `config.json` to pin a session's parley ID across full process relaunches; `config.json` is machine-global, so a fixed `stableId` there applies to every session on the machine and the newest registration takes over that identity only within the same `PI_PARLEY_SCOPE_ID` boundary. The broker owns local trust metadata such as `trustedLocal`; `peerUid` is reserved for runtimes that can expose real peer credentials and is left unset otherwise. Client-supplied cwd/model/pid/status are display metadata, not authentication.
 
 Async extension work (startup, inbound flushes, reconnects, overlays, and relays) no-ops if the session shuts down or reloads before it settles.
 
-Runtime files live at `~/.pi/agent/parley/` by default, or `$PI_CODING_AGENT_DIR/intercom/` when `PI_CODING_AGENT_DIR` is set:
+Runtime files live at `~/.pi/agent/parley/` by default, or `$PI_CODING_AGENT_DIR/parley/` when `PI_CODING_AGENT_DIR` is set:
 - `broker.sock` — Unix domain socket for communication (macOS/Linux only; Windows uses a named pipe instead)
 - `broker-launch.vbs` — Windows helper script used to launch the broker without a console window
 - `broker.pid` — Broker process ID
-- `broker.spawn.lock` — Auto-spawn lock file
-- `broker.port.json` — Dynamic localhost TCP endpoint, only when Windows TCP transport is explicitly enabled
+- `broker.startup/.process.lock` — Permanent advisory startup lock
+- `broker.ownership/.process.lock` — Permanent broker lifetime lock
+- `broker.port.json` — Authenticated dynamic localhost endpoint when TCP transport is explicitly enabled
 - `config.json` — User configuration
 
 Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `replyHint`, `confirmSend`, and advanced broker launch overrides.
 
 ## Design Decisions
 
-**Local broker IPC instead of a listening network service.** `pi-parley` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps local setup simple and avoids exposed broker ports. Cross-machine federation delegates authenticated SSH transport and ephemeral loopback attachment to FlightDeck rather than making the broker network-addressable. Windows TCP is available only as an explicit escape hatch with `PI_PARLEY_TRANSPORT=tcp` (or `PI_PARLEY_TCP=1`) for environments where named pipes are blocked. In that mode the broker binds a dynamic `127.0.0.1` port, records the endpoint plus a local secret under the parley state dir, and requires that secret before health or registration succeeds. Health replies do not echo the secret, so a random localhost process cannot discover it through the broker protocol.
+**Local broker IPC instead of a listening network service.** `pi-parley` uses Unix sockets on macOS/Linux and a named pipe on Windows, which keeps local setup simple and avoids exposed broker ports. Cross-machine federation delegates authenticated transport and ephemeral loopback attachment to a host controller rather than making the broker network-addressable. Authenticated loopback TCP is an explicit alternative on any platform with `PI_PARLEY_TRANSPORT=tcp` (or `PI_PARLEY_TCP=1`), useful when local IPC is unavailable. In that mode the broker binds a dynamic `127.0.0.1` port, records the endpoint plus a local secret under the parley state dir, and requires that secret before health or registration succeeds. Health replies do not echo the secret, so a random localhost process cannot discover it through the broker protocol.
 
-**Auto-spawn with file lock.** The broker starts on first connection and exits after 5 seconds idle. There is no daemon to manage. A spawn lock file, keyed by PID and timestamp, prevents duplicate brokers when multiple sessions start at once.
+**Runtime ownership.** One broker owns each runtime directory until shutdown completes. Ownership is an OS-managed file lock, not a PID or an elapsed-time lease: paused owners remain owners, and process exit releases the lock. A separate short-lived startup lock coordinates clients starting that broker. Lock files stay at stable paths and are never deleted to reclaim ownership. Runtime directories must remain on a local filesystem and must not be moved or replaced while in use.
 
 **Conversation intent is explicit.** The broker correlates ask/reply edges while the client owns blocking waits and asynchronous conversation delivery. Threading alone is not an answer: notifications preserve pending questions, and explicit replies settle them. Request IDs also correlate roster queries so a delayed list cannot be mistaken for a newer one.
+
+**Broker lifecycle.** The broker starts when needed and exits after five seconds with no registered sessions or federation links. Extension reload reuses a healthy broker; it does not replace the broker process. For broker-code updates, stop the broker gracefully and verify its exit before starting it again. Health reports the running PID, unique instance ID, package version and a source snapshot captured at startup. The source snapshot fingerprints packaged root/broker sources and metadata on disk, not dependency binaries or proof of module contents during concurrent checkout edits.
 
 ## pi-parley vs pi-messenger
 
@@ -359,7 +359,7 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 ## File Structure
 
 ```
-~/.pi/agent/extensions/pi-parley/
+<pi-parley package or checkout>/
 ├── package.json
 ├── index.ts              # Extension entry point
 ├── types.ts              # SessionInfo, Message, protocol types
@@ -371,6 +371,9 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 ├── broker/
 │   ├── broker.ts         # Broker process and connection roles
 │   ├── client.ts         # ParleyClient class
+│   ├── build.ts          # Startup package/source identity
+│   ├── process-lock.ts   # Kernel-owned lifetime leases
+│   ├── runtime-claim.ts  # Broker ownership before initialization
 │   ├── federation-types.ts    # Broker-peer wire contracts
 │   ├── federation-protocol.ts # Strict validators and qualified ID codec
 │   ├── federation-roster.ts   # Snapshot/delta import and resynchronization
@@ -379,7 +382,7 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 │   ├── peer-link.ts      # Peer authority, handshake, and lifecycle
 │   ├── framing.ts        # Length-prefixed JSON protocol
 │   ├── paths.ts          # Platform-specific socket/pipe paths
-│   ├── spawn.ts          # Auto-spawn logic with lock file
+│   ├── spawn.ts          # Auto-spawn and advisory startup ownership
 │   ├── spawn.test.ts     # Broker spawn tests
 │   └── paths.test.ts     # Path resolution tests
 ├── ui/
@@ -393,20 +396,20 @@ Pi-messenger centers a shared room; pi-parley centers conversations with chosen 
 
 ## Limitations
 
-- **Remote asks/replies not yet enabled** — Federation Slices 1–3 establish FlightDeck-bridged broker identity, a replicated remote roster, and routed direct text sends; remote asks, replies, receipts, and attachments arrive in a later slice
+- **Remote messaging is direct text-only** — Federation supports broker identity, a replicated remote roster, and routed direct text sends. Asks, replies, receipts, and attachments remain host-local.
 - **Bounded inspection, not a separate archive** — `pending` and `read` expose retained incoming context; journaled history lives in the Pi session, not a standalone durable inbox
 - **No attachments UI** — `file`, `snippet`, and `context` attachments are supported in the protocol, but not in the compose overlay
 - **Visibility is scoped** — The roster includes connected sessions permitted by routing scope and child ACLs, not every Pi process or every sibling
 - **Broker-memory mailboxes** — The broker auto-spawns and clients reconnect after a restart, but queued offline messages do not survive broker exit
 
-## Upgrading from 1.0.x or the intercom fork
+## Updating Parley
 
-Parley 1.1.0 retires the intercom names from runtime surfaces (directories, wire protocol, events, env vars, pipe names). The cutover is coordinated, never a live move:
+The extension and the broker are separate processes. Reloading a session updates its extension, but reuses a healthy broker; the health handshake checks wire compatibility, not the installed package version. Rolling reloads and federation links can keep that broker running indefinitely.
 
-1. **Install 1.1.0 everywhere together.** The wire protocol and federation protocol renamed (`pi-parley`, `pi-parley-peer`); 1.0.x and 1.1.0 brokers do not interoperate.
-2. **Restart Pi sessions.** A still-running 1.0.x broker drains once its sessions disconnect. If a federation peer link (e.g. a FlightDeck bridge) holds it open, disconnect the link or stop the drained broker.
-3. **First 1.1.0 start migrates the runtime** — a stopped `~/.pi/agent/intercom/` moves to `~/.pi/agent/parley/` whole. While the legacy broker is live, parley blocks startup (no split roster) and retries; sessions reconnect automatically once it drains.
-4. **Two populated runtimes are an explicit conflict.** The broker refuses to start and names both paths; resolve manually rather than losing either state.
-5. **Pre-1.1 session histories still replay** — legacy `intercom_*` journal entries are read transparently while new writes use `parley_*`.
+For an update that changes broker code:
 
-Consumer extensions must update in step: `pi-subagents` (subagent relay events, the `parley` tool name), `coord-observer`-style listeners (`parley:*` extension events), and FlightDeck (tool/command/event/env names — see the rename tracking issue).
+1. Install or pull the desired release for every client sharing the runtime directory, then reload those clients. Do this at a quiet boundary: reconnecting interrupts blocking waits.
+2. On macOS/Linux, read `broker.pid`, verify it is the expected Parley process and send it `SIGTERM`; an unchecked PID can be stale or reused. Windows process signals force termination, so use the normal idle shutdown after disconnecting all clients and federation links when a graceful flush is needed. Verify broker exit before restart. Collaboration state is flushed on graceful shutdown; queued offline mail and broker-memory thread routes do **not** survive broker exit.
+3. Reconnect clients to start the broker from the updated installation. Check its new health instance ID/PID and startup package/source snapshot, then verify the roster and real messaging. The snapshot describes startup files, not dependency binaries or concurrently edited module contents. Federation controllers must reconnect their links.
+
+There is no automatic version-based broker replacement. A client must not restart or downgrade a shared broker merely because its own installation differs.

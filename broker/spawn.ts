@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -11,18 +11,18 @@ import {
   getAgentDirPath,
   getBrokerConnectTarget,
   getParleyDirPath,
-  migrateLegacyRuntimeDir,
-  PARLEY_PROTOCOL_NAME,
-  PARLEY_PROTOCOL_VERSION,
   PARLEY_RUNTIME_FILE_MODE,
   restrictParleyRuntimeFile,
   type BrokerConnectTarget,
 } from "./paths.ts";
 
+import { tryAcquireProcessLock } from "./process-lock.ts";
+import { isBrokerHealthOkMessage } from "./protocol.ts";
+import { BROKER_RUNTIME_OCCUPIED_EXIT_CODE } from "./runtime-claim.ts";
+
 const PARLEY_DIR = getParleyDirPath();
 const EXTENSION_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
-const BROKER_PID = join(PARLEY_DIR, "broker.pid");
-const BROKER_SPAWN_LOCK = join(PARLEY_DIR, "broker.spawn.lock");
+const BROKER_STARTUP_LOCK_DIR = join(PARLEY_DIR, "broker.startup");
 const BROKER_STARTUP_STDERR_LIMIT = 4_000;
 
 type BrokerLaunchSpec =
@@ -51,7 +51,7 @@ export function getTsxCliPath(extensionDir: string = EXTENSION_DIR): string {
   // root by npm. We resolve the tsx package main entry (its "exports" field
   // does not expose ./dist/cli.mjs as a subpath) and then locate cli.mjs next
   // to it. If resolution fails, prefer the flat plugin-store layout before the
-  // legacy nested fallback.
+  // nested installation fallback.
   try {
     const requireFromExtension = createRequire(join(extensionDir, "package.json"));
     const tsxMain = requireFromExtension.resolve("tsx");
@@ -108,17 +108,6 @@ export function getWindowsHiddenLauncherScript(commandLine: string): string {
     'Set WshShell = Nothing',
     '',
   ].join("\r\n");
-}
-
-export function isBrokerHealthOkMessage(message: unknown, requestId: string): boolean {
-  if (typeof message !== "object" || message === null || !("type" in message)) {
-    return false;
-  }
-  const response = message as Record<string, unknown>;
-  return response.type === "health_ok"
-    && response.requestId === requestId
-    && response.protocol === PARLEY_PROTOCOL_NAME
-    && response.version === PARLEY_PROTOCOL_VERSION;
 }
 
 export function writeWindowsHiddenLauncher(
@@ -196,57 +185,21 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-// Parley 1.1.0 relocated the runtime dir; spawn refuses while a legacy
-// intercom broker is still running so the roster never splits. The client's
-// reconnect loop retries after the legacy broker idles out.
-// Parley 1.1.0 relocated the runtime dir; spawn refuses while a legacy
-// intercom broker is still running so the roster never splits. The client's
-// reconnect loop retries after the legacy broker idles out.
-function assertRuntimeCutoverComplete(): void {
-  const migration = migrateLegacyRuntimeDir();
-  if (migration.status === "blocked") {
-    throw new Error(
-      "parley: a legacy intercom broker is still running from the intercom/ runtime dir. Restart Pi sessions so it drains; if a federation peer link (e.g. a FlightDeck bridge) holds it open, disconnect the link or stop the drained broker — its state migrates on the next start.",
-    );
-  }
-  if (migration.status === "conflict") {
-    throw new Error(
-      `parley: both ${join(getAgentDirPath(), "intercom")} and ${getParleyDirPath()} hold runtime state; resolve manually (remove or merge one) before starting.`,
-    );
-  }
-}
-
-export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: string[], depth = 0): Promise<void> {
-  // The spawn lock opens parley/broker.spawn.lock, so the directory must
-  // exist first. A fresh parley/ dir with no state entries lets the legacy
-  // migration adopt intercom/ state wholesale.
+/** Reuse a wire-compatible broker or start one for the current runtime.
+ * Competing clients wait for the spawn winner's health handshake. */
+export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: string[]): Promise<void> {
   ensureParleyRuntimeDir(PARLEY_DIR);
+  if (await isBrokerRunning()) return;
 
-  const ownsLock = acquireSpawnLock();
-  if (!ownsLock) {
-    // A concurrent start owns the spawn lock. Wait for its broker, then
-    // re-enter so the attach decision is made under the same lock — a
-    // lock-free status probe cannot close the legacy pid/lock handoff
-    // race, and attaching to a healthy broker beside an unresolved legacy
-    // runtime would split the roster.
+  const startup = tryAcquireProcessLock(BROKER_STARTUP_LOCK_DIR);
+  if (startup.status === "occupied") {
     await waitForBroker();
-    if (depth >= 1) {
-      throw new Error("parley: broker startup lock is still held after the broker became healthy; retrying shortly.");
-    }
-    return spawnBrokerIfNeeded(brokerCommand, brokerArgs, depth + 1);
+    return;
   }
 
   try {
-    // Fully serialized under the spawn lock: a healthy parley broker is not
-    // enough to attach — while a legacy intercom runtime is unresolved (live
-    // broker, in-flight legacy startup, or dual state), attaching would split
-    // the roster and stall the cutover, so that broker is left to drain. The
-    // lock also serializes the one-time legacy migration across concurrent
-    // first starts.
-    assertRuntimeCutoverComplete();
-    if (await isBrokerRunning()) {
-      return;
-    }
+    // Another client may have completed startup before we acquired the lock.
+    if (await isBrokerRunning()) return;
 
     const brokerPath = join(dirname(fileURLToPath(import.meta.url)), "broker.ts");
     const launch = getBrokerLaunchSpec(brokerPath, brokerCommand, brokerArgs);
@@ -281,7 +234,9 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
       };
 
       const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-        if (launch.kind === "windows-launcher" && code === 0 && signal === null) {
+        if (signal === null && ((launch.kind === "windows-launcher" && code === 0) || code === BROKER_RUNTIME_OCCUPIED_EXIT_CODE)) {
+          // A direct starter may own the runtime before health is published, or
+          // a broker may outlive its spawning client. Keep waiting for that owner.
           return;
         }
         cleanup();
@@ -304,26 +259,12 @@ export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: str
       });
     });
   } finally {
-    releaseSpawnLock();
+    startup.lease.release();
   }
 }
 
-async function isBrokerRunning(): Promise<boolean> {
-  if (await checkSocketConnectable()) {
-    return true;
-  }
-
-  if (!existsSync(BROKER_PID)) return false;
-
-  try {
-    const pid = parseInt(readFileSync(BROKER_PID, "utf-8").trim(), 10);
-    if (!Number.isFinite(pid)) return false;
-    process.kill(pid, 0);
-    return checkSocketConnectable();
-  } catch {
-    // Missing or unreadable PID state means there is no live broker to reuse.
-    return false;
-  }
+function isBrokerRunning(): Promise<boolean> {
+  return checkSocketConnectable();
 }
 
 function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
@@ -378,84 +319,6 @@ function checkSocketConnectable(): Promise<boolean> {
     socket.on("data", reader);
     const timeout = setTimeout(() => finish(false), 1000);
   });
-}
-
-function acquireSpawnLock(): boolean {
-  const maxRetries = 5;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      writeFileSync(BROKER_SPAWN_LOCK, `${process.pid}\n${Date.now()}\n`, {
-        flag: "wx",
-        mode: PARLEY_RUNTIME_FILE_MODE,
-      });
-      restrictParleyRuntimeFile(BROKER_SPAWN_LOCK);
-      return true;
-    } catch (error) {
-      if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw error;
-      }
-      if (isSpawnLockStale()) {
-        try {
-          unlinkSync(BROKER_SPAWN_LOCK);
-        } catch {
-          // If we can't delete the stale lock, retry a few times before giving up
-        }
-        continue;
-      }
-      return false;
-    }
-  }
-  return false;
-}
-
-export function isSpawnLockStale(): boolean {
-  if (!existsSync(BROKER_SPAWN_LOCK)) {
-    return false;
-  }
-
-  try {
-    // A PID-only lock ("${pid}\n") leaves the timestamp element absent; an
-    // empty default keeps it non-finite so the mtime grace applies instead of
-    // parsing a phantom timestamp of zero and stealing a fresh lock.
-    const [pidLine = "", createdAtLine = ""] = readFileSync(BROKER_SPAWN_LOCK, "utf-8").trim().split("\n");
-    const pid = Number.parseInt(pidLine, 10);
-    const createdAt = Number.parseInt(createdAtLine, 10);
-
-    if (!Number.isFinite(pid) || !Number.isFinite(createdAt)) {
-      // Empty or partial content: the holder may be between the lock's
-      // exclusive create and its write. Steal only a lock that has also
-      // been sitting untouched; a freshly created one is treated as held.
-      return Date.now() - statSync(BROKER_SPAWN_LOCK).mtimeMs > 10_000;
-    }
-
-    if (Number.isFinite(pid)) {
-      try {
-        process.kill(pid, 0);
-      } catch {
-        // The process that created the lock is gone.
-        return true;
-      }
-    }
-
-    return Date.now() - createdAt > 10_000;
-  } catch {
-    // Unreadable or empty content: the holder may be between the lock's
-    // exclusive create and its write. Steal only a lock that has also been
-    // sitting untouched; a freshly created one is treated as held.
-    try {
-      return Date.now() - statSync(BROKER_SPAWN_LOCK).mtimeMs > 10_000;
-    } catch {
-      return false;
-    }
-  }
-}
-
-function releaseSpawnLock(): void {
-  try {
-    unlinkSync(BROKER_SPAWN_LOCK);
-  } catch {
-    // Another cleanup path may already have removed the lock.
-  }
 }
 
 async function waitForBroker(timeoutMs = 5000): Promise<void> {

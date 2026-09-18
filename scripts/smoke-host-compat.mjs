@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const scratch = mkdtempSync(join(tmpdir(), "pi-parley-host-compat-"));
+// Keep actual Unix socket paths within macOS's short sockaddr_un limit.
+const scratch = mkdtempSync(join(tmpdir(), "pl-host-"));
 const packed = join(scratch, "packed");
 const agentDirs = [];
 
@@ -22,8 +23,7 @@ const hosts = [
     spec: "@earendil-works/pi-coding-agent@0.80.3",
     packagePath: "@earendil-works/pi-coding-agent",
     forbiddenPackagePaths: ["@mariozechner/pi-coding-agent", "@mariozechner/pi-tui"],
-    // The 0.80.3 host used caret ranges for its sibling packages; pin the
-    // historical family together so npm does not combine it with 0.85.x.
+    // Pin matching sibling packages so caret ranges do not mix SDK families.
     overrides: {
       "@earendil-works/pi-agent-core": "0.80.3",
       "@earendil-works/pi-ai": "0.80.3",
@@ -66,6 +66,11 @@ try {
   writeFileSync(join(hostlessProject, "package.json"), JSON.stringify({ private: true }));
   run("npm", ["install", "--silent", tarball], { cwd: hostlessProject });
   assert.equal(existsSync(join(hostlessProject, "node_modules", "tsx")), true);
+  assert.equal(existsSync(join(hostlessProject, "node_modules", "fs-native-extensions")), true);
+  const hostlessExtension = join(hostlessProject, "node_modules", "pi-parley");
+  for (const runtimeFile of ["broker/process-lock.ts", "broker/runtime-claim.ts", "broker/build.ts", "broker/broker.ts"]) {
+    assert.equal(existsSync(join(hostlessExtension, runtimeFile)), true, `packed package omitted ${runtimeFile}`);
+  }
   for (const hostModule of [
     "@mariozechner/pi-coding-agent",
     "@mariozechner/pi-tui",
@@ -79,6 +84,51 @@ try {
       `hostless install pulled in optional host module ${hostModule}`,
     );
   }
+
+  const hostlessAgent = join(hostlessProject, "agent");
+  agentDirs.push(hostlessAgent);
+  const coldBrokerCheck = `
+    import assert from 'node:assert/strict';
+    import { spawn } from 'node:child_process';
+    import { once } from 'node:events';
+    import { randomUUID } from 'node:crypto';
+    import { ParleyClient } from ${JSON.stringify(pathToFileURL(join(hostlessExtension, "broker/client.ts")).href)};
+    const broker = spawn(process.execPath, ['--import', 'tsx', ${JSON.stringify(join(hostlessExtension, "broker/broker.ts"))}], {
+      env: process.env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    });
+    const exited = once(broker, 'exit');
+    let stdout = '', stderr = '';
+    broker.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-4000); });
+    const client = new ParleyClient();
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => finish(new Error('Cold broker startup timed out: ' + stderr)), 10000);
+        function finish(error) {
+          clearTimeout(timer); broker.stdout.off('data', onData); broker.off('exit', onExit);
+          error ? reject(error) : resolve();
+        }
+        function onData(chunk) { stdout += chunk; if (stdout.includes('Parley broker started')) finish(); }
+        function onExit(code) { finish(new Error('Cold broker exited ' + code + ': ' + stderr)); }
+        broker.stdout.on('data', onData); broker.once('exit', onExit);
+      });
+      const id = randomUUID();
+      await client.connect({ cwd: process.cwd(), model: 'cold-smoke', pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() }, id);
+      assert.deepEqual((await client.listSessions()).map(seat => seat.id), [id]);
+      assert.equal((await client.reportCompactionCompleted()).generation, 1);
+      await client.disconnect();
+      const [code, signal] = await exited;
+      assert.equal(signal, null); assert.equal(code, 0);
+    } finally {
+      await client.disconnect();
+      if (broker.exitCode === null && broker.signalCode === null) broker.kill('SIGKILL');
+      await exited;
+    }
+  `;
+  run(process.execPath, ["--import", "tsx", "--input-type=module", "-e", coldBrokerCheck], {
+    cwd: hostlessProject, timeout: 30000,
+    env: { ...process.env, PI_CODING_AGENT_DIR: hostlessAgent },
+  });
+  console.log("✓ hostless packed install: broker started, registered a client, committed state and shut down cleanly");
 
   for (const host of hosts) {
     const project = join(scratch, host.label);
@@ -102,7 +152,7 @@ try {
     const hostManifest = JSON.parse(readFileSync(join(hostPackage, "package.json"), "utf8"));
     const extensionRoot = join(project, "node_modules", "pi-parley");
     const extensionManifest = JSON.parse(readFileSync(join(extensionRoot, "package.json"), "utf8"));
-    assert.deepEqual(extensionManifest.dependencies, { tsx: "^4.23.13" });
+    assert.deepEqual(extensionManifest.dependencies, { "fs-native-extensions": "^1.5.1", tsx: "^4.23.13" });
     const extensionPath = join(extensionRoot, "index.ts");
     const input = [
       { id: "commands", type: "get_commands" },

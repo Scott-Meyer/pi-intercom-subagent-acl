@@ -16,6 +16,18 @@ import {
   isCanonicalFederationScopeAlias,
 } from "./federation-protocol.ts";
 
+import { PARLEY_PROTOCOL_NAME, PARLEY_PROTOCOL_VERSION } from "./paths.ts";
+
+/** Validate the wire identity and correlation of a health response.
+ * Build metadata is diagnostic and does not decide wire compatibility. */
+export function isBrokerHealthOkMessage(message: unknown, requestId: string): boolean {
+  if (!isRecord(message)) return false;
+  return message.type === "health_ok"
+    && message.requestId === requestId
+    && message.protocol === PARLEY_PROTOCOL_NAME
+    && message.version === PARLEY_PROTOCOL_VERSION;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

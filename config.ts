@@ -1,13 +1,12 @@
-import { existsSync, readFileSync } from "fs";
+import { readFileSync } from "fs";
 import { join } from "path";
 import { getParleyDirPath } from "./broker/paths.ts";
-import { parleyEnv } from "./env-compat.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
 const PARLEY_SCOPE_ID_ENV = "PI_PARLEY_SCOPE_ID";
 
 export function getAskTimeoutMs(): number {
-  const raw = parleyEnv("PI_PARLEY_ASK_TIMEOUT_MS");
+  const raw = process.env.PI_PARLEY_ASK_TIMEOUT_MS;
   if (raw === undefined || raw.trim() === "") {
     return DEFAULT_ASK_TIMEOUT_MS;
   }
@@ -20,7 +19,7 @@ export function getAskTimeoutMs(): number {
 }
 
 export function getParleyScopeId(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const scopeId = parleyEnv(PARLEY_SCOPE_ID_ENV, env)?.trim();
+  const scopeId = env[PARLEY_SCOPE_ID_ENV]?.trim();
   return scopeId ? scopeId : undefined;
 }
 
@@ -61,33 +60,13 @@ export function getConfigPath(parleyDir: string = getParleyDirPath()): string {
   return join(parleyDir, "config.json");
 }
 
-/** Parley 1.1.0 relocated the runtime dir; until the broker-side cutover
- * moves intercom/, a legacy config still governs. Read-only fallback — the
- * runtime migration owns the move. A concurrent migration can delete either
- * file between the check and the read, so every read tolerates ENOENT and
- * the primary is reread after a legacy miss (the mover may have just landed
- * it there). */
-function tryReadConfig(path: string): string | undefined {
+function readConfigRaw(): string | undefined {
   try {
-    return readFileSync(path, "utf-8");
+    return readFileSync(getConfigPath(), "utf-8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
-}
-
-function readConfigRaw(): string | undefined {
-  const primary = getConfigPath();
-  const primaryRaw = tryReadConfig(primary);
-  if (primaryRaw !== undefined) {
-    return primaryRaw;
-  }
-  const legacy = join(getParleyDirPath(), "..", "intercom", "config.json");
-  const legacyRaw = tryReadConfig(legacy);
-  if (legacyRaw !== undefined) {
-    return legacyRaw;
-  }
-  return tryReadConfig(primary);
 }
 
 const defaults: ParleyConfig = {

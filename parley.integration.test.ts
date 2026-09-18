@@ -36,7 +36,7 @@ process.env.USERPROFILE = sharedHomeDir;
 // vars would change routing and ACL behavior inside these tests.
 delete process.env.PI_CODING_AGENT_DIR;
 for (const key of Object.keys(process.env)) {
-  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_PARLEY_") || key.startsWith("PI_INTERCOM_")) delete process.env[key];
+  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_PARLEY_")) delete process.env[key];
 }
 const { ParleyClient } = await import("./broker/client.ts");
 const { getTsxCliPath } = await import("./broker/spawn.ts");
@@ -188,11 +188,7 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
   const { readFileSync } = await import("node:fs");
   const { createMessageReader, writeMessage } = await import("./broker/framing.ts");
   const agentDir = mkdtempSync(path.join(tmpdir(), "pi-parley-tcp-agent-"));
-  const broker = spawn(process.execPath, [
-    getTsxCliPath(),
-    "-e",
-    "Object.defineProperty(process, 'platform', { value: 'win32' }); import('./broker/broker.ts').catch((error) => { console.error(error); process.exit(1); });",
-  ], {
+  const broker = spawn(process.execPath, ["--import", "tsx", path.join(repoDir, "broker", "broker.ts")], {
     cwd: repoDir,
     env: {
       ...process.env,
@@ -268,12 +264,16 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
     }, false), []);
 
     const healthMessages = await exchange({ type: "health", requestId: "authorized-health", stateId }, true);
-    assert.deepEqual(healthMessages, [{
-      type: "health_ok",
-      requestId: "authorized-health",
-      protocol: "pi-parley",
-      version: 1,
-    }]);
+    assert.equal(healthMessages.length, 1);
+    const healthy = healthMessages[0] as { type: string; requestId: string; protocol: string; version: number; broker: { pid: number; instanceId: string; sourceId: string } };
+    assert.equal(healthy.type, "health_ok");
+    assert.equal(healthy.requestId, "authorized-health");
+    assert.equal(healthy.protocol, "pi-parley");
+    assert.equal(healthy.version, 1);
+    assert.equal(healthy.broker.pid, broker.pid);
+    assert.match(healthy.broker.instanceId, /^[0-9a-f-]{36}$/);
+    assert.match(healthy.broker.sourceId, /^[0-9a-f]{64}$/);
+    assert.equal(JSON.stringify(healthy).includes(stateId), false, "health must not publish endpoint credentials");
 
     const registerMessages = await exchange({
       type: "register",
@@ -3141,30 +3141,30 @@ test("durable pending profiles recover name ownership after a commit append fail
   }
 });
 
-test("older brokers are reported as local-only instead of falsely claiming description publication", { concurrency: false }, async () => {
+test("description publication is local-only when the negotiated profile capability is absent", { concurrency: false }, async () => {
   const originalSupportsFeature = ParleyClient.prototype.supportsFeature;
   ParleyClient.prototype.supportsFeature = function (feature: string) {
     if (feature === "session-profile-v1") return false;
     return originalSupportsFeature.call(this, feature);
   };
   const { planner, cleanup } = await setupClients();
-  const harness = createExtensionHarness("mixed-version-profile", { hasUI: true });
+  const harness = createExtensionHarness("limited-profile-provider", { hasUI: true });
 
   try {
     const { default: piParleyExtension } = await import("./index.ts");
     piParleyExtension(harness.pi as never);
     await harness.emitLifecycle("session_start");
-    await waitForSessionByName(planner, "mixed-version-profile");
+    await waitForSessionByName(planner, "limited-profile-provider");
     const parleyTool = harness.tools.find((tool) => tool.name === "parley");
     assert.ok(parleyTool);
 
-    const result = await parleyTool.execute("profile-old-broker", {
+    const result = await parleyTool.execute("profile-capability-unavailable", {
       action: "status",
-      profile: { description: "Reviewing mixed version profile publication behavior" },
+      profile: { description: "Reviewing optional profile publication capability behavior" },
     }, new AbortController().signal, undefined, harness.ctx);
     assert.equal((result.details?.selfProfile as { descriptionPublished?: boolean }).descriptionPublished, false);
-    assert.match(result.content.at(-1)?.text ?? "", /description local only: broker upgrade required/);
-    const peerView = await waitForSessionDescription(planner, "mixed-version-profile", undefined);
+    assert.match(result.content.at(-1)?.text ?? "", /description local only: broker does not support profiles/);
+    const peerView = await waitForSessionDescription(planner, "limited-profile-provider", undefined);
     assert.equal(peerView.description, undefined);
   } finally {
     ParleyClient.prototype.supportsFeature = originalSupportsFeature;
@@ -3831,6 +3831,54 @@ test("busy non-interactive sessions steer top-level asks without aborting", { co
 
   } finally {
     await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("Parley journal replay and model context ignore unrelated custom entry types", { concurrency: false }, async () => {
+  const { default: piParleyExtension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("journal-worker");
+  const rendererTypes: string[] = [];
+  harness.pi.registerMessageRenderer = ((type: string) => { rendererTypes.push(type); }) as typeof harness.pi.registerMessageRenderer;
+  const envelope = (customType: string, id: string) => ({
+    customType, content: "Journal context", details: {
+      from: { id: "peer-1", cwd: repoDir, model: "m", pid: 1, startedAt: 0, lastActivity: 0 },
+      message: { id, timestamp: 1, content: { text: "Journal context" }, contactBaseline: true, contactToken: id },
+    },
+  });
+  // The current entry comes last: its acknowledgement is a barrier after any
+  // acknowledgements accidentally issued for the foreign journal entries.
+  harness.persistedMessages.push(
+    envelope("unrelated_message", "foreign-token"),
+    envelope("other_message", "other-token"),
+    envelope("parley_message", "current-token"),
+  );
+  try {
+    piParleyExtension(harness.pi as never);
+    assert.deepEqual(rendererTypes, ["parley_message"]);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "journal-worker");
+    const deadline = Date.now() + 2_000;
+    while (!harness.entries.some((entry) => entry.type === "parley_receiver_baseline_abandoned"
+      && (entry.data as { token?: string }).token === "current-token") && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.deepEqual(harness.entries.filter((entry) => entry.type === "parley_receiver_baseline_abandoned")
+      .map((entry) => (entry.data as { token: string }).token), ["current-token"]);
+
+    const current = { role: "custom", ...envelope("parley_message", "context-id") };
+    const unrelated = { role: "custom", ...envelope("unrelated_message", "context-id") };
+    const other = { role: "custom", ...envelope("other_message", "context-id") };
+    const foreignNotice = { role: "custom", customType: "unrelated_persistence_notice", content: "Foreign notice" };
+    const [result] = await harness.emitLifecycleResults("context", {
+      messages: [current, current, unrelated, unrelated, other, other, foreignNotice],
+    });
+    assert.deepEqual((result as { messages: unknown[] }).messages,
+      [current, unrelated, unrelated, other, other, foreignNotice],
+      "only Parley messages are deduplicated; foreign entries remain untouched");
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
     await cleanup();
   }
 });
@@ -5476,6 +5524,43 @@ test("presence carries context usage to peers, and an explicit null clears a sta
   }
 });
 
+test("SDK usage sampling clears an unknown post-compaction sample and publishes later measurements", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const harness = createExtensionHarness("usage-sampling-worker", { sessionId: "usage-sampling-session" });
+  let usage: { tokens: number; contextWindow: number; percent: number } | undefined = {
+    tokens: 217000, contextWindow: 272000, percent: 80,
+  };
+  Object.assign(harness.ctx, { getContextUsage: () => usage });
+  const { default: extension } = await import("./index.ts");
+  const observe = async (percent: number | undefined, tokens: number | undefined) => {
+    const deadline = Date.now() + 2000;
+    let seat: SessionInfo | undefined;
+    do {
+      seat = (await planner.listSessions()).find((peer) => peer.id === "usage-sampling-session");
+      if (seat && seat.contextPct === percent && seat.contextTokens === tokens) return seat;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } while (Date.now() < deadline);
+    assert.equal(seat?.contextPct, percent);
+    assert.equal(seat?.contextTokens, tokens);
+    assert.ok(seat);
+    return seat;
+  };
+  try {
+    extension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    assert.equal((await observe(80, 217000)).contextWindow, 272000);
+    usage = undefined;
+    await harness.emitLifecycle("session_compact", { reason: "manual" });
+    assert.equal((await observe(undefined, undefined)).contextWindow, undefined);
+    usage = { tokens: 70000, contextWindow: 272000, percent: 26 };
+    await harness.emitLifecycle("turn_start");
+    assert.equal((await observe(26, 70000)).contextWindow, 272000);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
 test("an ordinary notification can be replied to using only its visible conversation handle", { concurrency: false }, async () => {
   const { planner, cleanup } = await setupClients();
   const { default: piParleyExtension } = await import("./index.ts");
@@ -5801,46 +5886,6 @@ test("known failed notification delivery preserves the pending ask", { concurren
     assert.match(pending.content[0]?.text ?? "", /delivery-failure-ask-1/);
   } finally {
     await harness.emitLifecycle("session_shutdown");
-    await cleanup();
-  }
-});
-
-test("legacy PI_INTERCOM_SCOPE_ID registers in the same scope as PI_PARLEY_SCOPE_ID", { concurrency: false }, async () => {
-  // 1.1.1 honors launcher-provided legacy env names through the transition.
-  const { cleanup } = await setupClients();
-  try {
-    const modern = new ParleyClient();
-    const legacy = new ParleyClient();
-    const unscoped = new ParleyClient();
-
-    await connectClientWithScope(modern, "legacy-env-check", "modern-peer", "modern-peer");
-    await connectClientWithScope(unscoped, undefined, "unscoped-check", "unscoped-check");
-
-    const previousNew = process.env.PI_PARLEY_SCOPE_ID;
-    const previousOld = process.env.PI_INTERCOM_SCOPE_ID;
-    delete process.env.PI_PARLEY_SCOPE_ID;
-    process.env.PI_INTERCOM_SCOPE_ID = "legacy-env-check";
-    try {
-      await legacy.connect({
-        name: "legacy-peer",
-        cwd: repoDir,
-        model: "test-model",
-        pid: process.pid,
-        startedAt: Date.now(),
-        lastActivity: Date.now(),
-      }, "legacy-peer");
-    } finally {
-      if (previousNew === undefined) delete process.env.PI_PARLEY_SCOPE_ID;
-      else process.env.PI_PARLEY_SCOPE_ID = previousNew;
-      if (previousOld === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
-      else process.env.PI_INTERCOM_SCOPE_ID = previousOld;
-    }
-
-    await waitForSessionByName(modern, "legacy-peer");
-    assert.equal((await modern.listSessions()).some((session) => session.id === "legacy-peer"), true);
-    assert.equal((await unscoped.listSessions()).some((session) => session.id === "legacy-peer"), false);
-    assert.equal((await legacy.listSessions()).some((session) => session.id === "unscoped-check"), false);
-  } finally {
     await cleanup();
   }
 });

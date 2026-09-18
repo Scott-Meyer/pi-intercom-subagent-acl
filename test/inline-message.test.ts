@@ -68,7 +68,7 @@ test("inline parley messages retain compaction awareness in expanded and collaps
   const expanded = new InlineMessageComponent(from, awareMessage, theme as any);
   const expandedText = expanded.render(100).join("\n");
   assert.match(expandedText, /sender compacted context since your last direct contact \(2 compactions\)/i);
-  assert.match(expandedText, /Current context[\s│]*usage is 38%/i);
+  assert.match(expandedText, /Last[\s│]*reported[\s│]*context[\s│]*usage is 38%/i);
   assert.match(expandedText, /available terminal width/);
 
   const collapsed = new InlineMessageComponent(from, awareMessage, theme as any, undefined, undefined, true);

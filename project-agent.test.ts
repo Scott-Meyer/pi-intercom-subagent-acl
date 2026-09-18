@@ -534,14 +534,12 @@ test("a real launcher can create resources and still fail; cancellation before l
   }
 });
 
-test("openProjectPane exports the legacy project root env for pre-rename launcher commands", async () => {
-  const root = mkdtempSync(join(tmpdir(), "parley-legacy-launch-"));
+test("openProjectPane gives configured launchers the canonical project root", async () => {
+  const root = mkdtempSync(join(tmpdir(), "parley-launch-root-"));
   const project = join(root, "project");
   mkdirSync(project);
   const spawnImpl: LaunchCommandSpawn = (_commandLine, options) => {
-    // A launcher configured under the old name substitutes $PI_INTERCOM_PROJECT_ROOT.
     const resolvedProject = realpathSync(project);
-    assert.equal(options.env.PI_INTERCOM_PROJECT_ROOT, resolvedProject);
     assert.equal(options.env.PI_PARLEY_PROJECT_ROOT, resolvedProject);
     return {
       on: (event: string, listener: (code: number) => void) => {
@@ -556,7 +554,7 @@ test("openProjectPane exports the legacy project root env for pre-rename launche
       cwd: project,
       sessions: [session("self", "self", "/anywhere")],
       currentSessionId: "self",
-      launcherCommand: "legacy-launcher \"$PI_INTERCOM_PROJECT_ROOT\"",
+      launcherCommand: "project-launcher \"$PI_PARLEY_PROJECT_ROOT\"",
       sendRequest: () => Promise.reject(new Error("no provider should be asked")),
       spawnImpl,
     });
@@ -566,38 +564,27 @@ test("openProjectPane exports the legacy project root env for pre-rename launche
   }
 });
 
-test("project launch requests honor legacy PI_INTERCOM_PI_BIN and prefer the new name", async () => {
-  const root = mkdtempSync(join(tmpdir(), "parley-legacy-pibin-"));
+test("project launch requests use the configured Pi executable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "parley-pibin-"));
   const project = join(root, "project");
   mkdirSync(project);
-  const requests: Array<{ command?: string }> = [];
-  const session = (id: string, name: string, cwd: string) => ({ id, name, cwd, model: "m", pid: 1, startedAt: 0, lastActivity: 0, extensions: [{ namespace: "pi-parley/project-launch-v1" }] }) as never as SessionInfo;
-  const previousNew = process.env.PI_PARLEY_PI_BIN;
-  const previousOld = process.env.PI_INTERCOM_PI_BIN;
+  const previous = process.env.PI_PARLEY_PI_BIN;
   try {
-    const run = () => openProjectPane({
+    process.env.PI_PARLEY_PI_BIN = "/configured/bin/pi";
+    let requestedCommand: string | undefined;
+    await openProjectPane({
       cwd: project,
-      sessions: [session("provider", "provider", project)],
+      sessions: [{ ...session("provider", "provider", project), extensions: [{ namespace: "pi-parley/project-launch-v1" }] }],
       currentSessionId: "self",
       sendRequest: async (_target, request) => {
-        requests.push(request as { command?: string });
+        requestedCommand = request.command;
         return { delivered: true, id: "launch-request" };
       },
     });
-
-    delete process.env.PI_PARLEY_PI_BIN;
-    process.env.PI_INTERCOM_PI_BIN = "/legacy/bin/pi";
-    await run();
-    assert.equal(requests.at(-1)?.command, "/legacy/bin/pi");
-
-    process.env.PI_PARLEY_PI_BIN = "/new/bin/pi";
-    await run();
-    assert.equal(requests.at(-1)?.command, "/new/bin/pi");
+    assert.equal(requestedCommand, "/configured/bin/pi");
   } finally {
-    if (previousNew === undefined) delete process.env.PI_PARLEY_PI_BIN;
-    else process.env.PI_PARLEY_PI_BIN = previousNew;
-    if (previousOld === undefined) delete process.env.PI_INTERCOM_PI_BIN;
-    else process.env.PI_INTERCOM_PI_BIN = previousOld;
+    if (previous === undefined) delete process.env.PI_PARLEY_PI_BIN;
+    else process.env.PI_PARLEY_PI_BIN = previous;
     rmSync(root, { recursive: true, force: true });
   }
 });

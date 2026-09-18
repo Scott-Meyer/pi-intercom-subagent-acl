@@ -4,7 +4,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getConfigPath, getParleyScopeId, loadConfig } from "./config.ts";
-import { parleyEnv } from "./env-compat.ts";
 
 async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -16,6 +15,12 @@ async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Prom
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
 }
+
+test("routing scope comes only from a non-empty current-name value", () => {
+  assert.equal(getParleyScopeId({}), undefined);
+  assert.equal(getParleyScopeId({ PI_PARLEY_SCOPE_ID: "  " }), undefined);
+  assert.equal(getParleyScopeId({ PI_PARLEY_SCOPE_ID: "  team-alpha  " }), "team-alpha");
+});
 
 test("getConfigPath uses the centralized parley runtime directory", () => {
   assert.equal(getConfigPath("/tmp/pi-agent/parley"), join("/tmp/pi-agent", "parley", "config.json"));
@@ -61,11 +66,11 @@ test("loadConfig accepts inboundTrigger replies policy", async () => {
   }
 });
 
-test("loadConfig ignores obsolete toolVisibility values", async () => {
+test("unknown config keys do not change supported settings", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-parley-config-"));
   try {
     mkdirSync(join(root, "parley"), { recursive: true });
-    writeFileSync(join(root, "parley", "config.json"), JSON.stringify({ toolVisibility: "lazy", replyHint: false }));
+    writeFileSync(join(root, "parley", "config.json"), JSON.stringify({ unrelatedSetting: "ignored", replyHint: false }));
     await withAgentDir(root, () => {
       assert.equal(loadConfig().replyHint, false);
     });
@@ -125,55 +130,4 @@ test("loadConfig rejects invalid inboundTrigger values", async () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
-
-test("loadConfig reads a legacy intercom config before the runtime cutover moves it", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-parley-config-legacy-"));
-  try {
-    const legacyDir = join(root, "intercom");
-    mkdirSync(legacyDir, { recursive: true });
-    writeFileSync(join(legacyDir, "config.json"), JSON.stringify({
-      enabled: false,
-      confirmSend: true,
-      inboundTrigger: "never",
-      stableId: "stable-legacy",
-    }));
-
-    await withAgentDir(root, () => {
-      const config = loadConfig();
-      assert.equal(config.enabled, false);
-      assert.equal(config.confirmSend, true);
-      assert.equal(config.inboundTrigger, "never");
-      assert.equal(config.stableId, "stable-legacy");
-    });
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("parleyEnv prefers the new name and honors legacy PI_INTERCOM_* names", async () => {
-  const env: NodeJS.ProcessEnv = {};
-  assert.equal(parleyEnv("PI_PARLEY_STABLE_ID", env), undefined);
-  env.PI_INTERCOM_STABLE_ID = "legacy-id";
-  assert.equal(parleyEnv("PI_PARLEY_STABLE_ID", env), "legacy-id");
-  env.PI_PARLEY_STABLE_ID = "new-id";
-  assert.equal(parleyEnv("PI_PARLEY_STABLE_ID", env), "new-id");
-  assert.equal(parleyEnv("PI_PARLEY_SCOPE_ID", { PI_INTERCOM_SCOPE_ID: "alpha" }), "alpha");
-});
-
-test("getParleyScopeId reads a legacy PI_INTERCOM_SCOPE_ID launch environment", async () => {
-  await withAgentDir(join(tmpdir(), "parley-scope-legacy-"), () => {
-    const previousNew = process.env.PI_PARLEY_SCOPE_ID;
-    const previousOld = process.env.PI_INTERCOM_SCOPE_ID;
-    delete process.env.PI_PARLEY_SCOPE_ID;
-    process.env.PI_INTERCOM_SCOPE_ID = "alpha";
-    try {
-      assert.equal(getParleyScopeId(), "alpha");
-    } finally {
-      if (previousNew === undefined) delete process.env.PI_PARLEY_SCOPE_ID;
-      else process.env.PI_PARLEY_SCOPE_ID = previousNew;
-      if (previousOld === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
-      else process.env.PI_INTERCOM_SCOPE_ID = previousOld;
-    }
-  });
 });

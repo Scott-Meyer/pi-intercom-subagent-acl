@@ -8,7 +8,7 @@ export function formatPeerCompactionNotice(
 ): string {
   const compactionCount = notice.generation - notice.previousGeneration;
   const countText = compactionCount === 1 ? "" : ` (${compactionCount} compactions)`;
-  const contextText = notice.contextPct === undefined ? "" : ` Current context usage is ${notice.contextPct}%.`;
+  const contextText = notice.contextPct === undefined ? "" : ` Last reported context usage is ${notice.contextPct}%.`;
   const shortPeerId = notice.peerSessionId.slice(0, 8);
   const requested = peerDisplay.trim();
   const peerName = notice.peerName?.trim();

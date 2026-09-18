@@ -1,4 +1,3 @@
-import { parleyEnv } from "./env-compat.ts";
 import { spawn, type ChildProcess } from "child_process";
 import { realpathSync, statSync } from "fs";
 import { resolve } from "path";
@@ -152,7 +151,7 @@ export function resolveProjectLauncherCommand(
   env: NodeJS.ProcessEnv = process.env,
   configured?: string,
 ): string | undefined {
-  const fromEnv = parleyEnv("PI_PARLEY_PROJECT_LAUNCHER", env)?.trim();
+  const fromEnv = env.PI_PARLEY_PROJECT_LAUNCHER?.trim();
   if (fromEnv) return fromEnv;
   const fromConfig = configured?.trim();
   return fromConfig ? fromConfig : undefined;
@@ -196,9 +195,6 @@ export async function launchProjectCommand(
         env: {
           ...process.env,
           PI_PARLEY_PROJECT_ROOT: root,
-          // Launcher commands configured under the pre-rename name substitute
-          // $PI_INTERCOM_PROJECT_ROOT; export both through the transition.
-          PI_INTERCOM_PROJECT_ROOT: root,
         },
         detached: true,
       });
@@ -317,7 +313,7 @@ export async function openProjectPane(input: {
   } catch (cause) {
     throw new ProjectLaunchError(errorText(cause), { stage: "launch", cause });
   }
-  const command = parleyEnv("PI_PARLEY_PI_BIN")?.trim() || process.env.PI_BIN?.trim() || "pi";
+  const command = process.env.PI_PARLEY_PI_BIN?.trim() || process.env.PI_BIN?.trim() || "pi";
   const provider = findProjectLaunchProvider(input.sessions, input.currentSessionId);
   if (provider) {
     const launch: ProjectPaneLaunch = {

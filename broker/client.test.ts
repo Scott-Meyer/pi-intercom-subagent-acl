@@ -6,12 +6,16 @@ import path from "node:path";
 import { once } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, type ClientMessage } from "../types.ts";
+import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, type ClientMessage } from "../types.ts";
 import { createMessageReader, writeMessage } from "./framing.ts";
 import { getBrokerSocketPath } from "./paths.ts";
 
 import { encodeOriginQualifiedSessionIdentity } from "./federation-protocol.ts";
 import { isSessionId } from "./protocol.ts";
+
+const REQUIRED_FEATURES = [CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE];
+const TEST_REGISTRATION = { name: "test-client", cwd: "/test", model: "test", pid: process.pid, startedAt: 1, lastActivity: 1 };
+const accepted = (messageId: string) => ({ type: "delivered", messageId, delivery: "socket_delivered", retryable: false, outcomeKnown: true });
 
 test("validated session lifecycle messages reach broker-message subscribers", () => {
   const client = new ParleyClient();
@@ -106,7 +110,7 @@ test("registered handshake exposes the broker-owned self projection", () => {
   (client as any).handleBrokerMessage({
     type: "registered",
     sessionId: "session-1",
-    features: ["session-profile-v1"],
+    features: [...REQUIRED_FEATURES, "session-profile-v1"],
     session,
   });
   assert.deepEqual(client.getSelfSession(), session);
@@ -117,6 +121,7 @@ test("registered handshake exposes the broker-owned self projection", () => {
     () => (invalidClient as any).handleBrokerMessage({
       type: "registered",
       sessionId: "session-1",
+      features: REQUIRED_FEATURES,
       session: { ...session, id: "different-session" },
     }),
     /Invalid registered session/,
@@ -188,9 +193,10 @@ test("cancelAsk ignores synchronous socket write failures", () => {
 
 
 async function withScriptedBroker(
-  features: string[],
+  features: string[] | undefined,
   handle: (socket: net.Socket, frame: ClientMessage) => boolean | void,
   run: (client: ParleyClient) => Promise<void>,
+  options: { connect?: boolean } = {},
 ): Promise<void> {
   const agentDir = mkdtempSync(path.join(process.platform === "win32" ? tmpdir() : "/tmp", "pi-wire-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -218,7 +224,7 @@ async function withScriptedBroker(
   try {
     server.listen(socketPath);
     await once(server, "listening");
-    await client.connect({ name: "test-client", cwd: "/test", model: "test", pid: process.pid, startedAt: Date.now(), lastActivity: Date.now() });
+    if (options.connect !== false) await client.connect(TEST_REGISTRATION);
     await run(client);
   } finally {
     await client.disconnect().catch(() => undefined);
@@ -230,76 +236,111 @@ async function withScriptedBroker(
   }
 }
 
-test("late send ACKs cannot settle cancellation; legacy cancellation ACKs remain unknown without request correlation", async () => {
-  for (const modern of [false, true]) {
-    let finishCancellation: (() => void) | undefined;
-    await withScriptedBroker(modern ? [CONVERSATION_CONTRACT_FEATURE] : [], (socket, frame) => {
-      if (frame.type !== "cancel_message") return;
-      // The earlier send succeeded, but its acknowledgement arrives only after
-      // cancellation starts. It says nothing about whether withdrawal happened.
-      writeMessage(socket, { type: "delivered", messageId: frame.messageId });
-      finishCancellation = () => writeMessage(socket, {
-        type: "delivered", messageId: frame.messageId,
-        ...(modern ? { requestId: frame.requestId, cancellation: "withdrawal_requested" } : {}),
-      });
-    }, async client => {
-      const sent = await client.send("colleague", { text: "original work", timeoutMs: 30 });
-      assert.equal(sent.delivery, "unknown");
-      let cancellationSettled = false;
-      const cancelling = client.cancelMessage(sent.id, { timeoutMs: 100 }).then(result => {
-        cancellationSettled = true;
-        return result;
-      });
-      await client.listSessions(); // ordered barrier after the original ACK
-      assert.equal(cancellationSettled, false, "original send acceptance is not cancellation acceptance");
-      assert.ok(finishCancellation);
-      finishCancellation();
-      await client.listSessions();
-      assert.equal(cancellationSettled, modern, "only requestId identifies a cancellation response");
-      const cancelled = await cancelling;
-      assert.equal(cancelled.id, sent.id);
-      assert.equal(cancelled.delivered, modern);
-      assert.equal(cancelled.delivery, modern ? "socket_delivered" : "unknown");
-      assert.equal(cancelled.outcomeKnown, modern);
-      assert.equal(cancelled.cancellation, modern ? "withdrawal_requested" : undefined);
-      if (!modern) {
-        const retry = await client.send("colleague", { text: "original work", messageId: sent.id });
-        assert.equal(retry.delivery, "unknown", "a late untagged cancellation ACK cannot acknowledge a later same-ID send");
-        assert.equal(retry.retryable, false);
-      }
-    });
+test("connection requires the current contract but optional features remain negotiable", async () => {
+  for (const features of [undefined, [], [EXACT_SEND_FEATURE], [CONVERSATION_CONTRACT_FEATURE]]) {
+    await withScriptedBroker(features, () => undefined, async client => {
+      await assert.rejects(client.connect(TEST_REGISTRATION), /Invalid registered features|Missing required broker feature/);
+      assert.equal(client.isConnected(), false);
+      assert.equal(client.sessionId, null);
+    }, { connect: false });
   }
-});
-
-test("old brokers receive ordinary messages and legacy answers, but never silently reinterpret new conversation intent", async () => {
-  const sent: Extract<ClientMessage, { type: "send" }>[] = [];
-  await withScriptedBroker([], (socket, frame) => {
-    if (frame.type !== "send") return;
-    sent.push(frame);
-    writeMessage(socket, { type: "delivered", messageId: frame.message.id });
-  }, async client => {
-    for (const options of [
-      { text: "Progress, not an answer", replyTo: "question", completesAsk: false },
-      { text: "Which version?", replyTo: "question", expectsReply: true },
-      { text: "Replacement request", supersedes: "question" },
-    ]) {
-      const result = await client.send("colleague", options);
-      assert.equal(result.code, "E_CONVERSATION_CONTRACT_UNSUPPORTED");
-      assert.equal(result.delivery, "failed");
-      assert.equal(result.outcomeKnown, true);
-      assert.equal(result.retryable, false);
-      assert.ok(result.id);
-    }
-    const snapshot = { id: "colleague", endpointEpoch: "epoch", cwd: "/test", model: "test", pid: 1, startedAt: 1, lastActivity: 1 };
-    assert.equal((await client.sendToSession(snapshot, { text: "Snapshot contact" })).code, "E_EXACT_SEND_UNSUPPORTED");
-    assert.equal(sent.length, 0, "unsupported intent fails before writing any send frame");
-    assert.equal((await client.send("colleague", { text: "Ordinary notification", completesAsk: false })).delivered, true);
-    assert.equal((await client.send("colleague", { text: "Legacy answer", replyTo: "question" })).delivered, true);
-    assert.equal((await client.send("colleague", { text: "Explicit answer", replyTo: "question", completesAsk: true })).delivered, true);
-    assert.equal(sent.length, 3);
+  await withScriptedBroker(REQUIRED_FEATURES, () => undefined, async client => {
+    assert.equal(client.supportsFeature(COMPACTION_AWARENESS_FEATURE), false);
+    await assert.rejects(client.reportCompactionCompleted("compaction"), /unavailable/);
+    client.updateExtensionCapabilities([]);
   });
 });
 
+test("late send ACKs cannot settle cancellation, and cancellation acceptance is not original nondelivery", async () => {
+  let finishCancellation: (() => void) | undefined;
+  await withScriptedBroker(REQUIRED_FEATURES, (socket, frame) => {
+    if (frame.type !== "cancel_message") return;
+    writeMessage(socket, accepted(frame.messageId));
+    finishCancellation = () => writeMessage(socket, {
+      ...accepted(frame.messageId), requestId: frame.requestId, cancellation: "withdrawal_requested",
+    });
+  }, async client => {
+    const sent = await client.send("colleague", { text: "original work", timeoutMs: 30 });
+    assert.equal(sent.delivery, "unknown");
+    let cancellationSettled = false;
+    const cancelling = client.cancelMessage(sent.id, { timeoutMs: 1000 }).then(result => {
+      cancellationSettled = true;
+      return result;
+    });
+    await client.listSessions();
+    assert.equal(cancellationSettled, false, "original send acceptance is not cancellation acceptance");
+    assert.ok(finishCancellation);
+    finishCancellation();
+    const cancelled = await cancelling;
+    assert.equal(cancelled.id, sent.id);
+    assert.equal(cancelled.delivered, true, "withdrawal notice accepted, not earlier work undone");
+    assert.equal(cancelled.delivery, "socket_delivered");
+    assert.equal(cancelled.outcomeKnown, true);
+    assert.equal(cancelled.cancellation, "withdrawal_requested");
+  });
+});
+
+test("late cancellation ACK cannot settle a later same-ID send or another cancellation", async () => {
+  let lateCancellation: (() => void) | undefined;
+  let finishSend: (() => void) | undefined;
+  let finishCancellation: (() => void) | undefined;
+  await withScriptedBroker(REQUIRED_FEATURES, (socket, frame) => {
+    if (frame.type === "cancel_message") {
+      const finish = () => writeMessage(socket, {
+        ...accepted(frame.messageId), requestId: frame.requestId, cancellation: "withdrawal_requested",
+      });
+      if (!lateCancellation) lateCancellation = finish;
+      else finishCancellation = finish;
+    }
+    if (frame.type === "send") finishSend = () => writeMessage(socket, accepted(frame.message.id));
+  }, async client => {
+    const timedOut = await client.cancelMessage("reused-id", { timeoutMs: 30 });
+    assert.equal(timedOut.delivery, "unknown");
+    assert.equal(timedOut.code, "E_CANCELLATION_UNKNOWN");
+    assert.equal(timedOut.outcomeKnown, false);
+    let sendSettled = false;
+    let cancelSettled = false;
+    const sending = client.send("colleague", { text: "work", messageId: "reused-id", timeoutMs: 1000 })
+      .then(result => { sendSettled = true; return result; });
+    const cancelling = client.cancelMessage("reused-id", { timeoutMs: 1000 })
+      .then(result => { cancelSettled = true; return result; });
+    await client.listSessions();
+    assert.ok(lateCancellation);
+    lateCancellation();
+    await client.listSessions();
+    assert.equal(sendSettled, false);
+    assert.equal(cancelSettled, false);
+    assert.ok(finishSend);
+    assert.ok(finishCancellation);
+    finishSend();
+    finishCancellation();
+    assert.equal((await sending).delivered, true);
+    assert.equal((await cancelling).cancellation, "withdrawal_requested");
+  });
+});
+
+test("current conversation intent is authored without reinterpretation", async () => {
+  const sent: Extract<ClientMessage, { type: "send" }>[] = [];
+  await withScriptedBroker(REQUIRED_FEATURES, (socket, frame) => {
+    if (frame.type !== "send") return;
+    sent.push(frame);
+    writeMessage(socket, accepted(frame.message.id));
+  }, async client => {
+    const intents = [
+      { text: "Progress, not an answer", replyTo: "question", completesAsk: false },
+      { text: "Which version?", replyTo: "question", expectsReply: true },
+      { text: "Replacement request", supersedes: "question" },
+      { text: "Explicit answer", replyTo: "question", completesAsk: true },
+    ];
+    for (const intent of intents) assert.equal((await client.send("colleague", intent)).delivered, true);
+    assert.equal(sent.length, intents.length);
+    for (let i = 0; i < intents.length; i++) {
+      const { text, ...metadata } = intents[i]!;
+      assert.equal(sent[i]!.message.content.text, text);
+      for (const [key, value] of Object.entries(metadata)) assert.equal((sent[i]!.message as any)[key], value);
+    }
+  });
+});
 
 test("ordinary send may re-resolve an endpoint rebound but sendToSession never retries its caller-owned snapshot", async () => {
   const snapshot = { id: "reviewer", name: "reviewer", endpointEpoch: "original-epoch", cwd: "/test", model: "test", pid: 2, startedAt: 1, lastActivity: 1 };
@@ -315,7 +356,7 @@ test("ordinary send may re-resolve an endpoint rebound but sendToSession never r
       epochs.push(frame.targetEpoch!);
       writeMessage(socket, frame.targetEpoch === "original-epoch"
         ? { type: "delivery_failed", messageId: frame.message.id, delivery: "failed", outcomeKnown: true, retryable: true, code: "E_TARGET_REBOUND", reason: "Endpoint was replaced" }
-        : { type: "delivered", messageId: frame.message.id });
+        : accepted(frame.message.id));
     }
   }, async client => {
     assert.equal((await client.sendToSession(snapshot, { text: "Snapshot contact" })).code, "E_TARGET_REBOUND");
@@ -328,14 +369,130 @@ test("ordinary send may re-resolve an endpoint rebound but sendToSession never r
 });
 
 
-test("legacy cancellation makes an overlapping send unknown rather than accepting an ambiguous ACK", async () => {
-  await withScriptedBroker([], (socket, frame) => {
-    if (frame.type === "cancel_message") writeMessage(socket, { type: "delivered", messageId: frame.messageId });
+test("invalid ACKs close the connection without accepting unrelated operations", async t => {
+  const cases: [string, Record<string, unknown>, RegExp][] = [
+    ["missing delivery", { delivery: undefined }, /Invalid delivered/],
+    ["invalid retryability", { retryable: true }, /Invalid delivered/],
+    ["invalid known outcome", { outcomeKnown: false }, /Invalid delivered/],
+    ["invalid request ID", { requestId: 7 }, /Invalid delivery requestId/],
+    ["empty request ID", { requestId: "" }, /Invalid delivery requestId/],
+    ["wrong operation", { cancellation: undefined }, /Invalid cancellation acknowledgement/],
+    ["queued cancellation", { delivery: "queued" }, /Invalid cancellation acknowledgement/],
+    ["failed but confirmed cancellation", { type: "delivery_failed", reason: "failed", delivery: "failed" }, /Invalid cancellation acknowledgement/],
+    ["wrong message correlation", { messageId: "another-message" }, /does not match requestId/],
+    ["invalid cancellation", { cancellation: "undone" }, /Invalid cancellation state/],
+    ["invalid recipient", { recipient: { id: "peer" } }, /Invalid delivery recipient/],
+    ["send-only metadata", { contactToken: "contact" }, /Invalid cancellation acknowledgement/],
+    ["invalid code", { code: 123 }, /Invalid delivery code/],
+    ["retryable uncertainty", { type: "delivery_failed", reason: "uncertain", delivery: "unknown", retryable: true, outcomeKnown: false }, /Invalid delivery_failed/],
+    ["false certainty", { type: "delivery_failed", reason: "uncertain", delivery: "unknown", outcomeKnown: true }, /Invalid delivery_failed/],
+  ];
+  for (const [name, patch, expected] of cases) {
+    await t.test(name, async () => {
+      await withScriptedBroker(REQUIRED_FEATURES, (socket, frame) => {
+        if (frame.type === "cancel_message") writeMessage(socket, {
+          ...accepted(frame.messageId), requestId: frame.requestId, cancellation: "withdrawal_requested", ...patch,
+        });
+      }, async client => {
+        const errors: Error[] = [];
+        client.on("error", error => errors.push(error));
+        const sending = client.send("colleague", { text: "work", replyTo: "question", messageId: "pending-send" });
+        const cancelling = client.cancelMessage("pending-send");
+        const listing = assert.rejects(client.listSessions(), expected);
+        const [send, cancel] = await Promise.all([sending, cancelling]);
+        await listing;
+        assert.equal(send.delivery, "unknown");
+        assert.equal(send.outcomeKnown, false);
+        assert.equal(cancel.delivery, "unknown");
+        assert.equal(cancel.outcomeKnown, false);
+        assert.equal(client.isConnected(), false);
+        assert.match(errors[0]!.message, expected);
+      });
+    });
+  }
+});
+
+test("connection failure settles every pending call, including without an error subscriber", async t => {
+  for (const failure of ["close", "protocol"] as const) {
+    await t.test(failure, async () => {
+      let frames = 0;
+      await withScriptedBroker([...REQUIRED_FEATURES, COMPACTION_AWARENESS_FEATURE], (socket) => {
+        if (++frames === 5) {
+          if (failure === "close") socket.destroy();
+          else writeMessage(socket, { type: "not-a-broker-operation" });
+        }
+        return true;
+      }, async client => {
+        const sending = client.send("colleague", { text: "work", replyTo: "question", messageId: "pending-send" });
+        const cancelling = client.cancelMessage("pending-send");
+        const settled = Promise.allSettled([
+          client.listSessions(), client.advertise("new-name"), client.reportCompactionCompleted("event"),
+        ]);
+        const [send, cancel, calls] = await Promise.all([sending, cancelling, settled]);
+        assert.equal(send.delivery, "unknown");
+        assert.equal(send.id, "pending-send");
+        assert.equal(cancel.delivery, "unknown");
+        assert.equal(cancel.id, "pending-send");
+        assert.equal(calls.every(result => result.status === "rejected"), true);
+        assert.equal(client.isConnected(), false);
+      });
+    });
+  }
+});
+
+test("receipts and controls preserve their authored message correlation without settling send acceptance", async () => {
+  const peer = { id: "peer", cwd: "/test", model: "test", pid: 2, startedAt: 1, lastActivity: 1 };
+  const receipt = { messageId: "controlled-message", status: "cancellation_requested", timestamp: 1 } as const;
+  const control = { messageId: "controlled-message", action: "supersede", supersededBy: "replacement-message", timestamp: 2 } as const;
+  let acceptSend: (() => void) | undefined;
+  await withScriptedBroker(REQUIRED_FEATURES, (socket, frame) => {
+    if (frame.type !== "send") return;
+    writeMessage(socket, { type: "message_receipt", from: peer, receipt });
+    writeMessage(socket, { type: "message_control", from: peer, control });
+    acceptSend = () => writeMessage(socket, { ...accepted(frame.message.id), recipient: peer, cancellation: "withdrawal_requested" });
   }, async client => {
-    const sending = client.send("colleague", { text: "Original work", messageId: "overlapping-legacy", timeoutMs: 1000 });
+    const received: unknown[] = [];
+    client.onMessageReceipt((from, value) => received.push([from, value]));
+    client.onMessageControl((from, value) => received.push([from, value]));
+    let sendSettled = false;
+    const sending = client.send("peer", { text: "work", replyTo: "question", messageId: receipt.messageId })
+      .then(result => { sendSettled = true; return result; });
     await client.listSessions();
-    const cancelling = client.cancelMessage("overlapping-legacy", { timeoutMs: 50 });
-    assert.equal((await sending).delivery, "unknown");
-    assert.equal((await cancelling).delivery, "unknown");
+    assert.deepEqual(received, [[peer, receipt], [peer, control]]);
+    assert.equal(sendSettled, false);
+    assert.ok(acceptSend);
+    acceptSend();
+    const result = await sending;
+    assert.equal(result.delivered, true, "stored withdrawal metadata does not reverse original send acceptance");
+    assert.equal(result.cancellation, "withdrawal_requested");
+    assert.deepEqual(result.recipient, peer);
   });
+});
+
+test("correlated cancellation failure preserves its own uncertainty and cannot fail an overlapping send", async () => {
+  for (const delivery of ["failed", "unknown"] as const) {
+    let acceptSend: (() => void) | undefined;
+    await withScriptedBroker(REQUIRED_FEATURES, (socket, frame) => {
+      if (frame.type === "send") acceptSend = () => writeMessage(socket, accepted(frame.message.id));
+      if (frame.type === "cancel_message") writeMessage(socket, {
+        type: "delivery_failed", messageId: frame.messageId, requestId: frame.requestId,
+        reason: "Withdrawal unavailable", code: "E_CANCELLATION_UNAVAILABLE",
+        delivery, outcomeKnown: delivery === "failed", retryable: false,
+      });
+    }, async client => {
+      let sendSettled = false;
+      const sending = client.send("peer", { text: "work", replyTo: "question", messageId: "overlapping-send" })
+        .then(result => { sendSettled = true; return result; });
+      const cancelled = await client.cancelMessage("overlapping-send");
+      assert.equal(cancelled.id, "overlapping-send");
+      assert.equal(cancelled.delivered, false);
+      assert.equal(cancelled.delivery, delivery);
+      assert.equal(cancelled.outcomeKnown, delivery === "failed");
+      assert.equal(cancelled.retryable, false);
+      assert.equal(sendSettled, false);
+      assert.ok(acceptSend);
+      acceptSend();
+      assert.equal((await sending).delivered, true);
+    });
+  }
 });

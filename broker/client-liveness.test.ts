@@ -6,7 +6,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { ParleyClient } from "./client.ts";
-import { writeMessage } from "./framing.ts";
+import { createMessageReader, writeMessage } from "./framing.ts";
+import { CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, type ClientMessage } from "../types.ts";
 
 /**
  * Unit tests for the half-open socket fix.
@@ -30,6 +31,8 @@ const runtimeAgentDir = process.platform === "win32" ? undefined : mkdtempSync("
 const previousHome = process.env.HOME;
 const previousUserProfile = process.env.USERPROFILE;
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+const previousInterval = process.env.PI_PARLEY_LIVENESS_INTERVAL_MS;
+const previousTimeout = process.env.PI_PARLEY_LIVENESS_TIMEOUT_MS;
 process.env.HOME = homeDir;
 process.env.USERPROFILE = homeDir;
 if (runtimeAgentDir) process.env.PI_CODING_AGENT_DIR = runtimeAgentDir;
@@ -41,6 +44,10 @@ test.after(() => {
   process.env.USERPROFILE = previousUserProfile;
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  if (previousInterval === undefined) delete process.env.PI_PARLEY_LIVENESS_INTERVAL_MS;
+  else process.env.PI_PARLEY_LIVENESS_INTERVAL_MS = previousInterval;
+  if (previousTimeout === undefined) delete process.env.PI_PARLEY_LIVENESS_TIMEOUT_MS;
+  else process.env.PI_PARLEY_LIVENESS_TIMEOUT_MS = previousTimeout;
   rmSync(homeDir, { recursive: true, force: true });
   if (runtimeAgentDir) rmSync(runtimeAgentDir, { recursive: true, force: true });
 });
@@ -72,26 +79,25 @@ async function registeredClientAgainstFakeSocket(): Promise<{
 
   let responding = true;
   const server = net.createServer((serverSide) => {
-    serverSide.on("data", (data) => {
-      if (!responding) return; // simulate a dead/unresponsive broker: drop everything
-      try {
-        const len = data.readUInt32BE(0);
-        const json = JSON.parse(data.subarray(4, 4 + len).toString("utf-8"));
-        if (json.type === "register") {
-          writeMessage(serverSide, { type: "registered", sessionId: json.sessionId ?? "stable-test", features: [] });
-        }
-        if (json.type === "list") {
-          writeMessage(serverSide, { type: "sessions", requestId: json.requestId, sessions: [] });
-        }
-      } catch {
-        // ignore parse errors in the fake
+    serverSide.on("data", createMessageReader(value => {
+      if (!responding) return;
+      const frame = value as ClientMessage;
+      if (frame.type === "register") {
+        writeMessage(serverSide, {
+          type: "registered", sessionId: frame.sessionId ?? "stable-test",
+          features: [CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE],
+        });
       }
-    });
+      if (frame.type === "list") {
+        writeMessage(serverSide, { type: "sessions", requestId: frame.requestId, sessions: [] });
+      }
+    }, error => serverSide.destroy(error)));
+    serverSide.on("error", () => undefined);
     server.close();
     resolveReady({
       serverSide,
       closeServerSideAbruptly() {
-        // Destroy WITHOUT a clean FIN — simulates a SIGKILL'd broker peer.
+        // A real socket close exercises passive disconnect detection.
         serverSide.destroy();
       },
       stopResponding() {
@@ -120,7 +126,7 @@ async function registeredClientAgainstFakeSocket(): Promise<{
   return { client, serverSide, closeServerSideAbruptly, stopResponding };
 }
 
-test("client emits disconnected when the peer destroys the socket without a FIN", async () => {
+test("client emits disconnected when the peer closes the socket", async () => {
   const { client, closeServerSideAbruptly } = await registeredClientAgainstFakeSocket();
   try {
     assert.equal(client.isConnected(), true, "client should be connected after register");
@@ -154,8 +160,11 @@ test("client liveness heartbeat detects a half-open socket within a bounded wind
     // the connection. No "close"/"error" event reaches the client, so passive
     // detection cannot fire — only the liveness heartbeat can notice.
     stopResponding();
+    const sending = client.send("colleague", { text: "work", replyTo: "question", messageId: "half-open-send" });
+    const cancelling = client.cancelMessage("half-open-send");
+    const listing = assert.rejects(client.listSessions(), /List sessions timeout/);
 
-    // The heartbeat (interval ~100ms, timeout ~200ms) must notice and tear down.
+    // The configured timeout is capped at the 100ms interval.
     const event = await Promise.race([
       disconnected,
       new Promise<never>((_, reject) =>
@@ -167,6 +176,9 @@ test("client liveness heartbeat detects a half-open socket within a bounded wind
     ]);
     assert.ok(event, "expected the heartbeat to surface a disconnected event");
     assert.equal(client.isConnected(), false);
+    assert.equal((await sending).delivery, "unknown");
+    assert.equal((await cancelling).delivery, "unknown");
+    await listing;
   } finally {
     await client.disconnect().catch(() => undefined);
   }

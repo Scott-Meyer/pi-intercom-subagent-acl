@@ -5,11 +5,9 @@ import { createHash, randomUUID } from "crypto";
 import { writeMessage, createMessageReader } from "./framing.ts";
 import { isAuthoredMessage, isMessageReceipt, isSessionId, isSessionRegistration } from "./protocol.ts";
 import {
-  ensureParleyRuntimeDir,
   getBrokerListenTarget,
   getBrokerPortFilePath,
   getParleyDirPath,
-  migrateLegacyRuntimeDir,
   PARLEY_DIR_MODE,
   PARLEY_PROTOCOL_NAME,
   PARLEY_PROTOCOL_VERSION,
@@ -22,7 +20,9 @@ import { sameCwd } from "../cwd.ts";
 import { COMPACTION_AWARENESS_FEATURE, CONVERSATION_CONTRACT_FEATURE, EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_PROFILE_FEATURE } from "../types.ts";
 import type { CancellationState, DeliveryDetails, DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, PeerCompactionNotice } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
-import { assertNoLiveBroker } from "./runtime-claim.ts";
+import { BROKER_RUNTIME_OCCUPIED_EXIT_CODE, BrokerRuntimeOccupiedError, claimBrokerRuntime } from "./runtime-claim.ts";
+import { getBrokerBuildIdentity } from "./build.ts";
+import type { ProcessLockLease } from "./process-lock.ts";
 import { CollaborationStateStore } from "./collaboration-state.ts";
 import { isValidSessionDescription, isValidSessionName, RESERVED_SESSION_NAME_PREFIX } from "../session-profile.ts";
 import {
@@ -70,29 +70,13 @@ import {
   type FederationOrigin,
 } from "./federation-types.ts";
 
-// Parley 1.1.0 relocated the runtime dir; a broker must never start beside a
-// live legacy one (split roster) or over unresolved dual state. A competing
-// first start that completes the migration first is success, not an error.
-const legacyRuntimeMigration = migrateLegacyRuntimeDir();
-if (legacyRuntimeMigration.status === "blocked") {
-  console.error(
-    "parley: a legacy intercom broker is still running from the intercom/ runtime dir. Restart Pi sessions so it drains; if a federation peer link (e.g. a FlightDeck bridge) holds it open, disconnect the link or stop the drained broker — its state migrates on the next start.",
-  );
-  process.exit(1);
-}
-if (legacyRuntimeMigration.status === "conflict") {
-  console.error(
-    `parley: both ${legacyRuntimeMigration.legacyDir} and ${legacyRuntimeMigration.targetDir} hold runtime state; resolve manually (remove or merge one) before starting.`,
-  );
-  process.exit(1);
-}
-
 const PARLEY_DIR = getParleyDirPath();
 const LISTEN_TARGET = getBrokerListenTarget();
 const PID_PATH = join(PARLEY_DIR, "broker.pid");
 const PORT_PATH = getBrokerPortFilePath(PARLEY_DIR);
 const PENDING_ASKS_DIR = join(PARLEY_DIR, "pending-asks");
 const BROKER_STATE_ID = randomUUID();
+const BROKER_BUILD = getBrokerBuildIdentity();
 const MAX_SESSIONS = 128;
 const MAX_UNREGISTERED_CONNECTIONS = 32;
 const REGISTRATION_TIMEOUT_MS = 1000;
@@ -360,6 +344,7 @@ class ParleyBroker {
   private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
   private shutdownTimer: NodeJS.Timeout | null = null;
+  private shuttingDown = false;
   private maintenanceTimer: NodeJS.Timeout | null = null;
   private readonly askTimeoutMs = getAskTimeoutMs();
   private namespaceOwners = new Map<string, NamespaceOwner>();
@@ -374,10 +359,8 @@ class ParleyBroker {
   private federationInFlightMessageIds = new Set<string>();
   private federationSendSweepTimer: NodeJS.Timeout | null = null;
 
-  constructor() {
-    ensureParleyRuntimeDir(PARLEY_DIR);
+  constructor(private readonly runtimeLease: ProcessLockLease) {
     this.federationOrigin = loadPersistedFederationOrigin(PARLEY_DIR);
-    assertNoLiveBroker(PID_PATH);
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
     this.extensionStateManager = new ExtensionStateManager(PARLEY_DIR);
@@ -574,6 +557,7 @@ class ParleyBroker {
       writeFileSync(PID_PATH, String(process.pid), { mode: PARLEY_RUNTIME_FILE_MODE });
       restrictParleyRuntimeFile(PID_PATH);
       console.log(`Parley broker started (pid: ${process.pid})`);
+      this.scheduleShutdownCheck();
     };
 
     if (typeof LISTEN_TARGET === "string") {
@@ -592,6 +576,10 @@ class ParleyBroker {
   }
 
   private handleConnection(socket: net.Socket): void {
+    if (this.shuttingDown) {
+      socket.destroy();
+      return;
+    }
     this.connections.add(socket);
     let sessionKey: string | null = null;
     let connectionRole: "unregistered" | "client" | "peer-prepared" | "peer" | "control" = "unregistered";
@@ -895,7 +883,7 @@ class ParleyBroker {
   }
 
   private scheduleShutdownCheck(): void {
-    if (this.shutdownTimer) return;
+    if (this.shuttingDown || this.shutdownTimer) return;
 
     this.shutdownTimer = setTimeout(() => {
       this.shutdownTimer = null;
@@ -1313,6 +1301,11 @@ class ParleyBroker {
         requestId: clientMessage.requestId,
         protocol: PARLEY_PROTOCOL_NAME,
         version: PARLEY_PROTOCOL_VERSION,
+        broker: {
+          pid: process.pid,
+          instanceId: this.runtimeLease.owner.claimId,
+          ...BROKER_BUILD,
+        },
       });
       return;
     }
@@ -1418,9 +1411,8 @@ class ParleyBroker {
         
         this.cancelShutdownTimer();
 
-        // This must be the first broker message. Older clients ignore the
-        // additive features field; newer clients use it to avoid sending
-        // extension operations to an older broker.
+        // Registration is the first response; clients validate their required
+        // conversation capabilities before issuing operations.
         writeMessage(socket, {
           type: "registered",
           sessionId: id,
@@ -2033,7 +2025,7 @@ class ParleyBroker {
 
       case "cancel_message": {
         if (!currentKey) throw new Error("Received cancel_message before register");
-        if (typeof clientMessage.messageId !== "string" || (clientMessage.requestId !== undefined && typeof clientMessage.requestId !== "string")) {
+        if (typeof clientMessage.messageId !== "string" || typeof clientMessage.requestId !== "string" || !clientMessage.requestId.trim()) {
           throw new Error("Invalid cancel_message message");
         }
         const sender = this.sessions.get(currentKey);
@@ -2043,7 +2035,7 @@ class ParleyBroker {
         writeMessage(socket, {
           type: accepted ? "delivered" : "delivery_failed",
           messageId: clientMessage.messageId,
-          ...(clientMessage.requestId ? { requestId: clientMessage.requestId } : {}),
+          requestId: clientMessage.requestId,
           ...details,
         });
         break;
@@ -3107,14 +3099,28 @@ class ParleyBroker {
   }
 
   private shutdown(): void {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
     console.log("Broker shutting down");
-
+    this.cancelShutdownTimer();
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
     }
+    if (this.federationSendSweepTimer) {
+      clearInterval(this.federationSendSweepTimer);
+      this.federationSendSweepTimer = null;
+    }
     this.peerLinks.close();
-    for (const connection of this.connections) connection.end();
+    let exitCode = 0;
+    try {
+      this.collaborationState.close();
+    } catch (error) {
+      exitCode = 1;
+      console.error("Failed to flush collaboration state during shutdown:", error);
+    }
+    // Do not wait indefinitely for a client to acknowledge EOF during shutdown.
+    for (const connection of this.connections) connection.destroy();
     this.connections.clear();
     this.sessions.clear();
     this.askEdges.clear();
@@ -3122,31 +3128,37 @@ class ParleyBroker {
     this.pendingDirectContacts.clear();
     this.disconnectedSessions.clear();
     this.mailboxMessages.length = 0;
-    try {
-      this.collaborationState.close();
-    } catch (error) {
-      console.error("Failed to flush collaboration state during shutdown:", error);
-    }
-    if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
-      try {
-        unlinkSync(LISTEN_TARGET);
-      } catch {
-        // The socket may already be gone if shutdown started after a disconnect.
+    this.server.close((error) => {
+      if (error) {
+        exitCode = 1;
+        console.error("Failed to close broker listener during shutdown:", error);
       }
-    }
-    try {
-      unlinkSync(PORT_PATH);
-    } catch {
-      // The TCP endpoint file only exists when opt-in TCP transport is active.
-    }
-    try {
-      unlinkSync(PID_PATH);
-    } catch {
-      // The PID file may already be gone if startup never completed.
-    }
-    this.server.close();
-    process.exit(0);
+      // Retain lifetime ownership until the listener is closed and all process
+      // artifacts are removed, so an exiting broker cannot erase its successor.
+      if (typeof LISTEN_TARGET === "string" && process.platform !== "win32") {
+        try { unlinkSync(LISTEN_TARGET); } catch { /* Already absent after close. */ }
+      }
+      try { unlinkSync(PORT_PATH); } catch { /* No TCP endpoint. */ }
+      try { unlinkSync(PID_PATH); } catch { /* Startup may not have published it. */ }
+      this.runtimeLease.release();
+      process.exit(exitCode);
+    });
   }
 }
 
-new ParleyBroker().start();
+let runtimeLease: ProcessLockLease;
+try {
+  runtimeLease = await claimBrokerRuntime(PARLEY_DIR, LISTEN_TARGET);
+} catch (error) {
+  if (error instanceof BrokerRuntimeOccupiedError) {
+    console.error(error.message);
+    process.exit(BROKER_RUNTIME_OCCUPIED_EXIT_CODE);
+  }
+  throw error;
+}
+try {
+  new ParleyBroker(runtimeLease).start();
+} catch (error) {
+  runtimeLease.release();
+  throw error;
+}

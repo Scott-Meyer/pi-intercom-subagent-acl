@@ -1,12 +1,13 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { getParleyDirPath } from "./broker/paths.ts";
+import { parleyEnv } from "./env-compat.ts";
 
 const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000;
 const PARLEY_SCOPE_ID_ENV = "PI_PARLEY_SCOPE_ID";
 
 export function getAskTimeoutMs(): number {
-  const raw = process.env.PI_PARLEY_ASK_TIMEOUT_MS;
+  const raw = parleyEnv("PI_PARLEY_ASK_TIMEOUT_MS");
   if (raw === undefined || raw.trim() === "") {
     return DEFAULT_ASK_TIMEOUT_MS;
   }
@@ -19,7 +20,7 @@ export function getAskTimeoutMs(): number {
 }
 
 export function getParleyScopeId(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const scopeId = env[PARLEY_SCOPE_ID_ENV]?.trim();
+  const scopeId = parleyEnv(PARLEY_SCOPE_ID_ENV, env)?.trim();
   return scopeId ? scopeId : undefined;
 }
 

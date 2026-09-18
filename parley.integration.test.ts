@@ -5804,3 +5804,43 @@ test("known failed notification delivery preserves the pending ask", { concurren
     await cleanup();
   }
 });
+
+test("legacy PI_INTERCOM_SCOPE_ID registers in the same scope as PI_PARLEY_SCOPE_ID", { concurrency: false }, async () => {
+  // 1.1.1 honors launcher-provided legacy env names through the transition.
+  const { cleanup } = await setupClients();
+  try {
+    const modern = new ParleyClient();
+    const legacy = new ParleyClient();
+    const unscoped = new ParleyClient();
+
+    await connectClientWithScope(modern, "legacy-env-check", "modern-peer", "modern-peer");
+    await connectClientWithScope(unscoped, undefined, "unscoped-check", "unscoped-check");
+
+    const previousNew = process.env.PI_PARLEY_SCOPE_ID;
+    const previousOld = process.env.PI_INTERCOM_SCOPE_ID;
+    delete process.env.PI_PARLEY_SCOPE_ID;
+    process.env.PI_INTERCOM_SCOPE_ID = "legacy-env-check";
+    try {
+      await legacy.connect({
+        name: "legacy-peer",
+        cwd: repoDir,
+        model: "test-model",
+        pid: process.pid,
+        startedAt: Date.now(),
+        lastActivity: Date.now(),
+      }, "legacy-peer");
+    } finally {
+      if (previousNew === undefined) delete process.env.PI_PARLEY_SCOPE_ID;
+      else process.env.PI_PARLEY_SCOPE_ID = previousNew;
+      if (previousOld === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
+      else process.env.PI_INTERCOM_SCOPE_ID = previousOld;
+    }
+
+    await waitForSessionByName(modern, "legacy-peer");
+    assert.equal((await modern.listSessions()).some((session) => session.id === "legacy-peer"), true);
+    assert.equal((await unscoped.listSessions()).some((session) => session.id === "legacy-peer"), false);
+    assert.equal((await legacy.listSessions()).some((session) => session.id === "unscoped-check"), false);
+  } finally {
+    await cleanup();
+  }
+});

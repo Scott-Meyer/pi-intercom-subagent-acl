@@ -28,6 +28,7 @@ import {
 } from "./extension-api.ts";
 import { ReplyTracker, type ParleyContext } from "./reply-tracker.ts";
 import { normalizeEntryType, restoreConversationHistory, messageControlKey, type OutstandingAsk } from "./conversation-history.ts";
+import { parleyEnv } from "./env-compat.ts";
 import { resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
@@ -274,7 +275,7 @@ function formatAttachments(attachments: Attachment[]): string {
 function readChildOrchestratorMetadata(): ChildOrchestratorMetadata | null {
   const orchestratorTarget = process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV]?.trim();
   const orchestratorSessionId = process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV]?.trim()
-    || process.env[PARLEY_SESSION_ID_ENV]?.trim();
+    || parleyEnv(PARLEY_SESSION_ID_ENV)?.trim();
   const runId = process.env[SUBAGENT_RUN_ID_ENV]?.trim();
   const agent = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
   const index = process.env[SUBAGENT_CHILD_INDEX_ENV]?.trim();
@@ -647,7 +648,7 @@ function buildPresenceIdentity(pi: ExtensionAPI, sessionId: string): { name: str
   };
 }
 function resolveConfiguredParleySessionId(piSessionId: string, config: ParleyConfig): string {
-  return process.env[STABLE_PARLEY_SESSION_ID_ENV]?.trim() || config.stableId || piSessionId;
+  return parleyEnv(STABLE_PARLEY_SESSION_ID_ENV)?.trim() || config.stableId || piSessionId;
 }
 // The tmux pane id (e.g. "%212") the session was launched in. $TMUX_PANE is
 // inherited at process start and immutable for the lifetime — moving the pane
@@ -729,7 +730,7 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   let currentModel = "unknown";
   let sessionStartedAt: number | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
-  const previousParleySessionId = process.env[PARLEY_SESSION_ID_ENV];
+  const previousParleySessionId = parleyEnv(PARLEY_SESSION_ID_ENV);
   let reconnectPromise: Promise<ParleyClient> | null = null;
   let reconnectPromiseGeneration: number | null = null;
   let startupConnectTimer: NodeJS.Timeout | null = null;

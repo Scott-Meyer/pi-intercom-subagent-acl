@@ -1,3 +1,4 @@
+import { parleyEnv } from "../env-compat.ts";
 import { EventEmitter } from "events";
 import net from "net";
 import { randomUUID } from "crypto";
@@ -73,12 +74,12 @@ function toError(error: unknown): Error {
  * the existing onClose -> "disconnected" path drive reconnection.
  */
 function getLivenessIntervalMs(): number {
-  const raw = Number.parseInt(process.env.PI_PARLEY_LIVENESS_INTERVAL_MS ?? "", 10);
+  const raw = Number.parseInt(parleyEnv("PI_PARLEY_LIVENESS_INTERVAL_MS") ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
 }
 
 function getLivenessTimeoutMs(): number {
-  const raw = Number.parseInt(process.env.PI_PARLEY_LIVENESS_TIMEOUT_MS ?? "", 10);
+  const raw = Number.parseInt(parleyEnv("PI_PARLEY_LIVENESS_TIMEOUT_MS") ?? "", 10);
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, getLivenessIntervalMs()) : 5_000;
 }
 

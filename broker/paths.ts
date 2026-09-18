@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { isAbsolute, join, resolve } from "path";
+import { parleyEnv } from "../env-compat.ts";
 import { homedir } from "os";
 
 export const PARLEY_DIR_MODE = 0o700;
@@ -49,12 +50,12 @@ export function shouldUseWindowsTcpTransport(
     return false;
   }
 
-  const transport = env.PI_PARLEY_TRANSPORT?.trim().toLowerCase();
+  const transport = parleyEnv("PI_PARLEY_TRANSPORT", env)?.trim().toLowerCase();
   if (transport === "tcp") {
     return true;
   }
 
-  const legacyOptIn = env.PI_PARLEY_TCP?.trim().toLowerCase();
+  const legacyOptIn = parleyEnv("PI_PARLEY_TCP", env)?.trim().toLowerCase();
   return legacyOptIn === "1" || legacyOptIn === "true";
 }
 

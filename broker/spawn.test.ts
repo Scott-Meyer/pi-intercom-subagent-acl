@@ -1,7 +1,10 @@
 import test from "node:test";
+import { createMessageReader, writeMessage } from "./framing.ts";
+import { PARLEY_PROTOCOL_NAME, PARLEY_PROTOCOL_VERSION } from "./paths.ts";
+import net from "node:net";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -237,6 +240,7 @@ test("spawnBrokerIfNeeded includes stderr from default broker startup failures",
     for (const fileName of ["spawn.ts", "framing.ts", "paths.ts"]) {
       cpSync(path.join(sourceDir, fileName), path.join(brokerDir, fileName));
     }
+    cpSync(path.join(sourceDir, "..", "env-compat.ts"), path.join(extensionDir, "env-compat.ts"));
 
     process.env.PI_CODING_AGENT_DIR = path.join(root, "agent");
     const moduleUrl = `${pathToFileURL(path.join(brokerDir, "spawn.ts")).href}?case=${Date.now()}`;
@@ -263,4 +267,144 @@ test("isBrokerHealthOkMessage requires the parley protocol marker", () => {
   assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-1" }, "req-1"), false);
   assert.equal(isBrokerHealthOkMessage({ type: "health_ok", requestId: "req-2", protocol: "pi-parley", version: 1 }, "req-1"), false);
   assert.equal(isBrokerHealthOkMessage("ok", "req-1"), false);
+});
+
+async function importSpawnWithAgentDir(root: string): Promise<typeof import("./spawn.ts")> {
+  const extensionDir = path.join(root, "pi-parley");
+  const brokerDir = path.join(extensionDir, "broker");
+  const fakeTsxCli = path.join(extensionDir, "node_modules", "tsx", "dist", "cli.mjs");
+  mkdirSync(brokerDir, { recursive: true });
+  mkdirSync(path.dirname(fakeTsxCli), { recursive: true });
+  writeFileSync(path.join(extensionDir, "package.json"), JSON.stringify({ type: "module" }));
+  writeFileSync(fakeTsxCli, "process.exit(0);\n");
+  const sourceDir = path.dirname(fileURLToPath(import.meta.url));
+  for (const fileName of ["spawn.ts", "framing.ts", "paths.ts"]) {
+    cpSync(path.join(sourceDir, fileName), path.join(brokerDir, fileName));
+  }
+  cpSync(path.join(sourceDir, "..", "env-compat.ts"), path.join(extensionDir, "env-compat.ts"));
+  const moduleUrl = `${pathToFileURL(path.join(brokerDir, "spawn.ts")).href}?case=${Date.now()}-${Math.random()}`;
+  return await import(moduleUrl) as typeof import("./spawn.ts");
+}
+
+/** A broker stub that genuinely answers the framed health handshake, so
+ * isBrokerRunning/waitForBroker see a healthy parley broker. onFirstHealth
+ * runs once when the first health request arrives (e.g. to simulate the
+ * spawn winner releasing its lock after startup). */
+function listenHealthyParleyBroker(
+  sockPath: string,
+  onFirstHealth?: () => void,
+): { server: import("node:net").Server; close: () => Promise<void> } {
+  const sockets = new Set<import("node:net").Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let answeredFirst = false;
+    const reader = createMessageReader((message) => {
+      const request = message as { type?: string; requestId?: string };
+      if (request.type === "health" && typeof request.requestId === "string") {
+        if (!answeredFirst) {
+          answeredFirst = true;
+          onFirstHealth?.();
+        }
+        writeMessage(socket, {
+          type: "health_ok",
+          requestId: request.requestId,
+          protocol: PARLEY_PROTOCOL_NAME,
+          version: PARLEY_PROTOCOL_VERSION,
+        });
+      }
+    });
+    socket.on("data", reader);
+    socket.on("error", () => undefined);
+  });
+  server.listen(sockPath);
+  return {
+    server,
+    close: () => new Promise<void>((resolve) => {
+      for (const socket of sockets) socket.destroy();
+      server.close(() => resolve());
+      setTimeout(() => resolve(), 500);
+    }),
+  };
+}
+
+function writeUnresolvedLegacyRuntime(agentDir: string): void {
+  const legacyDir = path.join(agentDir, "intercom");
+  mkdirSync(legacyDir, { recursive: true });
+  writeFileSync(path.join(legacyDir, "config.json"), JSON.stringify({ enabled: true }));
+  // A live legacy broker holds the intercom runtime.
+  writeFileSync(path.join(legacyDir, "broker.pid"), String(process.pid));
+}
+
+test("spawnBrokerIfNeeded refuses a healthy parley broker while a legacy intercom runtime is unresolved", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "parley-gate-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let broker: { server: import("node:net").Server; close: () => Promise<void> } | undefined;
+  try {
+    const agentDir = path.join(root, "agent");
+    const parleyDir = path.join(agentDir, "parley");
+    mkdirSync(parleyDir, { recursive: true });
+    writeUnresolvedLegacyRuntime(agentDir);
+    // A healthy parley broker answers health on the target socket.
+    broker = listenHealthyParleyBroker(path.join(parleyDir, "broker.sock"));
+    await new Promise<void>((resolve) => broker!.server.once("listening", resolve));
+
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const imported = await importSpawnWithAgentDir(root);
+
+    // With an early-return-on-healthy bypass this call would succeed and
+    // attach; the cutover gate must refuse instead.
+    await assert.rejects(
+      () => imported.spawnBrokerIfNeeded("npx", ["--no-install", "tsx"]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /legacy intercom broker is still running/);
+        return true;
+      },
+    );
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await broker?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("spawnBrokerIfNeeded contention path re-enters the cutover gate before attaching", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "parley-ctn-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let broker: { server: import("node:net").Server; close: () => Promise<void> } | undefined;
+  try {
+    const agentDir = path.join(root, "agent");
+    const parleyDir = path.join(agentDir, "parley");
+    mkdirSync(parleyDir, { recursive: true });
+    writeUnresolvedLegacyRuntime(agentDir);
+    const lockPath = path.join(parleyDir, "broker.spawn.lock");
+    // A concurrent start owns the spawn lock...
+    writeFileSync(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: "wx" });
+    // ...and its broker is healthy. When the winner's first health answer
+    // arrives it releases the lock, exactly as a real spawn winner would;
+    // the contender must then re-acquire and hit the cutover gate.
+    broker = listenHealthyParleyBroker(path.join(parleyDir, "broker.sock"), () => {
+      try { unlinkSync(lockPath); } catch { /* already released */ }
+    });
+    await new Promise<void>((resolve) => broker!.server.once("listening", resolve));
+
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const imported = await importSpawnWithAgentDir(root);
+
+    await assert.rejects(
+      () => imported.spawnBrokerIfNeeded("npx", ["--no-install", "tsx"]),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /legacy intercom broker is still running/);
+        return true;
+      },
+    );
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await broker?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

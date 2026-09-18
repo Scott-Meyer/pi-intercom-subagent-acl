@@ -2,6 +2,14 @@
 
 All notable changes to the `pi-parley` extension will be documented in this file.
 
+## [1.1.1] - 2026-09-18
+
+### Fixed
+
+- Legacy `PI_INTERCOM_*` environment variables are honored as fallbacks (`PI_PARLEY_*` wins) so launchers still exporting old names — stable IDs, scopes, transports, liveness, project launchers — keep identities through the cutover. `env-compat.ts` is now in the packed `files` allowlist.
+- The cutover gate now runs under the parley spawn lock before any attach to a healthy broker, including the contention path: a parley broker left over from the transition drains instead of serving a split roster. Contenders re-enter the serialized gate rather than probing lock-free.
+- Spawn-lock staleness treats a freshly created empty lock as held (create-before-write window) on both target and legacy locks, so simultaneous first starts genuinely serialize.
+
 ## [1.1.0] - 2026-09-17
 
 ### Changed

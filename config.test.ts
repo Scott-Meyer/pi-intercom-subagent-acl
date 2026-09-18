@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getConfigPath, loadConfig } from "./config.ts";
+import { getConfigPath, getParleyScopeId, loadConfig } from "./config.ts";
+import { parleyEnv } from "./env-compat.ts";
 
 async function withAgentDir<T>(agentDir: string, fn: () => T | Promise<T>): Promise<T> {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -148,4 +149,31 @@ test("loadConfig reads a legacy intercom config before the runtime cutover moves
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("parleyEnv prefers the new name and honors legacy PI_INTERCOM_* names", async () => {
+  const env: NodeJS.ProcessEnv = {};
+  assert.equal(parleyEnv("PI_PARLEY_STABLE_ID", env), undefined);
+  env.PI_INTERCOM_STABLE_ID = "legacy-id";
+  assert.equal(parleyEnv("PI_PARLEY_STABLE_ID", env), "legacy-id");
+  env.PI_PARLEY_STABLE_ID = "new-id";
+  assert.equal(parleyEnv("PI_PARLEY_STABLE_ID", env), "new-id");
+  assert.equal(parleyEnv("PI_PARLEY_SCOPE_ID", { PI_INTERCOM_SCOPE_ID: "alpha" }), "alpha");
+});
+
+test("getParleyScopeId reads a legacy PI_INTERCOM_SCOPE_ID launch environment", async () => {
+  await withAgentDir(join(tmpdir(), "parley-scope-legacy-"), () => {
+    const previousNew = process.env.PI_PARLEY_SCOPE_ID;
+    const previousOld = process.env.PI_INTERCOM_SCOPE_ID;
+    delete process.env.PI_PARLEY_SCOPE_ID;
+    process.env.PI_INTERCOM_SCOPE_ID = "alpha";
+    try {
+      assert.equal(getParleyScopeId(), "alpha");
+    } finally {
+      if (previousNew === undefined) delete process.env.PI_PARLEY_SCOPE_ID;
+      else process.env.PI_PARLEY_SCOPE_ID = previousNew;
+      if (previousOld === undefined) delete process.env.PI_INTERCOM_SCOPE_ID;
+      else process.env.PI_INTERCOM_SCOPE_ID = previousOld;
+    }
+  });
 });

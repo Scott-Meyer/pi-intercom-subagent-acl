@@ -1,3 +1,4 @@
+import { parleyEnv } from "./env-compat.ts";
 import { spawn, type ChildProcess } from "child_process";
 import { realpathSync, statSync } from "fs";
 import { resolve } from "path";
@@ -151,7 +152,7 @@ export function resolveProjectLauncherCommand(
   env: NodeJS.ProcessEnv = process.env,
   configured?: string,
 ): string | undefined {
-  const fromEnv = env.PI_PARLEY_PROJECT_LAUNCHER?.trim();
+  const fromEnv = parleyEnv("PI_PARLEY_PROJECT_LAUNCHER", env)?.trim();
   if (fromEnv) return fromEnv;
   const fromConfig = configured?.trim();
   return fromConfig ? fromConfig : undefined;

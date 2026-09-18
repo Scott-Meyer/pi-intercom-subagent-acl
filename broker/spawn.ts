@@ -1,5 +1,5 @@
 import { spawn } from "child_process";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -199,6 +199,9 @@ function toError(error: unknown): Error {
 // Parley 1.1.0 relocated the runtime dir; spawn refuses while a legacy
 // intercom broker is still running so the roster never splits. The client's
 // reconnect loop retries after the legacy broker idles out.
+// Parley 1.1.0 relocated the runtime dir; spawn refuses while a legacy
+// intercom broker is still running so the roster never splits. The client's
+// reconnect loop retries after the legacy broker idles out.
 function assertRuntimeCutoverComplete(): void {
   const migration = migrateLegacyRuntimeDir();
   if (migration.status === "blocked") {
@@ -208,30 +211,38 @@ function assertRuntimeCutoverComplete(): void {
   }
   if (migration.status === "conflict") {
     throw new Error(
-      `parley: both ${migration.legacyDir} and ${migration.targetDir} hold runtime state; resolve manually (remove or merge one) before starting.`,
+      `parley: both ${join(getAgentDirPath(), "intercom")} and ${getParleyDirPath()} hold runtime state; resolve manually (remove or merge one) before starting.`,
     );
   }
 }
 
-export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: string[]): Promise<void> {
+export async function spawnBrokerIfNeeded(brokerCommand: string, brokerArgs: string[], depth = 0): Promise<void> {
   // The spawn lock opens parley/broker.spawn.lock, so the directory must
   // exist first. A fresh parley/ dir with no state entries lets the legacy
   // migration adopt intercom/ state wholesale.
   ensureParleyRuntimeDir(PARLEY_DIR);
 
-  if (await isBrokerRunning()) {
-    return;
-  }
-
   const ownsLock = acquireSpawnLock();
   if (!ownsLock) {
+    // A concurrent start owns the spawn lock. Wait for its broker, then
+    // re-enter so the attach decision is made under the same lock — a
+    // lock-free status probe cannot close the legacy pid/lock handoff
+    // race, and attaching to a healthy broker beside an unresolved legacy
+    // runtime would split the roster.
     await waitForBroker();
-    return;
+    if (depth >= 1) {
+      throw new Error("parley: broker startup lock is still held after the broker became healthy; retrying shortly.");
+    }
+    return spawnBrokerIfNeeded(brokerCommand, brokerArgs, depth + 1);
   }
 
   try {
-    // Inside the spawn lock: concurrent first starts serialize here, so the
-    // one-time legacy runtime migration cannot race a competing rename.
+    // Fully serialized under the spawn lock: a healthy parley broker is not
+    // enough to attach — while a legacy intercom runtime is unresolved (live
+    // broker, in-flight legacy startup, or dual state), attaching would split
+    // the roster and stall the cutover, so that broker is left to drain. The
+    // lock also serializes the one-time legacy migration across concurrent
+    // first starts.
     assertRuntimeCutoverComplete();
     if (await isBrokerRunning()) {
       return;
@@ -406,7 +417,13 @@ function isSpawnLockStale(): boolean {
     const [pidLine = "", createdAtLine = "0"] = readFileSync(BROKER_SPAWN_LOCK, "utf-8").trim().split("\n");
     const pid = Number.parseInt(pidLine, 10);
     const createdAt = Number.parseInt(createdAtLine, 10);
-    const ageMs = Date.now() - createdAt;
+
+    if (!Number.isFinite(pid) || !Number.isFinite(createdAt)) {
+      // Empty or partial content: the holder may be between the lock's
+      // exclusive create and its write. Steal only a lock that has also
+      // been sitting untouched; a freshly created one is treated as held.
+      return Date.now() - statSync(BROKER_SPAWN_LOCK).mtimeMs > 10_000;
+    }
 
     if (Number.isFinite(pid)) {
       try {
@@ -417,10 +434,16 @@ function isSpawnLockStale(): boolean {
       }
     }
 
-    return !Number.isFinite(createdAt) || ageMs > 10_000;
+    return Date.now() - createdAt > 10_000;
   } catch {
-    // Unreadable lock contents are treated as stale so a new broker can start.
-    return true;
+    // Unreadable or empty content: the holder may be between the lock's
+    // exclusive create and its write. Steal only a lock that has also been
+    // sitting untouched; a freshly created one is treated as held.
+    try {
+      return Date.now() - statSync(BROKER_SPAWN_LOCK).mtimeMs > 10_000;
+    } catch {
+      return false;
+    }
   }
 }
 

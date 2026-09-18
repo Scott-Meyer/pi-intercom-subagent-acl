@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync , realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ChildProcess } from "child_process";
@@ -530,6 +530,74 @@ test("a real launcher can create resources and still fail; cancellation before l
     });
     assert.throws(() => readFileSync(join(root, "created-resource")), { code: "ENOENT" });
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("openProjectPane exports the legacy project root env for pre-rename launcher commands", async () => {
+  const root = mkdtempSync(join(tmpdir(), "parley-legacy-launch-"));
+  const project = join(root, "project");
+  mkdirSync(project);
+  const spawnImpl: LaunchCommandSpawn = (_commandLine, options) => {
+    // A launcher configured under the old name substitutes $PI_INTERCOM_PROJECT_ROOT.
+    const resolvedProject = realpathSync(project);
+    assert.equal(options.env.PI_INTERCOM_PROJECT_ROOT, resolvedProject);
+    assert.equal(options.env.PI_PARLEY_PROJECT_ROOT, resolvedProject);
+    return {
+      on: (event: string, listener: (code: number) => void) => {
+        if (event === "close") setTimeout(() => listener(0), 1);
+        return null as never as ChildProcess;
+      },
+      kill: () => {},
+    } as unknown as ChildProcess;
+  };
+  try {
+    const launched = await openProjectPane({
+      cwd: project,
+      sessions: [session("self", "self", "/anywhere")],
+      currentSessionId: "self",
+      launcherCommand: "legacy-launcher \"$PI_INTERCOM_PROJECT_ROOT\"",
+      sendRequest: () => Promise.reject(new Error("no provider should be asked")),
+      spawnImpl,
+    });
+    assert.equal(launched.outcome, "command-started");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("project launch requests honor legacy PI_INTERCOM_PI_BIN and prefer the new name", async () => {
+  const root = mkdtempSync(join(tmpdir(), "parley-legacy-pibin-"));
+  const project = join(root, "project");
+  mkdirSync(project);
+  const requests: Array<{ command?: string }> = [];
+  const session = (id: string, name: string, cwd: string) => ({ id, name, cwd, model: "m", pid: 1, startedAt: 0, lastActivity: 0, extensions: [{ namespace: "pi-parley/project-launch-v1" }] }) as never as SessionInfo;
+  const previousNew = process.env.PI_PARLEY_PI_BIN;
+  const previousOld = process.env.PI_INTERCOM_PI_BIN;
+  try {
+    const run = () => openProjectPane({
+      cwd: project,
+      sessions: [session("provider", "provider", project)],
+      currentSessionId: "self",
+      sendRequest: async (_target, request) => {
+        requests.push(request as { command?: string });
+        return { delivered: true, id: "launch-request" };
+      },
+    });
+
+    delete process.env.PI_PARLEY_PI_BIN;
+    process.env.PI_INTERCOM_PI_BIN = "/legacy/bin/pi";
+    await run();
+    assert.equal(requests.at(-1)?.command, "/legacy/bin/pi");
+
+    process.env.PI_PARLEY_PI_BIN = "/new/bin/pi";
+    await run();
+    assert.equal(requests.at(-1)?.command, "/new/bin/pi");
+  } finally {
+    if (previousNew === undefined) delete process.env.PI_PARLEY_PI_BIN;
+    else process.env.PI_PARLEY_PI_BIN = previousNew;
+    if (previousOld === undefined) delete process.env.PI_INTERCOM_PI_BIN;
+    else process.env.PI_INTERCOM_PI_BIN = previousOld;
     rmSync(root, { recursive: true, force: true });
   }
 });

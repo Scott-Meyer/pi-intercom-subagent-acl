@@ -12,7 +12,7 @@ const home = mkdtempSync(path.join(tmpdir(), "ic-r-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
 for (const key of Object.keys(process.env)) {
-  if (key.startsWith("PI_SUBAGENT_") || key === "PI_PARLEY_SESSION_ID" || key === "PI_PARLEY_STABLE_ID" || key === "PI_CODING_AGENT_DIR") delete process.env[key];
+  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_PARLEY_") || key.startsWith("PI_INTERCOM_") || key === "PI_CODING_AGENT_DIR") delete process.env[key];
 }
 const { ParleyClient } = await import("./broker/client.ts");
 const { getTsxCliPath } = await import("./broker/spawn.ts");

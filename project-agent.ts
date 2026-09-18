@@ -193,7 +193,13 @@ export async function launchProjectCommand(
         shell: true,
         windowsHide: true,
         cwd: root,
-        env: { ...process.env, PI_PARLEY_PROJECT_ROOT: root },
+        env: {
+          ...process.env,
+          PI_PARLEY_PROJECT_ROOT: root,
+          // Launcher commands configured under the pre-rename name substitute
+          // $PI_INTERCOM_PROJECT_ROOT; export both through the transition.
+          PI_INTERCOM_PROJECT_ROOT: root,
+        },
         detached: true,
       });
     } catch (cause) {
@@ -311,7 +317,7 @@ export async function openProjectPane(input: {
   } catch (cause) {
     throw new ProjectLaunchError(errorText(cause), { stage: "launch", cause });
   }
-  const command = process.env.PI_PARLEY_PI_BIN?.trim() || process.env.PI_BIN?.trim() || "pi";
+  const command = parleyEnv("PI_PARLEY_PI_BIN")?.trim() || process.env.PI_BIN?.trim() || "pi";
   const provider = findProjectLaunchProvider(input.sessions, input.currentSessionId);
   if (provider) {
     const launch: ProjectPaneLaunch = {

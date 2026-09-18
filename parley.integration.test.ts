@@ -36,7 +36,7 @@ process.env.USERPROFILE = sharedHomeDir;
 // vars would change routing and ACL behavior inside these tests.
 delete process.env.PI_CODING_AGENT_DIR;
 for (const key of Object.keys(process.env)) {
-  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_PARLEY_")) delete process.env[key];
+  if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_PARLEY_") || key.startsWith("PI_INTERCOM_")) delete process.env[key];
 }
 const { ParleyClient } = await import("./broker/client.ts");
 const { getTsxCliPath } = await import("./broker/spawn.ts");

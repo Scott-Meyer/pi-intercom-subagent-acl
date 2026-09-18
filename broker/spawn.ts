@@ -408,13 +408,16 @@ function acquireSpawnLock(): boolean {
   return false;
 }
 
-function isSpawnLockStale(): boolean {
+export function isSpawnLockStale(): boolean {
   if (!existsSync(BROKER_SPAWN_LOCK)) {
     return false;
   }
 
   try {
-    const [pidLine = "", createdAtLine = "0"] = readFileSync(BROKER_SPAWN_LOCK, "utf-8").trim().split("\n");
+    // A PID-only lock ("${pid}\n") leaves the timestamp element absent; an
+    // empty default keeps it non-finite so the mtime grace applies instead of
+    // parsing a phantom timestamp of zero and stealing a fresh lock.
+    const [pidLine = "", createdAtLine = ""] = readFileSync(BROKER_SPAWN_LOCK, "utf-8").trim().split("\n");
     const pid = Number.parseInt(pidLine, 10);
     const createdAt = Number.parseInt(createdAtLine, 10);
 

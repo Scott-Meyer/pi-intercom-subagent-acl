@@ -408,3 +408,22 @@ test("spawnBrokerIfNeeded contention path re-enters the cutover gate before atta
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("isSpawnLockStale treats a fresh PID-only target lock as held", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "parley-lock-pidonly-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    const agentDir = path.join(root, "agent");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    const imported = await importSpawnWithAgentDir(root);
+    const parleyDir = path.join(agentDir, "parley");
+    mkdirSync(parleyDir, { recursive: true });
+    // A live owner wrote only its PID before the timestamp line.
+    writeFileSync(path.join(parleyDir, "broker.spawn.lock"), `${process.pid}\n`);
+    assert.equal(imported.isSpawnLockStale(), false);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});

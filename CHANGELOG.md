@@ -2,6 +2,14 @@
 
 All notable changes to the `pi-parley` extension will be documented in this file.
 
+## [1.1.2] - 2026-09-18
+
+### Fixed
+
+- Launcher commands configured under pre-rename names receive both project-root env vars: `PI_PARLEY_PROJECT_ROOT` and `PI_INTERCOM_PROJECT_ROOT` are exported together through the transition.
+- `PI_INTERCOM_PI_BIN` is honored as a fallback for the launch-request command (new name wins).
+- The integration harnesses scrub inherited `PI_INTERCOM_*` env alongside the modern names, so the suite is hermetic when run from a legacy launcher environment.
+
 ## [1.1.1] - 2026-09-18
 
 ### Fixed

@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  constants,
   fstatSync,
-  ftruncateSync,
   mkdirSync,
   openSync,
   readSync,
-  writeSync,
+  writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -39,7 +39,7 @@ export type ProcessLockResult =
       /**
        * Last published diagnostic identity, NOT proof of the current holder's PID.
        * May be the previous holder during handoff, or null during first publication,
-       * after damaged metadata, or when Windows denies reads of the locked file.
+       * after damaged metadata, or when diagnostic reads are unavailable.
        * The occupied status itself comes exclusively from the kernel lock attempt.
        */
       readonly owner: ProcessLockOwner | null;
@@ -52,7 +52,9 @@ export type ProcessLockResult =
  * throw (including unsupported native binaries, kernels, or filesystem locking).
  *
  * Protocol: open a permanent `.process.lock` without truncation, request an exclusive
- * whole-file kernel lock, and only then replace its diagnostic JSON. The descriptor
+ * whole-file kernel lock, and only then publish a separate diagnostic JSON file.
+ * No data operations touch the locked file (Windows forbids truncation under lock).
+ * The descriptor
  * remains private and open for the lease lifetime. Release unlocks/closes only that
  * descriptor and never removes or renames the file. A losing attempt only closes its
  * own descriptor. Thus simultaneous starts have one winner, paused owners retain
@@ -71,12 +73,12 @@ export type ProcessLockResult =
  */
 export function tryAcquireProcessLock(directory: string): ProcessLockResult {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const fd = openSync(path.join(directory, ".process.lock"), "a+", 0o600);
+  const fd = openSync(path.join(directory, ".process.lock"), constants.O_RDWR | constants.O_CREAT, 0o600);
   let retained = false;
   try {
     if (!fstatSync(fd).isFile()) throw new Error("Process lock must be a regular file");
     if (!nativeLocks.tryLock(fd)) {
-      return Object.freeze({ status: "occupied", owner: readDiagnosticOwner(fd) });
+      return Object.freeze({ status: "occupied", owner: readDiagnosticOwner(directory) });
     }
 
     const owner: ProcessLockOwner = Object.freeze({
@@ -84,16 +86,10 @@ export function tryAcquireProcessLock(directory: string): ProcessLockResult {
       claimId: randomUUID(),
       acquiredAt: new Date().toISOString(),
     });
-    // This descriptor is the owner. Metadata is allowed to be absent/partial after
-    // a crash; no reader ever interprets JSON as authority to acquire or clean up.
-    const metadata = Buffer.from(`${JSON.stringify(owner)}\n`);
-    ftruncateSync(fd, 0);
-    let written = 0;
-    while (written < metadata.length) {
-      const count = writeSync(fd, metadata, written, metadata.length - written);
-      if (count === 0) throw new Error("Could not publish process lock identity");
-      written += count;
-    }
+    // Diagnostic publication is serialized by the lease, but is not authority.
+    // A separate file avoids Windows restrictions on I/O under a byte-range lock.
+    // Readers may see absent/partial/stale JSON; no reader uses it for recovery.
+    writeFileSync(path.join(directory, ".process.owner.json"), `${JSON.stringify(owner)}\n`, { mode: 0o600 });
 
     let descriptor: number | null = fd;
     const lease: ProcessLockLease = Object.freeze({
@@ -118,10 +114,11 @@ export function tryAcquireProcessLock(directory: string): ProcessLockResult {
   }
 }
 
-function readDiagnosticOwner(fd: number): ProcessLockOwner | null {
+function readDiagnosticOwner(directory: string): ProcessLockOwner | null {
+  let fd: number | null = null;
   try {
-    // Bounded, positional read through the contender's existing descriptor. No
-    // pathname reopening or unbounded parsing, and unreadable metadata is harmless.
+    fd = openSync(path.join(directory, ".process.owner.json"), "r");
+    // Bound diagnostic reads; unreadable or interrupted publication is harmless.
     const bytes = Buffer.alloc(4096);
     const count = readSync(fd, bytes, 0, bytes.length, 0);
     if (count === 0 || count === bytes.length) return null;
@@ -136,5 +133,9 @@ function readDiagnosticOwner(fd: number): ProcessLockOwner | null {
     return Object.freeze({ pid: owner.pid, claimId: owner.claimId, acquiredAt: owner.acquiredAt });
   } catch {
     return null;
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* Diagnostics never establish ownership. */ }
+    }
   }
 }

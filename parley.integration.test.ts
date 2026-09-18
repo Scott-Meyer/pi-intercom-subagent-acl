@@ -1053,7 +1053,8 @@ test("broker disconnects a connection that exceeds the local rate limit", { conc
 
   try {
     raw.socket.on("error", () => undefined);
-    const closed = once(raw.socket, "close");
+    // Linux may reset a flooded socket; the promise is closure, not a clean EOF.
+    const closed = new Promise<void>((resolve) => raw.socket.once("close", () => resolve()));
     for (let i = 0; i < 300; i += 1) {
       raw.writeMessage(raw.socket, { type: "list", requestId: `flood-${i}` });
     }
@@ -1062,7 +1063,7 @@ test("broker disconnects a connection that exceeds the local rate limit", { conc
 
     const unsafePresence = await connectRawRegistered("unsafe-presence-id", "safe-presence-name");
     unsafePresence.socket.on("error", () => undefined);
-    const unsafeClosed = once(unsafePresence.socket, "close");
+    const unsafeClosed = new Promise<void>((resolve) => unsafePresence.socket.once("close", () => resolve()));
     unsafePresence.writeMessage(unsafePresence.socket, { type: "presence", name: "unsafe\u001b[2J-name" });
     await unsafeClosed;
     assert.equal(unsafePresence.socket.destroyed, true);

@@ -122,7 +122,7 @@ function occupied(directory: string, owner: ProcessLockOwner) {
   const result = tryAcquireProcessLock(directory);
   assert.equal(result.status, "occupied");
   if (result.status === "occupied" && result.owner !== null) assert.deepEqual(result.owner, owner);
-  // Windows may deny metadata reads under LockFileEx; null is legitimate evidence.
+  // Diagnostics can be unavailable independently of kernel ownership.
   if (process.platform !== "win32" && result.status === "occupied") assert.deepEqual(result.owner, owner);
 }
 
@@ -132,6 +132,10 @@ test("separate same-process attempts contend, and old release cannot affect a ne
   cleanup(t, () => first.release());
   assert.equal(first.owner.pid, process.pid);
   occupied(directory, first.owner);
+  // Diagnostics are replaceable and can be interrupted; corruption cannot unlock
+  // the lifetime resource or make a contender mistake it for available.
+  writeFileSync(path.join(directory, ".process.owner.json"), "interrupted publication");
+  assert.deepEqual(tryAcquireProcessLock(directory), { status: "occupied", owner: null });
   first.release();
   first.release();
 

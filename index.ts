@@ -80,6 +80,15 @@ interface InboundMessageEntry {
   message: Message;
   replyCommand?: string;
   bodyText: string;
+  replyTopic?: string;
+}
+
+interface InboundEnvelope {
+  customType: string;
+  content: string;
+  display: boolean;
+  details: unknown;
+  timestamp: number;
 }
 
 interface DeliveryTarget {
@@ -771,6 +780,8 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   const pendingOutboxRequests = new Map<string, PendingOutboxRequest>();
   function dismissIncomingAsk(messageId: string): void {
     replyTracker.dismissPendingAsk(messageId);
+    freshModelContexts.delete(messageId);
+    settledInboundMessages.add(messageId);
     recordConversationEntry("parley_inbound_settled", { messageId, timestamp: Date.now() });
   }
   function hasSeenInboundMessage(from: SessionInfo, message: Message, now = Date.now()): boolean {
@@ -805,13 +816,15 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   }
   function handleMessageControl(from: SessionInfo, control: MessageControl, restored = false): void {
     if (!restored) recordConversationEntry("parley_inbound_control", { from, control });
-    replyTracker.setDisposition(control.messageId, {
+    const disposition: NonNullable<ParleyContext["disposition"]> = {
       state: control.action === "cancel" ? "withdrawn" : "superseded",
       ...(control.supersededBy ? { replacementId: control.supersededBy } : {}),
-    });
+    };
+    inboundMessageDispositions.set(control.messageId, disposition);
+    replyTracker.setDisposition(control.messageId, disposition);
     deferredInboundMessages.delete(control.messageId);
     pendingHostEnvelopes.delete(`message:${control.messageId}`);
-    contextFallbackEnvelopes.delete(`message:${control.messageId}`);
+    // Already surfaced snapshots remain history, now with their current disposition.
     freshModelContexts.delete(control.messageId);
     const original = replyTracker.getMessage(control.messageId);
     const topic = original ? `\nOriginal message: ${JSON.stringify(previewText(original.message.content.text, 180))}` : "";
@@ -819,14 +832,14 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       ? `**Parley withdrawal from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was withdrawn by its sender.${topic}\nThe sender no longer requests this work. Earlier delivery or work may already have happened; withdrawal does not undo it.`
       : `**Parley update from ${from.name || from.id}** (${from.id})\n\nMessage ${control.messageId} was superseded${control.supersededBy ? ` by ${control.supersededBy}` : ""}.${topic}\nThe earlier message is no longer the current request; prior work is not undone.`;
     const key = messageControlKey(control);
-    deferredInboundControls.set(key, { from, control, content });
+    deferredInboundControls.set(key, { from, control, content, receivedAt: Date.now() });
     flushInboundControl(key);
   }
   function flushInboundControl(key: string): void {
     const entry = deferredInboundControls.get(key);
     const ctx = getLiveContext();
     if (!entry || !ctx) return;
-    const envelope = { customType: "parley_message_control", content: entry.content, display: true, details: { from: entry.from, control: entry.control } };
+    const envelope = { customType: "parley_message_control", content: entry.content, display: true, details: { from: entry.from, control: entry.control, receivedAt: entry.receivedAt }, timestamp: entry.receivedAt };
     pendingHostEnvelopes.set(`control:${key}`, envelope);
     try {
       pi.sendMessage(envelope, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
@@ -854,10 +867,14 @@ export default function piParleyExtension(pi: ExtensionAPI) {
    * broker's own ask-edge timeout keeps the authoritative lifecycle bounded. */
   const outstandingAsks = new Map<string, OutstandingAsk>();
   const deferredInboundMessages = new Map<string, InboundMessageEntry>();
-  const deferredInboundControls = new Map<string, { from: SessionInfo; control: MessageControl; content: string }>();
+  const deferredInboundControls = new Map<string, { from: SessionInfo; control: MessageControl; content: string; receivedAt: number }>();
   let inboundRetryTimer: NodeJS.Timeout | null = null;
-  const pendingHostEnvelopes = new Map<string, { customType: string; content: string; display: boolean; details: unknown }>();
-  const contextFallbackEnvelopes = new Map<string, { customType: string; content: string; display: boolean; details: unknown }>();
+  const pendingHostEnvelopes = new Map<string, InboundEnvelope>();
+  // Keep full snapshots until the host persists them; presentation is not persistence.
+  const contextFallbackEnvelopes = new Map<string, InboundEnvelope>();
+  const presentedInboundEnvelopes = new Set<string>();
+  const settledInboundMessages = new Set<string>();
+  const inboundMessageDispositions = new Map<string, NonNullable<ParleyContext["disposition"]>>();
   const freshModelContexts = new Map<string, ParleyContext>();
 
   function scheduleInboundRetry(): void {
@@ -906,7 +923,9 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       if (!entry) return;
       recordConversationEntry("parley_inbound_visible", { messageId: id, timestamp: Date.now() });
       deferredInboundMessages.delete(id);
-      freshModelContexts.set(id, { from: entry.from, message: entry.message, receivedAt: entry.message.receiverReceivedAt ?? Date.now() });
+      if (!isHistoricalInboundEnvelope(key)) {
+        freshModelContexts.set(id, { from: entry.from, message: entry.message, receivedAt: entry.message.receiverReceivedAt ?? Date.now() });
+      }
       emitMessageReceipt(id, "injected", "observed in host conversation/model context; not proof of processing");
       settleOutgoingReply(entry.from, entry.message);
       acknowledgeInboundMessageContact(client, entry.message);
@@ -918,6 +937,45 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       deferredInboundControls.delete(controlId);
       emitMessageReceipt(entry.control.messageId, entry.control.action === "cancel" ? "cancellation_requested" : "superseded", "withdrawal/update observed in host conversation/model context; earlier work may have happened");
     }
+  }
+
+  function isHistoricalInboundEnvelope(key: string): boolean {
+    if (presentedInboundEnvelopes.has(key)) return true;
+    if (!key.startsWith("message:")) return false;
+    const id = key.slice("message:".length);
+    return settledInboundMessages.has(id) || inboundMessageDispositions.has(id);
+  }
+
+  /** A retained snapshot is background history, not another incoming request.
+   * Status comes from the live conversation, while timing and content stay tied to arrival. */
+  function historicalInboundEnvelope(envelope: { customType: string; content: string | Array<{ type: string; text?: string }>; details?: unknown; timestamp: number }): string {
+    if (envelope.customType === "parley_message_control") {
+      const details = envelope.details as { control: MessageControl };
+      const disposition = inboundMessageDispositions.get(details.control.messageId);
+      const status = disposition
+        ? `${disposition.state}${disposition.replacementId ? ` by message ${disposition.replacementId}` : ""}`
+        : details.control.action === "cancel" ? "withdrawn" : "superseded";
+      const content = typeof envelope.content === "string" ? envelope.content : envelope.content.map((part) => part.text ?? "").join("\n");
+      return `**Parley history — withdrawal/update**\nReceived: ${formatMessageTimestamp(envelope.timestamp)}\nStatus: ${status}\nPreviously received context, not a new delivery.\n\n${content}`;
+    }
+    const entry = envelope.details as InboundMessageEntry;
+    const { from, message } = entry;
+    const retained = replyTracker.getMessage(message.id);
+    const disposition = inboundMessageDispositions.get(message.id);
+    const answered = settledInboundMessages.has(message.id);
+    const status = disposition
+      ? `${disposition.state}${disposition.replacementId ? ` by message ${disposition.replacementId}` : ""}`
+      : answered ? "answered"
+      : message.expectsReply
+        ? `unanswered request${replyTracker.replyWindowElapsed(retained ?? { from, message, receivedAt: envelope.timestamp }) ? "; reply window elapsed, not withdrawn" : ""}`
+        : message.replyTo ? message.completesAsk === false ? "received threaded progress" : "received reply"
+        : "received notification; no reply requested";
+    const origin = from.federation
+      ? `\nRemote origin: ${from.federation.originLabel || from.federation.originId}; scope ${from.federation.remoteScopeAlias}` : "";
+    const compaction = message.peerCompaction
+      ? `\n\n${formatPeerCompactionNotice(from.name || from.id, message.peerCompaction, from.id)}` : "";
+    const body = entry.bodyText ?? message.content.text + (message.content.attachments?.length ? formatAttachments(message.content.attachments) : "");
+    return `**Parley history — from ${from.name || from.id}**${from.description ? ` — ${from.description}` : ""}\nReceived: ${formatMessageTimestamp(envelope.timestamp)}\nStatus: ${status}\nPreviously received context, not a new delivery or active conversation.${entry.replyTopic ?? ""}\n\n${body}\n\n${formatInboundDeliveryMetadata(message)}\nSession: ${from.id} · ${from.cwd}${origin}${compaction}`;
   }
 
   function settleOutgoingReply(from: SessionInfo, message: Message): void {
@@ -1792,7 +1850,6 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) return;
     const injectedMessage = { ...entry.message, injectedAt: Date.now() };
-    const deliveredEntry = { ...entry, message: injectedMessage };
     const senderDisplay = entry.from.name || entry.from.id;
     const focus = entry.from.description ? ` — ${entry.from.description}` : "";
     const origin = entry.from.federation
@@ -1815,7 +1872,8 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       customType: "parley_message",
       content: `**From ${senderDisplay}**${focus}${request}${topic}\n\n${entry.bodyText}\n\n${formatInboundDeliveryMetadata(injectedMessage)}\nSession: ${entry.from.id} · ${entry.from.cwd}${origin}${compactionNotice}`,
       display: true,
-      details: deliveredEntry,
+      details: { ...entry, message: injectedMessage, replyTopic: topic },
+      timestamp: entry.message.receiverReceivedAt ?? entry.message.timestamp,
     };
     deferredInboundMessages.set(entry.message.id, entry);
     pendingHostEnvelopes.set(`message:${entry.message.id}`, envelope);
@@ -2356,12 +2414,18 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     deferredInboundControls.clear();
     pendingHostEnvelopes.clear();
     contextFallbackEnvelopes.clear();
+    presentedInboundEnvelopes.clear();
+    settledInboundMessages.clear();
+    inboundMessageDispositions.clear();
     freshModelContexts.clear();
     outstandingAsks.clear();
     seenInboundMessages.clear();
     latestOutboundReceipts.clear();
     conversationPersistenceWarning = undefined;
     const history = restoreConversationHistory(ctx.sessionManager.getEntries());
+    for (const id of history.persistedIncoming) presentedInboundEnvelopes.add(`message:${id}`);
+    for (const key of history.persistedControls) presentedInboundEnvelopes.add(`control:${key}`);
+    for (const id of history.settledIncoming) settledInboundMessages.add(id);
     for (const [id, ask] of history.outgoing) outstandingAsks.set(id, ask);
     for (const context of history.incoming.values()) {
       replyTracker.recordIncomingMessage(context.from, context.message, context.receivedAt);
@@ -2376,10 +2440,12 @@ export default function piParleyExtension(pi: ExtensionAPI) {
       }
     }
     for (const [key, value] of history.controls) {
-      replyTracker.setDisposition(value.control.messageId, {
+      const disposition: NonNullable<ParleyContext["disposition"]> = {
         state: value.control.action === "cancel" ? "withdrawn" : "superseded",
         ...(value.control.supersededBy ? { replacementId: value.control.supersededBy } : {}),
-      });
+      };
+      inboundMessageDispositions.set(value.control.messageId, disposition);
+      replyTracker.setDisposition(value.control.messageId, disposition);
       if (!history.persistedControls.has(key)) handleMessageControl(value.from, value.control, true);
     }
     for (const entry of deferredInboundMessages.values()) sendIncomingMessage(entry, ctx.isIdle() ? "trigger" : "steer");
@@ -2560,6 +2626,9 @@ export default function piParleyExtension(pi: ExtensionAPI) {
     deferredInboundControls.clear();
     pendingHostEnvelopes.clear();
     contextFallbackEnvelopes.clear();
+    presentedInboundEnvelopes.clear();
+    settledInboundMessages.clear();
+    inboundMessageDispositions.clear();
     freshModelContexts.clear();
     if (inboundRetryTimer) clearTimeout(inboundRetryTimer);
     inboundRetryTimer = null;
@@ -2621,26 +2690,50 @@ export default function piParleyExtension(pi: ExtensionAPI) {
   });
   pi.on("context", (event) => {
     if (!getLiveContext()) return;
+    // Host persistence can arrive after fallback visibility has drained the retry queue.
+    confirmPersistedInbound();
     // This is the actual model boundary, including hosts whose asynchronous sendMessage failed.
-    // Duplicate host retries are collapsed by actionable message ID, not by identical body text.
+    // Duplicate host retries are collapsed by message ID, not by identical body text.
     const seen = new Set<string>();
-    const messages = event.messages.filter((message) => {
-      if (message.role !== "custom") return true;
-      if (message.customType === "parley_persistence_notice") return !conversationPersistenceWarning;
+    const messages: typeof event.messages = [];
+    for (const message of event.messages) {
+      if (message.role !== "custom") {
+        messages.push(message);
+        continue;
+      }
+      if (message.customType === "parley_persistence_notice" && conversationPersistenceWarning) continue;
       const key = inboundEnvelopeKey(message);
-      if (!key) return true;
-      if (seen.has(key)) return false;
+      if (!key) {
+        messages.push(message);
+        continue;
+      }
+      if (seen.has(key)) continue;
       seen.add(key);
-      return true;
-    });
+      const details = message.details as { message?: Message; control?: MessageControl; receivedAt?: number };
+      const timestamp = details.message?.receiverReceivedAt ?? details.receivedAt ?? details.message?.timestamp ?? details.control?.timestamp ?? message.timestamp;
+      if (!isHistoricalInboundEnvelope(key)) {
+        messages.push({ ...message, timestamp });
+        continue;
+      }
+      messages.push({ ...message, content: historicalInboundEnvelope({ ...message, timestamp }), timestamp });
+    }
     for (const [key, envelope] of pendingHostEnvelopes) {
       if (!seen.has(key)) contextFallbackEnvelopes.set(key, envelope);
       confirmInboundEnvelope(key);
     }
+    const history: typeof messages = [];
     for (const [key, envelope] of contextFallbackEnvelopes) {
-      if (!seen.has(key)) messages.push({ role: "custom", ...envelope, timestamp: Date.now() });
-      else contextFallbackEnvelopes.delete(key);
+      if (seen.has(key)) continue;
+      if (isHistoricalInboundEnvelope(key)) {
+        history.push({ role: "custom", ...envelope, content: historicalInboundEnvelope(envelope) });
+      } else {
+        messages.push({ role: "custom", ...envelope });
+      }
+      seen.add(key);
     }
+    for (const key of seen) presentedInboundEnvelopes.add(key);
+    // Background snapshots precede host-owned context, so they don't masquerade as its latest input.
+    messages.unshift(...history);
     if (conversationPersistenceWarning) messages.push({
       role: "custom", customType: "parley_persistence_notice", content: conversationPersistenceWarning, display: true, timestamp: Date.now(),
     });

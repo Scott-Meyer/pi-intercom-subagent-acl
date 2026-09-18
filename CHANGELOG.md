@@ -16,5 +16,7 @@
 - OS-managed broker lifetime ownership, with safe concurrent startup and automatic crash recovery.
 - Correlated cancellation acknowledgements and required current conversation capabilities.
 - Broker health identity with a startup package/source snapshot.
+- Unknown SDK context usage clears old presence estimates; notices identify the last reported sample.
+- Retained model-context snapshots are historical, preserve arrival timing/disposition, and reconcile late host persistence without reviving answered requests.
 - Optional authenticated loopback TCP on all supported platforms.
 - Packed fresh-install checks and cross-platform ownership validation before automated publishing.
